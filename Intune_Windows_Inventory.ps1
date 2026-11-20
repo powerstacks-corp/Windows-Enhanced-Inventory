@@ -134,7 +134,7 @@ $ScriptVersion = '19 - August 10, 2026'
 
 
 # Current date/time
-$Now = Get-Date -Format "yyyy-MM-dd_HHmm"
+$Now = Get-Date -Format "yyyy-MM-dd_HHmmss"
 
 # Enable/Disable Script Transciption
 $Transcribe = $False
