@@ -100,6 +100,7 @@ Payloads are compressed, encoded, and split into safe chunks to meet Azure inges
 - Azure Log Analytics Workspace
 - API access for vendor warranty data (optional)
 - Execution context with network access (SYSTEM context in Intune is supported)
+- On devices that enforce App Control for Business (WDAC) script rules: a policy that allows the script. PowerShell runs scripts the policy doesn't allow in Constrained Language Mode, where the script might not run correctly. If your policy doesn't already allow scripts that Intune deploys, sign the script with a code-signing certificate the policy trusts, after you set its parameters. Any later edit invalidates the signature, so sign it again after each change.
 
 ## License
 
