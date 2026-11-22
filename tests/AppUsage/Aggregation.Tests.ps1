@@ -393,6 +393,38 @@ Describe 'Get-AUAppUsage known exe that ran unmatched (D30)' {
         (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'fabrikam.exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed'
     }
 
+    It 'is Ambiguous when the known exe ran unmatched only as SYSTEM' {
+        $run = New-TestUnmatchedRun 'alpha.exe' @{ UserSid = $script:SystemSid; UserType = 'System' }
+        $value = (Invoke-TestAppUsage -Entries @($run) -Apps $script:AlphaApps -Known (New-TestKnown @{ 'Contoso Alpha' = 'alpha.exe' }))['Contoso Alpha']
+        $value.AppUsageStatus | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'treats a Windows Installer name holding [ as literal: an unmatched run of that name is Ambiguous, without throwing' {
+        $run = New-TestUnmatchedRun 'alpha[.exe'
+        $known = Get-AUKnownExes $script:AlphaApps @{ 'c:\program files\contoso\alpha\alpha[.exe' = $script:AlphaCode } $null @($run)
+        { Invoke-TestAppUsage -Entries @($run) -Apps $script:AlphaApps -Known $known } | Should -Not -Throw
+        (Invoke-TestAppUsage -Entries @($run) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'Ambiguous'
+        (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'beta.exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'treats a literal foo[1].exe as literal: an unmatched foo1.exe does not match it' {
+        $known = Get-AUKnownExes $script:AlphaApps @{ 'c:\program files\contoso\alpha\foo[1].exe' = $script:AlphaCode } $null @()
+        (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'foo1.exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed'
+        (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'foo[1].exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'treats a matched exe name holding [ as literal too' {
+        $old = New-TestEntry @{ ExeInfo = '!!foo[1].exe!2026/06/01:00:00:00!11111!'; ExeName = 'foo[1].exe'; LastRanTime = (New-TestUtc '2026-09-01T00:00:00') }
+        $entries = @($old, (New-TestUnmatchedRun 'foo1.exe'))
+        $known = Get-AUKnownExes $script:AlphaApps @{} $null $entries
+        (Invoke-TestAppUsage -Entries $entries -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'never throws on a known-exe pattern that will not parse' {
+        { $script:BadPattern = (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'beta.exe')) -Apps $script:AlphaApps -Known (New-TestKnown @{ 'Contoso Alpha' = 'alpha[.exe' }))['Contoso Alpha'] } | Should -Not -Throw
+        $script:BadPattern.AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
     It 'stays NotUsed when the unmatched run is ignored, has another name, or ran before WatchingSince' {
         $known = New-TestKnown @{ 'Contoso Alpha' = 'alpha.exe' }
         $ignored = New-TestUnmatchedRun 'alpha.exe' @{ Classification = (New-TestClassification 'ps-ignore-1') }

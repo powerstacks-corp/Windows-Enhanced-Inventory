@@ -4613,6 +4613,7 @@ $script:AUMatchedSections = @('Customer', 'PowerStacks', 'Retained')
 # Facts copied into the per-executable output; for an unverified build only the path-level ones (D30).
 $script:AUExeFactFields = @('RunPath', 'LocationClass', 'FileDescription', 'FileProductName', 'FileCompanyName', 'FileVersion', 'ProductVersion', 'Subsystem')
 $script:AUPathFactFields = @('RunPath', 'LocationClass', 'Subsystem')
+$script:AUWildcardChars = [char[]]@('*', '?', '[', ']', '`')
 
 function ConvertTo-AUOutputDate
 {
@@ -4750,7 +4751,7 @@ function Get-AUKnownExes
 {
     <#
 .SYNOPSIS
-    Returns each installed app's known executables: DisplayName (ignoring case) to a set of lowercase exe names (F23).
+    Returns each installed app's known executables: DisplayName (ignoring case) to a set of lowercase exe name patterns (F23).
 .DESCRIPTION
     An app's executables are known from three sources: the .exe files Windows Installer lists as
     components of the app's ProductCode; the exeName of each identity rule (customer and PowerStacks)
@@ -4758,6 +4759,9 @@ function Get-AUKnownExes
     entries matched to the app (Get-AUTargetAppNames). A Store or MSIX package entry is known by its
     ExeInfo. Ignored entries don't count (F22), and an unresolved entry belongs to no app. An app with
     no known executable is absent, so Get-AUAppUsage reports it NotCovered.
+    Every value is a -like pattern: a rule's exeName as written (the validator checked it), and every
+    other name escaped with WildcardPattern.Escape, because a file name may hold [ or ] and must match
+    only itself.
 .PARAMETER Apps
     The installed-app entries (Task 13 shape), with ProductCode.
 .PARAMETER MsiFileMap
@@ -4776,14 +4780,16 @@ function Get-AUKnownExes
 
     $Known = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
     $Add = {
-        param ([string]$Name, [string]$Exe)
+        param ([string]$Name, [string]$Exe, [bool]$IsPattern)
         $Set = $Known[$Name]
         if ($null -eq $Set)
         {
             $Set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             $Known[$Name] = $Set
         }
-        [void]$Set.Add($Exe.ToLowerInvariant())
+        $Exe = $Exe.ToLowerInvariant()
+        if (-not $IsPattern) { $Exe = [Management.Automation.WildcardPattern]::Escape($Exe) }
+        [void]$Set.Add($Exe)
     }
     $Index = New-AUAppIndex $Apps
     $AppsByName = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
@@ -4816,7 +4822,7 @@ function Get-AUKnownExes
             if (-not $File.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { continue }
             $Leaf = $File.Substring($File.LastIndexOfAny([char[]]@('\', '/')) + 1)
             if (-not $Leaf) { continue }
-            foreach ($Name in $Owners) { & $Add $Name $Leaf }
+            foreach ($Name in $Owners) { & $Add $Name $Leaf $false }
         }
     }
 
@@ -4839,7 +4845,7 @@ function Get-AUKnownExes
                 {
                     foreach ($App in $AppsByName[$Name])
                     {
-                        if (Test-AUTargetApp $App $Keys) { & $Add $Name $Exe; break }
+                        if (Test-AUTargetApp $App $Keys) { & $Add $Name $Exe $true; break }
                     }
                 }
             }
@@ -4853,7 +4859,7 @@ function Get-AUKnownExes
         if ($null -ne $Entry.Classification -and $Entry.Classification.Ignored -eq $true) { continue }
         $Exe = Get-AUExeKey $Entry
         if (-not $Exe) { continue }
-        foreach ($Name in @(Get-AUTargetAppNames $Entry.Target $Index)) { & $Add $Name $Exe }
+        foreach ($Name in @(Get-AUTargetAppNames $Entry.Target $Index)) { & $Add $Name $Exe $false }
     }
     return $Known
 }#endfunction
@@ -5031,13 +5037,23 @@ function Get-AUAppUsage
                 $Status = 'NotUsed'
                 if ($UnmatchedNames.Count -gt 0)
                 {
-                    foreach ($Exe in @(@($State.Exes) + @($KnownExes | Where-Object { $null -ne $_ })))
+                    # Matched exe names are literal: exact match only.
+                    foreach ($Exe in $State.Exes) { if ($UnmatchedRan.Contains($Exe)) { $Status = 'Ambiguous'; break } }
+                    # Known exes are -like patterns (Get-AUKnownExes). A plain name is an exact match; a
+                    # pattern that won't parse never stops the run and falls back to an exact match.
+                    if ($Status -ceq 'NotUsed' -and $null -ne $KnownExes)
                     {
-                        $Pattern = [string]$Exe
-                        if ($UnmatchedRan.Contains($Pattern) -or ([Management.Automation.WildcardPattern]::ContainsWildcardCharacters($Pattern) -and @($UnmatchedNames -like $Pattern).Count -gt 0))
+                        foreach ($Exe in $KnownExes)
                         {
-                            $Status = 'Ambiguous'
-                            break
+                            $Pattern = [string]$Exe
+                            if (-not $Pattern) { continue }
+                            $Hit = $UnmatchedRan.Contains($Pattern)
+                            if (-not $Hit -and $Pattern.IndexOfAny($script:AUWildcardChars) -ge 0)
+                            {
+                                try { $Hit = (@($UnmatchedNames -like $Pattern).Count -gt 0) }
+                                catch { Write-CMTraceLog -Message "App Usage: known exe pattern '$Pattern' for $Trimmed isn't valid; compared exactly." -Component 'AppUsage' -Type 2 }
+                            }
+                            if ($Hit) { $Status = 'Ambiguous'; break }
                         }
                     }
                 }
