@@ -2963,6 +2963,35 @@ function Get-AUIdentityRuleHit
     return [pscustomobject]@{ Candidates = $Candidates.ToArray(); TargetPattern = $null; TargetPublisher = $null }
 }#endfunction
 
+function Get-AUCommandFile
+{
+    <#
+.SYNOPSIS
+    Returns the file named by a DisplayIcon or UninstallString value, or $null when it's blank.
+.DESCRIPTION
+    A quoted value gives the text inside the first pair of quotes. Otherwise it's the text up to the
+    first .exe, .dll, .ico, .cmd, or .bat followed by a space, a comma, or the end, or else the whole
+    value without a trailing icon index (,0). The path isn't checked or changed.
+.PARAMETER Command
+    The DisplayIcon or UninstallString value.
+#>
+    param (
+        [string]$Command
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    $Command = $Command.Trim()
+    if ($Command.StartsWith('"'))
+    {
+        $End = $Command.IndexOf('"', 1)
+        if ($End -gt 1) { return $Command.Substring(1, $End - 1) }
+        return $null
+    }
+    $Match = [regex]::Match($Command, '^(.+?\.(exe|dll|ico|cmd|bat))(?=[\s,]|$)', 'IgnoreCase')
+    if ($Match.Success) { return $Match.Groups[1].Value }
+    return [regex]::Replace($Command, ',\s*-?\d+$', '')
+}#endfunction
+
 function Get-AUAppFolders
 {
     <#
@@ -2996,20 +3025,7 @@ function Get-AUAppFolders
     & $Add ([string]$App.InstallLocation) $false
     foreach ($Command in @([string]$App.DisplayIcon, [string]$App.UninstallString))
     {
-        if ([string]::IsNullOrWhiteSpace($Command)) { continue }
-        $Command = $Command.Trim()
-        $File = $null
-        if ($Command.StartsWith('"'))
-        {
-            $End = $Command.IndexOf('"', 1)
-            if ($End -gt 1) { $File = $Command.Substring(1, $End - 1) }
-        }
-        else
-        {
-            $Match = [regex]::Match($Command, '^(.+?\.(exe|dll|ico|cmd|bat))(?=[\s,]|$)', 'IgnoreCase')
-            if ($Match.Success) { $File = $Match.Groups[1].Value }
-            else { $File = [regex]::Replace($Command, ',\s*-?\d+$', '') }
-        }
+        $File = Get-AUCommandFile $Command
         if ($File) { & $Add (& $FileFolder $File) $true }
     }
     return , $Folders.ToArray()
@@ -3631,6 +3647,104 @@ function Get-AUInstallStatus
     # The target may be a per-user install, and with no SID that scope can't have been read.
     if (-not $Sid -or (& $StateOf $Sid) -notin @('Read', 'Deleted')) { return 'Unknown' }
     return 'NotInstalled'
+}#endfunction
+
+# Role (D32). There's no System role: SYSTEM is a user property, handled by credited use (F21).
+$script:AUInstallerLocations = @('Temp', 'Download', 'ManagementCache')
+
+function Test-AUMainExe
+{
+    <#
+.SYNOPSIS
+    Tests whether an executable is its target app's main executable (F19).
+.DESCRIPTION
+    True when the target came from an identity rule: the rule's exeName named this executable, and a
+    retained target keeps its rule type. Otherwise true when the build is verified and its run path
+    equals the DisplayIcon file of an installed app that is the target app (its ProductCode or
+    PackageFamily equals the target's, or its DisplayName and Publisher match TargetPattern and
+    TargetPublisher). The paths are compared ignoring case, quotes, and the icon index.
+.PARAMETER Facts
+    The executable facts.
+.PARAMETER Target
+    The Resolve-AUTarget result.
+.PARAMETER InstalledApps
+    The installed-app entries.
+#>
+    param (
+        [pscustomobject]$Facts,
+        [pscustomobject]$Target,
+        [object[]]$InstalledApps
+    )
+
+    if ($Target.RuleType -ceq 'identity') { return $true }
+    if ($Facts.FactsVerified -ne $true) { return $false }
+    $RunPath = ([string]$Facts.RunPath).Trim().Replace('/', '\')
+    if ($RunPath.StartsWith('\\?\')) { $RunPath = $RunPath.Substring(4) }
+    if (-not $RunPath) { return $false }
+    $Leaf = $RunPath.Substring($RunPath.LastIndexOf('\') + 1)
+    if (-not $Leaf) { return $false }
+    $Code = ([string]$Target.ProductCode).Trim()
+    $Family = ([string]$Target.PackageFamily).Trim()
+    $NamePattern = $Target.TargetPattern
+    $PublisherPattern = $Target.TargetPublisher
+
+    foreach ($App in @($InstalledApps))
+    {
+        if ($null -eq $App) { continue }
+        # Most apps' DisplayIcon doesn't name this file at all, so that cheap test runs first.
+        $Icon = [string]$App.DisplayIcon
+        if (-not $Icon -or $Icon.IndexOf($Leaf, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $File = Get-AUCommandFile $Icon
+        if (-not $File) { continue }
+        $File = $File.Trim().Replace('/', '\')
+        if ($File.StartsWith('\\?\')) { $File = $File.Substring(4) }
+        if (-not [string]::Equals($File, $RunPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        if ($Code -and [string]::Equals(([string]$App.ProductCode).Trim(), $Code, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($Family -and [string]::Equals(([string]$App.PackageFamily).Trim(), $Family, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        $AppName = ([string]$App.DisplayName).Trim()
+        if ($AppName -and $null -ne $NamePattern -and $null -ne $PublisherPattern -and $AppName -like [string]$NamePattern -and ([string]$App.Publisher).Trim() -like [string]$PublisherPattern) { return $true }
+    }
+    return $false
+}#endfunction
+
+function Get-AURole
+{
+    <#
+.SYNOPSIS
+    Returns an executable's role: Installer, the classification role, Service, CLI, App, Helper, or Unmatched.
+.DESCRIPTION
+    The first that applies, in order: Installer when it ran from a Temp, Download, or ManagementCache
+    location; the classification rule's role; Service for a service binary; CLI for the console
+    subsystem; App for a matched executable that is its target's main executable (Test-AUMainExe,
+    F19); Helper for any other matched executable; else Unmatched. Matched means the target's
+    MatchSection is Customer, PowerStacks, or Retained, so a retained target is still App or Helper
+    (D17, F20). A matched executable whose subsystem isn't known (a Store package, or a file that's
+    gone) is treated as GUI, so it stays App or Helper. There's no System role, and the user type
+    isn't an input (D32, F21).
+.PARAMETER Facts
+    The executable facts.
+.PARAMETER Target
+    The Resolve-AUTarget result.
+.PARAMETER Classification
+    The Get-AUClassification result.
+.PARAMETER InstalledApps
+    The installed-app entries, for the target app's DisplayIcon.
+#>
+    param (
+        [pscustomobject]$Facts,
+        [pscustomobject]$Target,
+        [pscustomobject]$Classification,
+        [object[]]$InstalledApps
+    )
+
+    if ([string]$Facts.LocationClass -in $script:AUInstallerLocations) { return 'Installer' }
+    if ($null -ne $Classification -and -not [string]::IsNullOrWhiteSpace([string]$Classification.RuleRole)) { return [string]$Classification.RuleRole }
+    if ($Facts.IsServiceBinary -eq $true) { return 'Service' }
+    if ([string]::Equals([string]$Facts.Subsystem, 'Console', [StringComparison]::OrdinalIgnoreCase)) { return 'CLI' }
+    if ($null -eq $Target -or $Target.MatchSection -cnotin @('Customer', 'PowerStacks', 'Retained')) { return 'Unmatched' }
+    if (Test-AUMainExe $Facts $Target $InstalledApps) { return 'App' }
+    return 'Helper'
 }#endfunction
 #endregion APPUSAGE
 

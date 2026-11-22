@@ -71,6 +71,24 @@ Each executable's usage reports an `InstallStatus` for its target:
 
 An executable whose app was uninstalled stays matched to it, and its usage is still recorded. `NotInstalled` says only that the app isn't installed now. It doesn't say when or why the app was removed.
 
+### Role
+
+Each executable's usage reports a `Role`, the kind of executable it is. The first one that applies, in this order, is the role:
+
+| Role | When |
+|---|---|
+| `Installer` | It ran from a `Temp`, `Download`, or `ManagementCache` location. This beats every classification rule. |
+| The rule's role | A classification rule matched it. The role is `Windows`, `Installer`, `Helper`, `Service`, or `CLI`. |
+| `Service` | It's the program of a Windows service on the device. |
+| `CLI` | It's a console (command-line) program. |
+| `App` | It's matched to an app, and it's the app's main executable. |
+| `Helper` | It's matched to an app, and it isn't the app's main executable. |
+| `Unmatched` | It isn't matched to an app. |
+
+An executable is the app's main executable when an identity rule matched it, through its `exeName`, or when its path is the file in the app's **DisplayIcon** uninstall value and the script verified the build. Every executable an identity rule matches is a main executable, so with a pattern such as `contoso*.exe`, add a classification rule with the `Helper` role for the ones that aren't.
+
+An executable that's matched to an app stays `App` or `Helper` after the app is uninstalled. There's no role for SYSTEM: who ran an executable doesn't change its role.
+
 ### File Format
 
 ```json
