@@ -2362,9 +2362,15 @@ function Test-AUMappings
                             $When = $R['when']
                             if ($When -is [System.Management.Automation.PSCustomObject])
                             {
-                                $Min = ConvertTo-AUVersion ([string]$When.PSObject.Properties['versionMin'].Value)
-                                $Max = ConvertTo-AUVersion ([string]$When.PSObject.Properties['versionMax'].Value)
-                                if ($Min -and $Max -and $Min -gt $Max) { $Errors.Add("${Where}: when.versionMin is above when.versionMax.") }
+                                $MinText = [string]$When.PSObject.Properties['versionMin'].Value
+                                $MaxText = [string]$When.PSObject.Properties['versionMax'].Value
+                                # A bound compares only as many parts as it gives, as in matching
+                                # (Compare-AUVersionPrefix): versionMax 8 covers every 8.x, so 8.5 to 8 is a range.
+                                if ((ConvertTo-AUVersion $MinText) -and (ConvertTo-AUVersion $MaxText) -and
+                                    (Compare-AUVersionPrefix (ConvertTo-AUVersionParts $MinText) (ConvertTo-AUVersionParts $MaxText)) -gt 0)
+                                {
+                                    $Errors.Add("${Where}: when.versionMin is above when.versionMax.")
+                                }
                             }
                         }
                         'ownership'

@@ -264,6 +264,27 @@ Describe 'Test-AUMappings' {
         $e[0] | Should -Match 'versionMin'
     }
 
+    It 'checks versionMin against versionMax on as many parts as versionMax gives, as matching does: <Min> to <Max> is <Verdict>' -ForEach @(
+        @{ Min = '8.5'; Max = '8'; Verdict = 'valid' }
+        @{ Min = '8'; Max = '8'; Verdict = 'valid' }
+        @{ Min = '8.0.0.1'; Max = '8.0'; Verdict = 'valid' }
+        @{ Min = '8'; Max = '8.0.1'; Verdict = 'valid' }
+        @{ Min = '8.5'; Max = '8.4'; Verdict = 'invalid' }
+        @{ Min = '9'; Max = '8.99'; Verdict = 'invalid' }
+        @{ Min = '8.0.2'; Max = '8.0.1'; Verdict = 'invalid' }
+    ) {
+        $m = Read-TestJson 'mappings-customer-valid.json'
+        $m.customer.identityRules[0].when.versionMin = $Min
+        $m.customer.identityRules[0].when.versionMax = $Max
+        $e = Test-AUMappings $m -Kind Customer
+        if ($Verdict -eq 'valid') { $e.Count | Should -Be 0 -Because ($e -join ' | ') }
+        else
+        {
+            $e.Count | Should -Be 1
+            $e[0] | Should -Match 'versionMin is above when.versionMax'
+        }
+    }
+
     It 'rejects a non-string condition value' {
         $m = Read-TestJson 'mappings-customer-valid.json'
         $m.customer.identityRules[0].when.exeName = 5
