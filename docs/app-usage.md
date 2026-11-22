@@ -2,6 +2,14 @@
 
 App Usage (software metering) records which installed apps people actually use, from the Windows System Resource Usage Monitor (SRUM). It's off by default. To turn it on, set `$CollectAppMetering = $true` in `Intune_Windows_Inventory.ps1`.
 
+## Usage History on the Device
+
+SRUM keeps only about 30 to 60 days of usage, so the script keeps its own history on each device, in `C:\Windows\AppUsage_<Serial>.json`, where `<Serial>` is the device's serial number. The file holds each user's usage of each executable build. Each run adds what SRUM recorded since the last run, and usage that was already counted is never counted again, so the history outlasts SRUM.
+
+- The script writes a new copy of the file and then swaps it in, so a run that stops partway leaves the earlier file in place.
+- If the file can't be read, the script never overwrites it. It renames the file to `AppUsage_<Serial>.corrupt-<yyyyMMddHHmmss>.json`, with the time in UTC, starts a new history from what SRUM still holds, and reports `LedgerReset`.
+- An app update brings a new build of its executable. Once SRUM holds no usage of the old build, the script combines the old build's history into a newer build of the same app for the same user. It combines builds only when both are matched to the same app, or, for unmatched builds, when the script verified both builds and they have the same company and product names. Executables that only share a file name, such as two `setup.exe` files from different publishers, are never combined.
+
 ## Mapping Rules
 
 App Usage sees executables, not apps. Mapping rules decide which installed app each executable belongs to, and what kind of executable it is. Rules come from two files:

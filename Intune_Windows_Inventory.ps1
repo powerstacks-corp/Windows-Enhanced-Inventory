@@ -3876,6 +3876,654 @@ function Get-AUDerivedUse
         HasCreditedUse = ($null -ne $LastUsedTime)
     }
 }#endfunction
+
+# Ledger (D13, D23, F6 to F10). C:\Windows\AppUsage_<Serial>.json keeps each user's usage of each exe
+# build across runs, keyed UserSid|ExeInfo, because SRUM keeps only about 30 to 60 days. In memory,
+# every date is a Utc DateTime or $null. The caller holds the run lock around read, merge, and write.
+$script:AULedgerSchemaVersion = 1
+$script:AULedgerDateFormat = "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffffK"
+$script:AULedgerLastTimeFields = @('LastFocusOrInputTime', 'LastInteractiveRunTime', 'LastRanTime')
+$script:AUStoredTargetFields = @('Section', 'MatchRuleId', 'RuleType', 'TargetPattern', 'TargetPublisher', 'ResolvedAppName', 'ProductCode', 'PackageFamily', 'EvidenceUsed')
+
+function New-AULedger
+{
+    <#
+.SYNOPSIS
+    Returns an empty ledger: no entries, no WatchingSince, no status, and writable.
+.DESCRIPTION
+    Entries is a hashtable keyed UserSid|ExeInfo, ignoring case. Status holds status tokens (Task 15's
+    list), for example LedgerReset. Writable is false only when an unreadable ledger file couldn't be
+    moved aside, so Write-AULedger never overwrites it.
+#>
+    return [pscustomobject]@{
+        Entries       = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+        WatchingSince = $null
+        Status        = [string[]]@()
+        Writable      = $true
+    }
+}#endfunction
+
+function New-AULedgerEntry
+{
+    <#
+.SYNOPSIS
+    Returns a new ledger entry for one user and exe build, with nothing counted yet.
+.DESCRIPTION
+    ExeName comes from ConvertFrom-AUExeInfo, so a Store or MSIX package entry has ExeName $null.
+    Counted is keyed <epoch>|<AutoIncId> and holds @{ F = focus; I = input; T = end time }.
+    FocusTotal is recalculated (Update-AULedgerEntryTotal); it isn't stored in the file.
+.PARAMETER UserSid
+    The user SID.
+.PARAMETER ExeInfo
+    The SRUM ExeInfo value.
+#>
+    param (
+        [string]$UserSid,
+        [string]$ExeInfo
+    )
+
+    return [pscustomobject]@{
+        UserSid                = $UserSid
+        ExeInfo                = $ExeInfo
+        ExeName                = (ConvertFrom-AUExeInfo $ExeInfo).ExeName
+        FirstSeen              = $null
+        Counted                = @{}
+        ArchivedFocus          = [double]0
+        ArchivedInput          = [double]0
+        LastFocusOrInputTime   = $null
+        LastInteractiveRunTime = $null
+        LastRanTime            = $null
+        Facts                  = $null
+        FactsVerified          = $false
+        StoredTarget           = $null
+        FocusTotal             = [double]0
+    }
+}#endfunction
+
+function Update-AULedgerEntryTotal
+{
+    <#
+.SYNOPSIS
+    Recalculates an entry's FocusTotal: ArchivedFocus plus the focus of every counted record.
+.PARAMETER Entry
+    The ledger entry.
+#>
+    param (
+        [pscustomobject]$Entry
+    )
+
+    $Total = [double]$Entry.ArchivedFocus
+    foreach ($Record in $Entry.Counted.Values) { $Total += [double]$Record.F }
+    $Entry.FocusTotal = $Total
+}#endfunction
+
+function Get-AULaterDate
+{
+    <#
+.SYNOPSIS
+    Returns the later of two dates, ignoring $null; $null when both are $null.
+.PARAMETER First
+    A date or $null.
+.PARAMETER Second
+    A date or $null.
+#>
+    param (
+        [object]$First,
+        [object]$Second
+    )
+
+    if ($null -eq $First) { return $Second }
+    if ($null -eq $Second) { return $First }
+    if ($Second -gt $First) { return $Second }
+    return $First
+}#endfunction
+
+function Get-AUEarlierDate
+{
+    <#
+.SYNOPSIS
+    Returns the earlier of two dates, ignoring $null; $null when both are $null.
+.PARAMETER First
+    A date or $null.
+.PARAMETER Second
+    A date or $null.
+#>
+    param (
+        [object]$First,
+        [object]$Second
+    )
+
+    if ($null -eq $First) { return $Second }
+    if ($null -eq $Second) { return $First }
+    if ($Second -lt $First) { return $Second }
+    return $First
+}#endfunction
+
+function ConvertFrom-AULedgerDate
+{
+    <#
+.SYNOPSIS
+    Parses a date written by Format-AUDate back to a Utc date; $null for null or blank.
+.DESCRIPTION
+    Throws when the text isn't a ledger date or isn't UTC, so Read-AULedger treats the file as
+    unreadable instead of guessing.
+.PARAMETER Value
+    The JSON value: a string or $null.
+#>
+    param (
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    $Text = ([string]$Value).Trim()
+    if (-not $Text) { return $null }
+    $Date = [datetime]::ParseExact($Text, $script:AULedgerDateFormat, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    if ($Date.Kind -ne [DateTimeKind]::Utc) { throw "Ledger date '$Text' isn't UTC." }
+    return $Date
+}#endfunction
+
+function Format-AULedgerDate
+{
+    <#
+.SYNOPSIS
+    Formats a ledger date with Format-AUDate; $null stays $null, never an empty string.
+.PARAMETER Value
+    A Utc date or $null. Format-AUDate throws on any other kind.
+#>
+    param (
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    return (Format-AUDate $Value)
+}#endfunction
+
+function ConvertFrom-AULedgerRecord
+{
+    <#
+.SYNOPSIS
+    Rebuilds a ledger entry from its JSON record. Throws when the record is malformed.
+.DESCRIPTION
+    Counted is rebuilt from its array into a hashtable, and every date into a Utc date. The stored
+    target keeps Task 7's shape (ConvertTo-AUStoredTarget). FocusTotal is recalculated.
+.PARAMETER Record
+    One element of the file's Entries array.
+#>
+    param (
+        [object]$Record
+    )
+
+    if ($null -eq $Record -or $Record -isnot [pscustomobject]) { throw 'A ledger entry is not an object.' }
+    $ExeInfo = ([string]$Record.ExeInfo).Trim()
+    if (-not $ExeInfo) { throw 'A ledger entry has no ExeInfo.' }
+    $UserSid = ([string]$Record.UserSid).Trim()
+    $Entry = New-AULedgerEntry $UserSid $ExeInfo
+    $Entry.ExeName = $(if ([string]::IsNullOrWhiteSpace([string]$Record.ExeName)) { $null } else { [string]$Record.ExeName })
+    $Entry.FirstSeen = ConvertFrom-AULedgerDate $Record.FirstSeen
+    foreach ($Name in $script:AULedgerLastTimeFields) { $Entry.$Name = ConvertFrom-AULedgerDate $Record.$Name }
+    $Entry.ArchivedFocus = [double]$Record.ArchivedFocus
+    $Entry.ArchivedInput = [double]$Record.ArchivedInput
+    foreach ($Item in @($Record.Counted))
+    {
+        if ($null -eq $Item) { continue }
+        $Key = ([string]$Item.K).Trim()
+        if (-not $Key) { throw "A counted record of $ExeInfo has no key." }
+        if ($Entry.Counted.ContainsKey($Key)) { throw "Counted record $Key of $ExeInfo appears twice." }
+        $Entry.Counted[$Key] = @{ F = [double]$Item.F; I = [double]$Item.I; T = (ConvertFrom-AULedgerDate $Item.T) }
+    }
+    $Entry.Facts = $Record.Facts
+    $Entry.FactsVerified = ($Record.FactsVerified -eq $true)
+    if ($null -ne $Record.StoredTarget)
+    {
+        $Target = [ordered]@{}
+        foreach ($Name in $script:AUStoredTargetFields) { $Target[$Name] = $Record.StoredTarget.$Name }
+        $Entry.StoredTarget = [pscustomobject]$Target
+    }
+    Update-AULedgerEntryTotal $Entry
+    return $Entry
+}#endfunction
+
+function ConvertTo-AULedgerRecord
+{
+    <#
+.SYNOPSIS
+    Returns the JSON record for a ledger entry: its stored fields only, dates as Format-AUDate text.
+.DESCRIPTION
+    Counted becomes an array of { K, F, I, T }, because ConvertFrom-Json in Windows PowerShell 5.1
+    rejects object keys that differ only in case. Fields recalculated each run (FocusTotal and the
+    run's target, role, and status) aren't written (D13).
+.PARAMETER Entry
+    The ledger entry.
+#>
+    param (
+        [pscustomobject]$Entry
+    )
+
+    $Keys = [string[]]@($Entry.Counted.Keys)
+    [Array]::Sort($Keys, [StringComparer]::Ordinal)
+    $Counted = New-Object Collections.Generic.List[object]
+    foreach ($Key in $Keys)
+    {
+        $Record = $Entry.Counted[$Key]
+        $Counted.Add([ordered]@{ K = $Key; F = [double]$Record.F; I = [double]$Record.I; T = (Format-AULedgerDate $Record.T) })
+    }
+    $StoredTarget = $null
+    if ($null -ne $Entry.StoredTarget)
+    {
+        $StoredTarget = [ordered]@{}
+        foreach ($Name in $script:AUStoredTargetFields) { $StoredTarget[$Name] = $Entry.StoredTarget.$Name }
+    }
+
+    $Result = [ordered]@{
+        UserSid       = $Entry.UserSid
+        ExeInfo       = $Entry.ExeInfo
+        ExeName       = $Entry.ExeName
+        FirstSeen     = (Format-AULedgerDate $Entry.FirstSeen)
+        Counted       = $Counted.ToArray()
+        ArchivedFocus = [double]$Entry.ArchivedFocus
+        ArchivedInput = [double]$Entry.ArchivedInput
+    }
+    foreach ($Name in $script:AULedgerLastTimeFields) { $Result[$Name] = Format-AULedgerDate $Entry.$Name }
+    $Result['Facts'] = $Entry.Facts
+    $Result['FactsVerified'] = ($Entry.FactsVerified -eq $true)
+    $Result['StoredTarget'] = $StoredTarget
+    return $Result
+}#endfunction
+
+function Move-AUFileAtomic
+{
+    <#
+.SYNOPSIS
+    Swaps a file over its target: [IO.File]::Replace when the target exists, [IO.File]::Move otherwise.
+.DESCRIPTION
+    The only swap path for the ledger, so a test can make it fail (F8). Both files must be on the
+    same volume. Throws on failure.
+.PARAMETER Source
+    The file to move.
+.PARAMETER Target
+    The file to replace or create.
+#>
+    param (
+        [string]$Source,
+        [string]$Target
+    )
+
+    if ([IO.File]::Exists($Target)) { [IO.File]::Replace($Source, $Target, [NullString]::Value) }
+    else { [IO.File]::Move($Source, $Target) }
+}#endfunction
+
+function Move-AUUnreadableLedger
+{
+    <#
+.SYNOPSIS
+    Moves an unreadable ledger aside to <name>.corrupt-<yyyyMMddHHmmss>.json, bytes intact.
+.DESCRIPTION
+    The time stamp is UTC. A name already taken gets a -<n> suffix, so an earlier copy is never
+    overwritten. Returns the new path, or $null when the file couldn't be moved. Never throws.
+.PARAMETER Path
+    The ledger path.
+#>
+    param (
+        [string]$Path
+    )
+
+    try
+    {
+        $Folder = [IO.Path]::GetDirectoryName($Path)
+        $Name = [IO.Path]::GetFileNameWithoutExtension($Path)
+        $Stamp = [datetime]::UtcNow.ToString('yyyyMMddHHmmss', [Globalization.CultureInfo]::InvariantCulture)
+        $Aside = [IO.Path]::Combine($Folder, "$Name.corrupt-$Stamp.json")
+        $Number = 1
+        while ([IO.File]::Exists($Aside))
+        {
+            $Aside = [IO.Path]::Combine($Folder, "$Name.corrupt-$Stamp-$Number.json")
+            $Number++
+        }
+        [IO.File]::Move($Path, $Aside)
+        Write-CMTraceLog -Message "App Usage: moved the unreadable ledger aside to $Aside." -Component 'AppUsage' -Type 2
+        return $Aside
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't move the unreadable ledger $Path aside, so it won't be written this run: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $null
+    }
+}#endfunction
+
+function Read-AULedger
+{
+    <#
+.SYNOPSIS
+    Reads the ledger file into Entries (keyed UserSid|ExeInfo, ignoring case), WatchingSince, and Status.
+.DESCRIPTION
+    A missing file gives an empty ledger. A file that can't be read or parsed, or isn't a ledger of
+    this schema, is moved aside (Move-AUUnreadableLedger) and never overwritten; the ledger starts
+    empty, so it's rebuilt from SRUM, and Status holds LedgerReset. If the file can't be moved aside,
+    Writable is false and Write-AULedger leaves it alone. Dates come back as Utc dates. Never throws.
+.PARAMETER Path
+    The ledger path, C:\Windows\AppUsage_<Serial>.json.
+#>
+    param (
+        [string]$Path
+    )
+
+    $Ledger = New-AULedger
+    if (-not [IO.File]::Exists($Path)) { return $Ledger }
+    try
+    {
+        $Text = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+        $Data = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
+        if ($null -eq $Data -or $Data -isnot [pscustomobject] -or $null -eq $Data.PSObject.Properties['Entries']) { throw 'The file is not a ledger.' }
+        if ($Data.SchemaVersion -ne $script:AULedgerSchemaVersion) { throw "Ledger schema version '$($Data.SchemaVersion)' isn't $($script:AULedgerSchemaVersion)." }
+        $Ledger.WatchingSince = ConvertFrom-AULedgerDate $Data.WatchingSince
+        foreach ($Record in @($Data.Entries))
+        {
+            if ($null -eq $Record) { continue }
+            $Entry = ConvertFrom-AULedgerRecord $Record
+            $Key = "$($Entry.UserSid)|$($Entry.ExeInfo)"
+            if ($Ledger.Entries.ContainsKey($Key)) { throw "Ledger entry $Key appears twice." }
+            $Ledger.Entries[$Key] = $Entry
+        }
+        return $Ledger
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: the ledger $Path is unreadable, so it's rebuilt from SRUM: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        $Ledger = New-AULedger
+        $Ledger.Status = [string[]]@('LedgerReset')
+        if ($null -eq (Move-AUUnreadableLedger $Path)) { $Ledger.Writable = $false }
+        return $Ledger
+    }
+}#endfunction
+
+function Write-AULedger
+{
+    <#
+.SYNOPSIS
+    Writes the ledger: a temp file next to the target, then Move-AUFileAtomic swaps it over the target.
+.DESCRIPTION
+    The format is ConvertTo-Json -Depth 8 (Windows PowerShell 5.1 defaults to depth 2), UTF-8 without
+    a BOM, dates as Format-AUDate strings, and Entries as an array (F7). On failure the temp file is
+    removed and the error is rethrown; the file on disk is unchanged (F8). A ledger that isn't
+    Writable (an unreadable file that couldn't be moved aside) isn't written.
+.PARAMETER Ledger
+    The ledger from Read-AULedger.
+.PARAMETER Path
+    The ledger path.
+#>
+    param (
+        [pscustomobject]$Ledger,
+        [string]$Path
+    )
+
+    if ($Ledger.Writable -eq $false)
+    {
+        Write-CMTraceLog -Message "App Usage: the ledger $Path wasn't written, because the unreadable file there couldn't be moved aside." -Component 'AppUsage' -Type 2
+        return
+    }
+
+    $Temp = "$Path.tmp"
+    try
+    {
+        $Keys = [string[]]@($Ledger.Entries.Keys)
+        [Array]::Sort($Keys, [StringComparer]::Ordinal)
+        $Records = New-Object Collections.Generic.List[object]
+        foreach ($Key in $Keys) { $Records.Add((ConvertTo-AULedgerRecord $Ledger.Entries[$Key])) }
+        $Data = [ordered]@{
+            SchemaVersion = $script:AULedgerSchemaVersion
+            WatchingSince = (Format-AULedgerDate $Ledger.WatchingSince)
+            Entries       = $Records.ToArray()
+        }
+        $Json = ConvertTo-Json -InputObject $Data -Depth 8 -Compress
+        [IO.File]::WriteAllText($Temp, $Json, (New-Object Text.UTF8Encoding $false))
+        Move-AUFileAtomic -Source $Temp -Target $Path
+    }
+    catch
+    {
+        $Failure = $_
+        try { if ([IO.File]::Exists($Temp)) { [IO.File]::Delete($Temp) } } catch { }
+        Write-CMTraceLog -Message "App Usage: couldn't write the ledger $Path; the file is unchanged: $($Failure.Exception.Message)" -Component 'AppUsage' -Type 3
+        throw $Failure
+    }
+}#endfunction
+
+function Merge-AUSrumRecords
+{
+    <#
+.SYNOPSIS
+    Folds one run's SRUM AppTimelineProvider rows into the ledger, by record key, not by time (D23).
+.DESCRIPTION
+    Each row is keyed <Epoch>|<AutoIncId> inside its entry (UserSid|ExeInfo). A key seen again replaces
+    its counted values, so a duplicate adds nothing and an update adds only the difference. A new key
+    counts, however old its end time. A counted key missing from this run's rows has aged out: its
+    values move into ArchivedFocus and ArchivedInput, and it leaves Counted, so a new epoch archives
+    every old-epoch key. FocusTotal (ArchivedFocus plus the counted focus) is unchanged by archiving.
+    The last-time fields only move forward: LastRanTime for any user, LastInteractiveRunTime when
+    Test-AUInteractiveUserType passes, and LastFocusOrInputTime when Test-AUFocusRecord does (F5, F6).
+    FirstSeen is set once, to the earliest end time of the merge that first saw the entry, and
+    WatchingSince on the first merge only, to the earliest end time in its rows (F9). With no rows or
+    no epoch nothing changes, so a failed SRUM read never archives counted keys (F10; the caller also
+    merges only after a successful, non-empty read). Rows without ExeInfo or AutoIncId are skipped.
+.PARAMETER Ledger
+    The ledger from Read-AULedger.
+.PARAMETER Rows
+    The Read-AUSrum Timeline rows: UserSid, ExeInfo, AutoIncId, EndTimeUtc, FocusSeconds, InputSeconds.
+.PARAMETER Epoch
+    The SRUM database epoch (its signature).
+.PARAMETER UserTypes
+    SID to user type (Get-AUUserType). A SID that's missing counts as Unknown, never interactive.
+.PARAMETER MinFocusSeconds
+    The focus floor, passed by the caller from $MinFocusSecondsForUse.
+#>
+    param (
+        [pscustomobject]$Ledger,
+        [object[]]$Rows,
+        [string]$Epoch,
+        [hashtable]$UserTypes,
+        [double]$MinFocusSeconds
+    )
+
+    $Epoch = ([string]$Epoch).Trim()
+    if (-not $Epoch)
+    {
+        Write-CMTraceLog -Message 'App Usage: no SRUM epoch, so the ledger is unchanged.' -Component 'AppUsage' -Type 2
+        return
+    }
+
+    $Entries = $Ledger.Entries
+    $Present = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $OpenFirstSeen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $Interactive = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Earliest = $null
+    $Merged = 0
+    $Skipped = 0
+
+    # Inline per-row work: this loop runs once per SRUM row, tens of thousands of times.
+    foreach ($Row in @($Rows))
+    {
+        if ($null -eq $Row) { continue }
+        $ExeInfo = ([string]$Row.ExeInfo).Trim()
+        $Id = ([string]$Row.AutoIncId).Trim()
+        if (-not $ExeInfo -or -not $Id) { $Skipped++; continue }
+        $UserSid = ([string]$Row.UserSid).Trim()
+        $Key = "$UserSid|$ExeInfo"
+        $RecordKey = "$Epoch|$Id"
+        # SRUM times are UTC: an Unspecified date is marked Utc, and a Local one is converted.
+        $Time = $Row.EndTimeUtc
+        if ($Time -isnot [datetime]) { $Time = $null }
+        elseif ($Time.Kind -eq [DateTimeKind]::Local) { $Time = $Time.ToUniversalTime() }
+        elseif ($Time.Kind -ne [DateTimeKind]::Utc) { $Time = [datetime]::SpecifyKind($Time, [DateTimeKind]::Utc) }
+        # SRUM's null means 0 seconds; a negative or non-numeric value counts as 0 too.
+        $Focus = $Row.FocusSeconds -as [double]
+        if (-not ($Focus -gt 0)) { $Focus = [double]0 }
+        $InputSeconds = $Row.InputSeconds -as [double]
+        if (-not ($InputSeconds -gt 0)) { $InputSeconds = [double]0 }
+
+        $Entry = $Entries[$Key]
+        if ($null -eq $Entry)
+        {
+            $Entry = New-AULedgerEntry $UserSid $ExeInfo
+            $Entries[$Key] = $Entry
+        }
+        if (-not $Present.ContainsKey($Key))
+        {
+            $Present[$Key] = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            if ($null -eq $Entry.FirstSeen) { [void]$OpenFirstSeen.Add($Key) }
+        }
+        [void]$Present[$Key].Add($RecordKey)
+        $Entry.Counted[$RecordKey] = @{ F = $Focus; I = $InputSeconds; T = $Time }
+        $Merged++
+
+        if ($null -eq $Time) { continue }
+        if ($null -eq $Earliest -or $Time -lt $Earliest) { $Earliest = $Time }
+        if ($OpenFirstSeen.Contains($Key) -and ($null -eq $Entry.FirstSeen -or $Time -lt $Entry.FirstSeen)) { $Entry.FirstSeen = $Time }
+        if ($null -eq $Entry.LastRanTime -or $Time -gt $Entry.LastRanTime) { $Entry.LastRanTime = $Time }
+
+        if (-not $Interactive.ContainsKey($UserSid))
+        {
+            $UserType = 'Unknown'
+            if ($null -ne $UserTypes -and $null -ne $UserTypes[$UserSid]) { $UserType = [string]$UserTypes[$UserSid] }
+            $Interactive[$UserSid] = @{ Type = $UserType; Interactive = (Test-AUInteractiveUserType $UserType) }
+        }
+        $User = $Interactive[$UserSid]
+        if (-not $User.Interactive) { continue }
+        if ($null -eq $Entry.LastInteractiveRunTime -or $Time -gt $Entry.LastInteractiveRunTime) { $Entry.LastInteractiveRunTime = $Time }
+        if (($null -eq $Entry.LastFocusOrInputTime -or $Time -gt $Entry.LastFocusOrInputTime) -and
+            (Test-AUFocusRecord -UserType $User.Type -FocusSeconds $Focus -InputSeconds $InputSeconds -MinFocusSeconds $MinFocusSeconds))
+        {
+            $Entry.LastFocusOrInputTime = $Time
+        }
+    }
+
+    # Nothing merged (no rows, or none usable): archiving now would treat every counted key as aged
+    # out, and those keys would count again when SRUM is read next time (F10).
+    if ($Merged -eq 0)
+    {
+        Write-CMTraceLog -Message "App Usage: no usable SRUM rows to merge ($Skipped skipped); the ledger is unchanged." -Component 'AppUsage' -Type 2
+        return
+    }
+
+    $Archived = 0
+    foreach ($Key in @($Entries.Keys))
+    {
+        $Entry = $Entries[$Key]
+        $Seen = $Present[$Key]
+        foreach ($RecordKey in @($Entry.Counted.Keys))
+        {
+            if ($null -ne $Seen -and $Seen.Contains($RecordKey)) { continue }
+            $Record = $Entry.Counted[$RecordKey]
+            $Entry.ArchivedFocus = [double]$Entry.ArchivedFocus + [double]$Record.F
+            $Entry.ArchivedInput = [double]$Entry.ArchivedInput + [double]$Record.I
+            $Entry.Counted.Remove($RecordKey)
+            $Archived++
+        }
+        Update-AULedgerEntryTotal $Entry
+    }
+
+    if ($null -eq $Ledger.WatchingSince -and $null -ne $Earliest) { $Ledger.WatchingSince = $Earliest }
+    Write-CMTraceLog -Message "App Usage: merged $Merged SRUM rows ($Skipped skipped) into $($Entries.Count) ledger entries; $Archived aged-out records archived." -Component 'AppUsage'
+}#endfunction
+
+function Get-AUFoldIdentity
+{
+    <#
+.SYNOPSIS
+    Returns the identity two builds must share to fold, or $null when the build's identity is unknown.
+.DESCRIPTION
+    A build with a stored target is identified by its section, rule ID, and target pattern. A build
+    without one is identified by its verified CompanyName and ProductName, and only when both are
+    present. Otherwise its identity is unknown, and it never folds (D23).
+.PARAMETER Entry
+    The ledger entry.
+#>
+    param (
+        [pscustomobject]$Entry
+    )
+
+    $Separator = [string][char]31
+    $Target = $Entry.StoredTarget
+    if ($null -ne $Target)
+    {
+        $Parts = @(([string]$Target.Section).Trim(), ([string]$Target.MatchRuleId).Trim(), ([string]$Target.TargetPattern).Trim())
+        if ($Parts[0] -and $Parts[1] -and $Parts[2]) { return ('Target' + $Separator + ($Parts -join $Separator)) }
+    }
+    if ($Entry.FactsVerified -eq $true -and $null -ne $Entry.Facts)
+    {
+        $Company = ([string]$Entry.Facts.FileCompanyName).Trim()
+        $Product = ([string]$Entry.Facts.FileProductName).Trim()
+        if ($Company -and $Product) { return ('Facts' + $Separator + $Company + $Separator + $Product) }
+    }
+    return $null
+}#endfunction
+
+function Invoke-AULedgerFold
+{
+    <#
+.SYNOPSIS
+    Folds aged-out builds into a build of the same app, so the ledger doesn't grow with every update.
+.DESCRIPTION
+    Builds fold only with the same user SID, the same exe name, and the same known identity
+    (Get-AUFoldIdentity): never unrelated apps that share an exe name (D23). Package entries have no
+    exe name and never fold. Only a build whose SRUM rows have all aged out (an empty Counted) is
+    folded away (F9). It folds into the group's survivor: a build that still has counted rows if there
+    is one, then the one that ran last. The survivor keeps the earliest FirstSeen, the latest of each
+    last-time field, and the summed archived totals.
+.PARAMETER Ledger
+    The ledger.
+#>
+    param (
+        [pscustomobject]$Ledger
+    )
+
+    $Entries = $Ledger.Entries
+    $Groups = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Keys = [string[]]@($Entries.Keys)
+    [Array]::Sort($Keys, [StringComparer]::Ordinal)
+    foreach ($Key in $Keys)
+    {
+        $Entry = $Entries[$Key]
+        $ExeName = ([string]$Entry.ExeName).Trim()
+        if (-not $ExeName) { continue }
+        $Identity = Get-AUFoldIdentity $Entry
+        if ($null -eq $Identity) { continue }
+        $GroupKey = ([string]$Entry.UserSid).Trim() + [char]31 + $ExeName + [char]31 + $Identity
+        if (-not $Groups.ContainsKey($GroupKey)) { $Groups[$GroupKey] = New-Object Collections.Generic.List[string] }
+        $Groups[$GroupKey].Add($Key)
+    }
+
+    $Folded = 0
+    foreach ($Members in $Groups.Values)
+    {
+        if ($Members.Count -lt 2) { continue }
+        $Survivor = $null
+        foreach ($Key in $Members)
+        {
+            if ($null -eq $Survivor) { $Survivor = $Key; continue }
+            $Candidate = $Entries[$Key]
+            $Current = $Entries[$Survivor]
+            $CandidateLive = $Candidate.Counted.Count -gt 0
+            $CurrentLive = $Current.Counted.Count -gt 0
+            if ($CandidateLive -ne $CurrentLive) { if ($CandidateLive) { $Survivor = $Key }; continue }
+            if ($null -ne $Candidate.LastRanTime -and ($null -eq $Current.LastRanTime -or $Candidate.LastRanTime -gt $Current.LastRanTime)) { $Survivor = $Key }
+        }
+
+        $Kept = $Entries[$Survivor]
+        foreach ($Key in $Members)
+        {
+            if ($Key -eq $Survivor) { continue }
+            $Source = $Entries[$Key]
+            if ($Source.Counted.Count -gt 0) { continue }
+            $Kept.FirstSeen = Get-AUEarlierDate $Kept.FirstSeen $Source.FirstSeen
+            foreach ($Name in $script:AULedgerLastTimeFields) { $Kept.$Name = Get-AULaterDate $Kept.$Name $Source.$Name }
+            $Kept.ArchivedFocus = [double]$Kept.ArchivedFocus + [double]$Source.ArchivedFocus
+            $Kept.ArchivedInput = [double]$Kept.ArchivedInput + [double]$Source.ArchivedInput
+            $Entries.Remove($Key)
+            $Folded++
+        }
+        Update-AULedgerEntryTotal $Kept
+    }
+    if ($Folded -gt 0) { Write-CMTraceLog -Message "App Usage: folded $Folded aged-out builds into newer builds of the same app." -Component 'AppUsage' }
+}#endfunction
 #endregion APPUSAGE
 
 #region script
