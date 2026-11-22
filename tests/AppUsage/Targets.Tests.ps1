@@ -228,6 +228,66 @@ Describe 'Get-AUInstallStatus' {
     }
 }
 
+Describe 'Text from files and the registry in -like patterns (I1)' {
+    It 'ConvertTo-AUWildcardLiteral gives a pattern that matches <Name> and nothing else' -ForEach @(
+        @{ Name = 'Contoso `[EU' }
+        @{ Name = 'Contoso `[EU`]' }
+        @{ Name = 'a`b*c?[d]' }
+        @{ Name = 'x`' }
+        @{ Name = 'Contoso Alpha' }
+    ) {
+        $p = ConvertTo-AUWildcardLiteral $Name
+        { $Name -like $p } | Should -Not -Throw
+        ($Name -like $p) | Should -BeTrue
+        ($Name.ToUpperInvariant() -like $p) | Should -BeTrue
+        foreach ($Other in @($Name.Replace('`', ''), $Name.Replace('[', ''), ($Name + 'x'), $Name.Replace('`', '``'), 'Contoso `E', 'a`b'))
+        {
+            if ($Other -ceq $Name) { continue }
+            ($Other -like $p) | Should -BeFalse -Because "'$Other' isn't '$Name'"
+        }
+        [Management.Automation.WildcardPattern]::Unescape($p) | Should -BeExactly $Name
+    }
+
+    It 'ConvertTo-AUWildcardLiteral gives an empty pattern for an empty or null text' {
+        ConvertTo-AUWildcardLiteral '' | Should -BeExactly ''
+        ConvertTo-AUWildcardLiteral $null | Should -BeExactly ''
+    }
+
+    It 'Test-AUTargetApp matches a literal pattern for a DisplayName with a backtick and [ only to that name' {
+        $name = 'Contoso `[EU'
+        $keys = Get-AUTargetKeys ([pscustomobject]@{ TargetPattern = (ConvertTo-AUWildcardLiteral $name); TargetPublisher = 'Contoso'; RuleType = 'identity'; InstalledStateDependent = $false })
+        Test-AUTargetApp (New-TestApp $name 'Contoso') $keys | Should -BeTrue
+        Test-AUTargetApp (New-TestApp 'Contoso `E' 'Contoso') $keys | Should -BeFalse
+        Test-AUTargetApp (New-TestApp 'Contoso [EU' 'Contoso') $keys | Should -BeFalse
+    }
+
+    It 'Test-AUTargetApp never throws on a stored pattern that won''t parse (a ledger written before this fix), and compares it exactly' {
+        # WildcardPattern.Escape on Windows PowerShell 5.1 leaves the backtick, so this pattern is invalid.
+        $old = [Management.Automation.WildcardPattern]::Escape('Contoso `[EU')
+        { 'Contoso `[EU' -like $old } | Should -Throw
+        $keys = Get-AUTargetKeys ([pscustomobject]@{ TargetPattern = $old; TargetPublisher = 'Contoso'; RuleType = 'identity'; InstalledStateDependent = $false })
+        { Test-AUTargetApp (New-TestApp 'Contoso `[EU' 'Contoso') $keys } | Should -Not -Throw
+        Test-AUTargetApp (New-TestApp 'Contoso `[EU' 'Contoso') $keys | Should -BeTrue
+        Test-AUTargetApp (New-TestApp 'Contoso `E' 'Contoso') $keys | Should -BeFalse
+    }
+
+    It 'an arpCompare target on the DisplayName <Name> is Installed on itself and NotInstalled on another app, without throwing' -ForEach @(
+        @{ Name = 'Contoso `[EU'; Product = 'Contoso EU' }
+        @{ Name = 'Contoso `[EU]'; Product = 'Contoso' }
+    ) {
+        $m = New-TestMappings -PowerStacks @($script:RuleArp)
+        $app = New-TestApp $Name 'Contoso'
+        $identity = Resolve-AUIdentity (New-TestFacts @{ FileCompanyName = 'Contoso'; FileProductName = $Product }) $m @($app)
+        $identity.ResolvedAppName | Should -BeExactly $Name
+        $stored = ConvertTo-AUStoredTarget (Resolve-AUTarget $identity $null $m)
+        $t = Resolve-AUTarget $script:NoMatch $stored $m
+        $t.MatchSection | Should -BeExactly 'Retained'
+        { Get-AUInstallStatus $t @($app) (New-TestScopeRead) $script:TestSid } | Should -Not -Throw
+        Get-AUInstallStatus $t @($app) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+        Get-AUInstallStatus $t @((New-TestApp 'Contoso `E' 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+    }
+}
+
 Describe 'Resolve-AUTarget' {
     Context 'Retained targets (D17, F11)' {
         It 'keeps an arpCompare target after the app is uninstalled: Retained, same rule, NotInstalled' {

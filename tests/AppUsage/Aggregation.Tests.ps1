@@ -407,6 +407,19 @@ Describe 'Get-AUAppUsage known exe that ran unmatched (D30)' {
         (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'beta.exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed'
     }
 
+    It 'treats a Windows Installer name <Name> as literal: it matches itself and nothing else, without throwing' -ForEach @(
+        @{ Name = 'a`[b].exe' }
+        @{ Name = 'a`[b.exe' }
+    ) {
+        $known = Get-AUKnownExes $script:AlphaApps @{ ('c:\program files\contoso\alpha\' + $Name) = $script:AlphaCode } $null @()
+        { Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun $Name)) -Apps $script:AlphaApps -Known $known } | Should -Not -Throw
+        (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun $Name)) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'Ambiguous'
+        foreach ($Other in @('a`b.exe', 'ab.exe', 'a[b].exe', 'a`].exe', 'a``[b].exe'))
+        {
+            (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun $Other)) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed' -Because $Other
+        }
+    }
+
     It 'treats a literal foo[1].exe as literal: an unmatched foo1.exe does not match it' {
         $known = Get-AUKnownExes $script:AlphaApps @{ 'c:\program files\contoso\alpha\foo[1].exe' = $script:AlphaCode } $null @()
         (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'foo1.exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed'

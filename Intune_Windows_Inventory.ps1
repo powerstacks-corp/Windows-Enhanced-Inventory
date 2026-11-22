@@ -2672,6 +2672,28 @@ function Test-AUTextPattern
     return (([string]$Value).Trim() -like [string]$Pattern)
 }#endfunction
 
+function ConvertTo-AUWildcardLiteral
+{
+    <#
+.SYNOPSIS
+    Returns a -like pattern that matches only the given text (ignoring case, as -like does).
+.DESCRIPTION
+    Every pattern built from file or registry text (a DisplayName, a Publisher, an exe file name)
+    goes through this. It escapes the backtick first, then *, ?, [, and ]. Windows PowerShell 5.1's
+    WildcardPattern.Escape doesn't escape the backtick, so a name holding `[ gives a pattern that
+    matches other text or throws. WildcardPattern.Unescape reverses this. Returns '' for a null or
+    empty text.
+.PARAMETER Text
+    The text to match literally.
+#>
+    param (
+        [AllowNull()][string]$Text
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    return $Text.Replace('`', '``').Replace('*', '`*').Replace('?', '`?').Replace('[', '`[').Replace(']', '`]')
+}#endfunction
+
 function Get-AUNormalizedText
 {
     <#
@@ -3278,8 +3300,8 @@ function Resolve-AUIdentity
     }
     else
     {
-        $Result.TargetPattern = [Management.Automation.WildcardPattern]::Escape(([string]$Chosen.DisplayName).Trim())
-        $Result.TargetPublisher = [Management.Automation.WildcardPattern]::Escape(([string]$Chosen.Publisher).Trim())
+        $Result.TargetPattern = ConvertTo-AUWildcardLiteral ([string]$Chosen.DisplayName).Trim()
+        $Result.TargetPublisher = ConvertTo-AUWildcardLiteral ([string]$Chosen.Publisher).Trim()
     }
     if ($Chosen)
     {
@@ -3634,7 +3656,19 @@ function Test-AUTargetApp
     if ($Keys.Code -and [string]::Equals(([string]$App.ProductCode).Trim(), $Keys.Code, [StringComparison]::OrdinalIgnoreCase)) { return $true }
     if ($Keys.Family -and [string]::Equals(([string]$App.PackageFamily).Trim(), $Keys.Family, [StringComparison]::OrdinalIgnoreCase)) { return $true }
     $AppName = ([string]$App.DisplayName).Trim()
-    if ($AppName -and $null -ne $Keys.NamePattern -and $null -ne $Keys.PublisherPattern -and $AppName -like [string]$Keys.NamePattern -and ([string]$App.Publisher).Trim() -like [string]$Keys.PublisherPattern) { return $true }
+    if ($AppName -and $null -ne $Keys.NamePattern -and $null -ne $Keys.PublisherPattern)
+    {
+        $AppPublisher = ([string]$App.Publisher).Trim()
+        # A stored pattern that won't parse (one escaped before ConvertTo-AUWildcardLiteral existed)
+        # never throws: it's compared exactly with the text it was escaped from.
+        try { $Hit = ($AppName -like [string]$Keys.NamePattern -and $AppPublisher -like [string]$Keys.PublisherPattern) }
+        catch
+        {
+            $Hit = ([string]::Equals($AppName, [Management.Automation.WildcardPattern]::Unescape([string]$Keys.NamePattern), [StringComparison]::OrdinalIgnoreCase) -and
+                [string]::Equals($AppPublisher, [Management.Automation.WildcardPattern]::Unescape([string]$Keys.PublisherPattern), [StringComparison]::OrdinalIgnoreCase))
+        }
+        if ($Hit) { return $true }
+    }
     if ($Keys.NameKey -and $Keys.PublisherKey -and (Get-AUNormalizedText ([string]$App.Publisher) -Kind Publisher) -ceq $Keys.PublisherKey -and (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -ceq $Keys.NameKey) { return $true }
     return $false
 }#endfunction
@@ -4760,8 +4794,8 @@ function Get-AUKnownExes
     ExeInfo. Ignored entries don't count (F22), and an unresolved entry belongs to no app. An app with
     no known executable is absent, so Get-AUAppUsage reports it NotCovered.
     Every value is a -like pattern: a rule's exeName as written (the validator checked it), and every
-    other name escaped with WildcardPattern.Escape, because a file name may hold [ or ] and must match
-    only itself.
+    other name escaped with ConvertTo-AUWildcardLiteral, because a file name may hold `, [, or ] and
+    must match only itself.
 .PARAMETER Apps
     The installed-app entries (Task 13 shape), with ProductCode.
 .PARAMETER MsiFileMap
@@ -4788,7 +4822,7 @@ function Get-AUKnownExes
             $Known[$Name] = $Set
         }
         $Exe = $Exe.ToLowerInvariant()
-        if (-not $IsPattern) { $Exe = [Management.Automation.WildcardPattern]::Escape($Exe) }
+        if (-not $IsPattern) { $Exe = ConvertTo-AUWildcardLiteral $Exe }
         [void]$Set.Add($Exe)
     }
     $Index = New-AUAppIndex $Apps
