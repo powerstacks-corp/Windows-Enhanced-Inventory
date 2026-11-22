@@ -5301,6 +5301,139 @@ function Get-AUUnmatchedExeCount
     }
     return $Count
 }#endfunction
+
+$script:AULockName = 'Global\PowerStacksAppUsage'
+# Well-known SIDs, never localized names: SYSTEM and Administrators (F27).
+$script:AULockAclSids = @('S-1-5-18', 'S-1-5-32-544')
+
+function Test-AUExceptionType
+{
+    <#
+.SYNOPSIS
+    Returns true when the exception, or any exception it wraps, is of the given type.
+.DESCRIPTION
+    PowerShell wraps a .NET method's exception in a MethodInvocationException, so the real cause is
+    often an inner exception.
+.PARAMETER Exception
+    The exception to check.
+.PARAMETER Type
+    The exception type to look for.
+#>
+    param (
+        [Exception]$Exception,
+        [type]$Type
+    )
+
+    for ($Current = $Exception; $null -ne $Current; $Current = $Current.InnerException)
+    {
+        if ($Type.IsInstanceOfType($Current)) { return $true }
+    }
+    return $false
+}#endfunction
+
+function Open-AULockMutex
+{
+    <#
+.SYNOPSIS
+    Opens the named run lock mutex, creating it when no process has it open.
+.DESCRIPTION
+    A mutex it creates grants SYSTEM and Administrators full control (MutexSecurity, an in-box type),
+    so an administrator's manual run can open a mutex the scheduled SYSTEM run created (F27). The
+    mutex isn't owned on return; the caller waits on it. Throws on failure, for example an
+    UnauthorizedAccessException when the caller lacks access to an existing mutex. The only open
+    path for the lock, so a test can make it fail.
+.PARAMETER Name
+    The mutex name, Global\PowerStacksAppUsage.
+#>
+    param (
+        [string]$Name
+    )
+
+    $Security = New-Object Security.AccessControl.MutexSecurity
+    foreach ($Sid in $script:AULockAclSids)
+    {
+        $Identity = New-Object Security.Principal.SecurityIdentifier $Sid
+        $Security.AddAccessRule((New-Object Security.AccessControl.MutexAccessRule($Identity, [Security.AccessControl.MutexRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)))
+    }
+    $CreatedNew = $false
+    return [Threading.Mutex]::new($false, $Name, [ref]$CreatedNew, $Security)
+}#endfunction
+
+function Invoke-AUWithLock
+{
+    <#
+.SYNOPSIS
+    Runs Body while holding the App Usage run lock, so two overlapping inventory runs never both run App Usage.
+.DESCRIPTION
+    Waits up to TimeoutSeconds for mutex Global\PowerStacksAppUsage, runs Body on this thread, and
+    releases the mutex in finally (a mutex must be released by the thread that took it, so Body is
+    never moved to a job or runspace). Returns Acquired, Abandoned, Result (Body's output), and Error
+    (the message when Body threw, else $null).
+    A mutex left abandoned by a run that ended without releasing it counts as acquired, with
+    Abandoned true. A timeout, an UnauthorizedAccessException, or any other failure to open or wait
+    gives Acquired false and Body never runs; the caller reports AppUsageBusy (Review Focus 1, F27).
+    Never throws, even when Body throws.
+.PARAMETER Body
+    The work to run under the lock.
+.PARAMETER TimeoutSeconds
+    How long to wait for the lock.
+#>
+    param (
+        [scriptblock]$Body,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $Outcome = [pscustomobject]@{ Acquired = $false; Abandoned = $false; Result = $null; Error = $null }
+    $Mutex = $null
+    try
+    {
+        try
+        {
+            $Mutex = Open-AULockMutex -Name $script:AULockName
+            try { $Outcome.Acquired = [bool]$Mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)) }
+            catch
+            {
+                if (-not (Test-AUExceptionType $_.Exception ([Threading.AbandonedMutexException]))) { throw }
+                $Outcome.Acquired = $true
+                $Outcome.Abandoned = $true
+                Write-CMTraceLog -Message "App Usage: an earlier run ended without releasing lock $($script:AULockName); this run took it over." -Component 'AppUsage' -Type 2
+            }
+        }
+        catch
+        {
+            $Outcome.Acquired = $false
+            if (Test-AUExceptionType $_.Exception ([UnauthorizedAccessException])) { $Reason = 'access was denied' }
+            else { $Reason = 'it could not be opened or waited on' }
+            Write-CMTraceLog -Message "App Usage: skipped this run (AppUsageBusy) because $Reason on lock $($script:AULockName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+            return $Outcome
+        }
+        if (-not $Outcome.Acquired)
+        {
+            Write-CMTraceLog -Message "App Usage: skipped this run (AppUsageBusy) because another run held lock $($script:AULockName) for $TimeoutSeconds seconds." -Component 'AppUsage' -Type 2
+            return $Outcome
+        }
+        try { $Outcome.Result = & $Body }
+        catch
+        {
+            $Outcome.Error = $_.Exception.Message
+            Write-CMTraceLog -Message "App Usage: the work under lock $($script:AULockName) failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        }
+        finally
+        {
+            try { $Mutex.ReleaseMutex() }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't release lock $($script:AULockName): $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        }
+        return $Outcome
+    }
+    finally
+    {
+        if ($null -ne $Mutex)
+        {
+            try { $Mutex.Dispose() }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't close lock $($script:AULockName): $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        }
+    }
+}#endfunction
 #endregion APPUSAGE
 
 #region script
