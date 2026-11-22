@@ -466,6 +466,16 @@ Describe 'Resolve-AUTarget' {
             Get-AUInstallStatus $t @((New-TestApp $Chosen 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
         }
 
+        It 'Get-AUTargetAppNames tells apart two targets that differ only in their rule, on one shared index' {
+            $index = New-AUAppIndex @($script:Tool32)
+            $arp = [pscustomobject]@{ MatchSection = 'Retained'; MatchRuleId = 'ps-arp-compare'; RuleType = 'arpCompare'; InstalledStateDependent = $true; TargetPattern = 'Contoso Tool'; TargetPublisher = 'Contoso'; ResolvedAppName = 'Contoso Tool'; ProductCode = $null; PackageFamily = $null }
+            $arch = $arp.PSObject.Copy()
+            $arch.MatchRuleId = 'ps-resolve-arch'
+            @(Get-AUTargetAppNames $arch $index).Count | Should -Be 0
+            @(Get-AUTargetAppNames $arp $index) | Should -Be @('Contoso Tool (x86)')
+            @(Get-AUTargetAppNames $arch $index).Count | Should -Be 0
+        }
+
         It 'an identity-rule target resolved by a D47 step counts only the chosen app, not every app its pattern matches' {
             $m = New-TestMappings -PowerStacks @($script:RuleContosoTool)
             $t = Resolve-AUTarget $script:NoMatch (New-TestStored @{ MatchRuleId = 'ps-resolve-arch'; RuleType = 'identity'; TargetPattern = 'Contoso*'; TargetPublisher = 'Contoso*'; ResolvedAppName = 'Contoso Tool' }) $m

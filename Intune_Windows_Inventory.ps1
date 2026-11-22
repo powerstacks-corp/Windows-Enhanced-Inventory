@@ -3562,8 +3562,8 @@ function Resolve-AUTarget
     when its evidence is Verified and, for a stored target a D47 step chose (ps-resolve-*), only when
     it resolved to the same app (Test-AUSameApp), so a match that lands on a sibling after the chosen
     app is removed keeps the chosen app; otherwise the stored target wins, and a conflict with a
-    different target is logged (D17, D30, F11, F15). A customer identity match always wins, even on current-file
-    evidence, and keeps that EvidenceUsed. When this run's match names the same app as the stored
+    different target is logged (D17, D30, F11, F15). A customer identity match always wins, even on
+    current-file evidence, and keeps that EvidenceUsed. When this run's match names the same app as the stored
     target but resolved to no installed app, the stored ResolvedAppName (the last concrete
     DisplayName), ProductCode, and PackageFamily fill the blanks. A None result keeps the identity's
     CandidateTargets. Returns Resolve-AUIdentity's fields plus RetainedFrom ($null unless Retained).
@@ -4892,7 +4892,7 @@ function Get-AUTargetAppNames
 
     $Separator = [string][char]31
     $Signature = @([string]$Target.ResolvedAppName, [string]$Target.TargetPattern, [string]$Target.TargetPublisher, [string]$Target.ProductCode,
-        [string]$Target.PackageFamily, [string]$Target.RuleType, [string]$Target.InstalledStateDependent) -join $Separator
+        [string]$Target.PackageFamily, [string]$Target.RuleType, [string]$Target.InstalledStateDependent, [string]$Target.MatchRuleId) -join $Separator
     $Names = $Index.Cache[$Signature]
     if ($null -ne $Names) { return $Names }
 
