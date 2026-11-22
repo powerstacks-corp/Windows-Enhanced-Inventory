@@ -3297,11 +3297,11 @@ function Get-AUClassification
     Evaluates classification and ignore rules for an executable: RuleRole, ClassificationRuleId, Ignored, IgnoreRuleId.
 .DESCRIPTION
     Runs for every executable, matched or not. Customer rules come first, then PowerStacks rules, each
-    in file order; the first classification rule that matches sets RuleRole, and the first ignore
-    rule that matches sets Ignored. When MatchSection is Customer (including a retained customer
-    target), PowerStacks rules are skipped (D38). Every condition a rule gives must match: exeName and
-    locationClass are path-level facts; companyName and fileDescription use verified facts only, never
-    PathEvidence (D30).
+    in file order; the first classification rule that matches sets RuleRole (in the AURuleRoles
+    casing, so helper is reported as Helper), and the first ignore rule that matches sets Ignored.
+    When MatchSection is Customer (including a retained customer target), PowerStacks rules are
+    skipped (D38). Every condition a rule gives must match: exeName and locationClass are path-level
+    facts; companyName and fileDescription use verified facts only, never PathEvidence (D30).
 .PARAMETER Facts
     The executable facts.
 .PARAMETER Mappings
@@ -3352,7 +3352,10 @@ function Get-AUClassification
             }
             else
             {
-                $Result.RuleRole = [string]$Rule.role
+                # The validator accepts any casing; report the role in its one canonical casing.
+                $Role = [string]$Rule.role
+                foreach ($Name in $script:AURuleRoles) { if ([string]::Equals($Role, $Name, [StringComparison]::OrdinalIgnoreCase)) { $Role = $Name } }
+                $Result.RuleRole = $Role
                 $Result.ClassificationRuleId = [string]$Rule.id
             }
         }
@@ -3571,6 +3574,71 @@ function ConvertTo-AUStoredTarget
     }
 }#endfunction
 
+function Get-AUTargetKeys
+{
+    <#
+.SYNOPSIS
+    Returns the values Test-AUTargetApp compares an installed app with, computed once per target.
+.DESCRIPTION
+    ProductCode and PackageFamily (trimmed), the TargetPattern and TargetPublisher wildcard patterns,
+    and, for an ownership or arpCompare target (whose patterns are escaped exact values), the
+    normalized name and publisher keys (Get-AUNormalizedText) of its ResolvedAppName (or the unescaped
+    TargetPattern) and TargetPublisher. The keys are blank for other targets.
+.PARAMETER Target
+    The Resolve-AUTarget result.
+#>
+    param (
+        [pscustomobject]$Target
+    )
+
+    $Keys = [pscustomobject]@{
+        Code             = ([string]$Target.ProductCode).Trim()
+        Family           = ([string]$Target.PackageFamily).Trim()
+        NamePattern      = $Target.TargetPattern
+        PublisherPattern = $Target.TargetPublisher
+        NameKey          = ''
+        PublisherKey     = ''
+    }
+    if ($Target.InstalledStateDependent -eq $true -or $Target.RuleType -cin @('ownership', 'arpCompare'))
+    {
+        $Name = [string]$Target.ResolvedAppName
+        if ([string]::IsNullOrWhiteSpace($Name)) { $Name = [Management.Automation.WildcardPattern]::Unescape([string]$Keys.NamePattern) }
+        $Keys.NameKey = Get-AUNormalizedText $Name -Kind Name
+        $Keys.PublisherKey = Get-AUNormalizedText ([Management.Automation.WildcardPattern]::Unescape([string]$Keys.PublisherPattern)) -Kind Publisher
+    }
+    return $Keys
+}#endfunction
+
+function Test-AUTargetApp
+{
+    <#
+.SYNOPSIS
+    Tests whether an installed app is the target app, ignoring scope.
+.DESCRIPTION
+    True when its ProductCode or PackageFamily equals the target's, its DisplayName and Publisher
+    match TargetPattern and TargetPublisher, or (ownership and arpCompare targets) its normalized
+    DisplayName and Publisher equal the target's keys, so an update that renames the entry, Contoso
+    Alpha 1.0 to Contoso Alpha 1.1, still counts. The one definition for Get-AUInstallStatus and
+    Test-AUMainExe.
+.PARAMETER App
+    The installed-app entry.
+.PARAMETER Keys
+    The Get-AUTargetKeys result.
+#>
+    param (
+        [pscustomobject]$App,
+        [pscustomobject]$Keys
+    )
+
+    if ($null -eq $App) { return $false }
+    if ($Keys.Code -and [string]::Equals(([string]$App.ProductCode).Trim(), $Keys.Code, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($Keys.Family -and [string]::Equals(([string]$App.PackageFamily).Trim(), $Keys.Family, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $AppName = ([string]$App.DisplayName).Trim()
+    if ($AppName -and $null -ne $Keys.NamePattern -and $null -ne $Keys.PublisherPattern -and $AppName -like [string]$Keys.NamePattern -and ([string]$App.Publisher).Trim() -like [string]$Keys.PublisherPattern) { return $true }
+    if ($Keys.NameKey -and $Keys.PublisherKey -and (Get-AUNormalizedText ([string]$App.Publisher) -Kind Publisher) -ceq $Keys.PublisherKey -and (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -ceq $Keys.NameKey) { return $true }
+    return $false
+}#endfunction
+
 function Get-AUInstallStatus
 {
     <#
@@ -3607,31 +3675,14 @@ function Get-AUInstallStatus
 
     if ($null -eq $Target -or $Target.MatchSection -cnotin @('Customer', 'PowerStacks', 'Retained')) { return 'Unmatched' }
     $Sid = ([string]$UserSid).Trim()
-    $NamePattern = $Target.TargetPattern
-    $PublisherPattern = $Target.TargetPublisher
-    $Code = ([string]$Target.ProductCode).Trim()
-    $Family = ([string]$Target.PackageFamily).Trim()
-    # Normalized keys for an ownership or arpCompare target, whose patterns are escaped exact values.
-    $NameKey = ''
-    $PublisherKey = ''
-    if ($Target.InstalledStateDependent -eq $true -or $Target.RuleType -cin @('ownership', 'arpCompare'))
-    {
-        $Name = [string]$Target.ResolvedAppName
-        if ([string]::IsNullOrWhiteSpace($Name)) { $Name = [Management.Automation.WildcardPattern]::Unescape([string]$NamePattern) }
-        $NameKey = Get-AUNormalizedText $Name -Kind Name
-        $PublisherKey = Get-AUNormalizedText ([Management.Automation.WildcardPattern]::Unescape([string]$PublisherPattern)) -Kind Publisher
-    }
+    $Keys = Get-AUTargetKeys $Target
 
     foreach ($App in @($InstalledApps))
     {
         if ($null -eq $App) { continue }
         $Scope = ([string]$App.Scope).Trim()
         if ($Scope -and $Scope -ne 'Machine' -and -not ($Sid -and [string]::Equals($Scope, $Sid, [StringComparison]::OrdinalIgnoreCase))) { continue }
-        if ($Code -and [string]::Equals(([string]$App.ProductCode).Trim(), $Code, [StringComparison]::OrdinalIgnoreCase)) { return 'Installed' }
-        if ($Family -and [string]::Equals(([string]$App.PackageFamily).Trim(), $Family, [StringComparison]::OrdinalIgnoreCase)) { return 'Installed' }
-        $AppName = ([string]$App.DisplayName).Trim()
-        if ($AppName -and $null -ne $NamePattern -and $null -ne $PublisherPattern -and $AppName -like [string]$NamePattern -and ([string]$App.Publisher).Trim() -like [string]$PublisherPattern) { return 'Installed' }
-        if ($NameKey -and $PublisherKey -and (Get-AUNormalizedText ([string]$App.Publisher) -Kind Publisher) -ceq $PublisherKey -and (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -ceq $NameKey) { return 'Installed' }
+        if (Test-AUTargetApp $App $Keys) { return 'Installed' }
     }
 
     $StateOf = {
@@ -3662,8 +3713,8 @@ function Test-AUMainExe
     retained target keeps its rule type. True for a Package-kind entry (a Store or MSIX package: no
     ExeName, a PackageFamily), whose package identity is the app. Otherwise true when the build is
     verified and its run path equals the DisplayIcon file of an installed app that is the target app
-    (its ProductCode or PackageFamily equals the target's, or its DisplayName and Publisher match
-    TargetPattern and TargetPublisher). The paths are compared ignoring case, quotes, and the icon index.
+    (Test-AUTargetApp, the same test as Get-AUInstallStatus). The paths are compared ignoring case,
+    quotes, and the icon index.
 .PARAMETER Facts
     The executable facts.
 .PARAMETER Target
@@ -3687,10 +3738,7 @@ function Test-AUMainExe
     if (-not $RunPath) { return $false }
     $Leaf = $RunPath.Substring($RunPath.LastIndexOf('\') + 1)
     if (-not $Leaf) { return $false }
-    $Code = ([string]$Target.ProductCode).Trim()
-    $Family = ([string]$Target.PackageFamily).Trim()
-    $NamePattern = $Target.TargetPattern
-    $PublisherPattern = $Target.TargetPublisher
+    $Keys = $null
 
     foreach ($App in @($InstalledApps))
     {
@@ -3704,10 +3752,8 @@ function Test-AUMainExe
         if ($File.StartsWith('\\?\')) { $File = $File.Substring(4) }
         if (-not [string]::Equals($File, $RunPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
 
-        if ($Code -and [string]::Equals(([string]$App.ProductCode).Trim(), $Code, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-        if ($Family -and [string]::Equals(([string]$App.PackageFamily).Trim(), $Family, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-        $AppName = ([string]$App.DisplayName).Trim()
-        if ($AppName -and $null -ne $NamePattern -and $null -ne $PublisherPattern -and $AppName -like [string]$NamePattern -and ([string]$App.Publisher).Trim() -like [string]$PublisherPattern) { return $true }
+        if ($null -eq $Keys) { $Keys = Get-AUTargetKeys $Target }
+        if (Test-AUTargetApp $App $Keys) { return $true }
     }
     return $false
 }#endfunction

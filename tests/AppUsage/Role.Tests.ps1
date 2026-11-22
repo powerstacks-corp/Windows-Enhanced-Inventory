@@ -78,13 +78,13 @@ BeforeAll {
     }
 
     # The whole Get-AUMappings result, built through the real loader from PowerStacks rule JSON texts.
-    function New-TestMappings([string[]]$PowerStacks)
+    function New-TestMappings([string[]]$PowerStacks, [string[]]$Classification = @())
     {
         $script:MappingsCount++
         $Dir = Join-Path 'TestDrive:\' "mappings$($script:MappingsCount)"
         New-Item -ItemType Directory -Path $Dir -Force | Out-Null
         $Dir = (Resolve-Path $Dir).ProviderPath
-        $Json = '{ "schemaVersion": 1, "powerStacks": { "version": "test", "identityRules": [' + ($PowerStacks -join ',') + '], "classificationRules": [] } }'
+        $Json = '{ "schemaVersion": 1, "powerStacks": { "version": "test", "identityRules": [' + ($PowerStacks -join ',') + '], "classificationRules": [' + ($Classification -join ',') + '] } }'
         [IO.File]::WriteAllText((Join-Path $Dir 'powerstacks-mappings.json'), $Json)
         $Result = Get-AUMappings -Embedded '' -BesideDir $Dir -CustomerPath (Join-Path $Dir 'customer-mappings.json')
         if ($Result.Errors.Count -gt 0) { throw "Test mappings are invalid: $($Result.Errors -join ' | ')" }
@@ -234,11 +234,34 @@ Describe 'Get-AURole main exe by DisplayIcon (F19)' {
         Get-AURole $facts $target (New-TestClassification) $apps | Should -BeExactly 'Helper'
     }
 
+    It 'keeps the DisplayIcon exe App after an update renamed a retained arpCompare target''s app, as install status does' {
+        $stored = [pscustomobject]@{ Section = 'PowerStacks'; MatchRuleId = 'ps-arp-compare'; RuleType = 'arpCompare'; TargetPattern = 'Contoso Alpha 1.0'; TargetPublisher = 'Contoso'; ResolvedAppName = 'Contoso Alpha 1.0'; ProductCode = $null; PackageFamily = $null; EvidenceUsed = 'Verified' }
+        $apps = @((New-TestApp 'Contoso Alpha 1.1' 'Contoso' @{ DisplayIcon = 'C:\Program Files\Contoso\Alpha\alpha.exe,0' }))
+        # No file facts, so this run's arpCompare can't match and the stored target is kept.
+        $facts = New-TestFacts @{ ExeName = 'alpha.exe'; RunPath = 'C:\Program Files\Contoso\Alpha\alpha.exe' }
+        $target = Resolve-AUTarget (Resolve-AUIdentity $facts $script:Mappings $apps) $stored $script:Mappings
+        $target.MatchSection | Should -BeExactly 'Retained'
+        Get-AUInstallStatus $target $apps @{ Machine = 'Read'; $script:TestSid = 'Read' } $script:TestSid | Should -BeExactly 'Installed'
+        Get-AURole $facts $target (New-TestClassification) $apps | Should -BeExactly 'App'
+    }
+
     It 'finds the target app by ProductCode after an update renamed it' {
         $target = New-TestTarget @{ RuleType = 'ownership'; MatchRuleId = 'ps-own-msi'; ProductCode = '{11111111-2222-3333-4444-555555555555}' }
         $apps = @((New-TestApp 'Contoso Alpha 2' 'Contoso' @{ ProductCode = '{11111111-2222-3333-4444-555555555555}'; DisplayIcon = 'C:\Program Files\Contoso\alpha.exe' }))
         $facts = New-TestFacts @{ ExeName = 'alpha.exe'; RunPath = 'C:\Program Files\Contoso\alpha.exe' }
         Get-AURole $facts $target (New-TestClassification) $apps | Should -BeExactly 'App'
+    }
+}
+
+Describe 'Get-AURole classification role casing' {
+    It 'reports a rule role written as <Written> as <Role>' -ForEach @(
+        @{ Written = 'helper'; Role = 'Helper' }, @{ Written = 'cli'; Role = 'CLI' }, @{ Written = 'WINDOWS'; Role = 'Windows' }
+    ) {
+        $m = New-TestMappings @($script:RuleArp) @("{ ""id"": ""ps-class-tool"", ""type"": ""classification"", ""when"": { ""exeName"": ""tool.exe"" }, ""role"": ""$Written"" }")
+        $facts = New-TestFacts
+        $classification = Get-AUClassification $facts $m 'None'
+        $classification.RuleRole | Should -BeExactly $Role
+        Get-AURole $facts $script:NoTarget $classification @() | Should -BeExactly $Role
     }
 }
 
