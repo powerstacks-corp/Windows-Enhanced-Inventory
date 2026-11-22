@@ -1,0 +1,42 @@
+name: Pester
+
+on:
+  pull_request:
+    branches: [main, 'release/**']
+  push:
+    branches: ['release/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pester:
+    name: Pester (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pester 5.7.1
+        shell: powershell
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+      - name: Run tests
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          Import-Module Pester -RequiredVersion 5.7.1
+          $c = New-PesterConfiguration
+          $c.Run.Path = 'tests'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          $c.TestResult.Enabled = $true
+          $c.TestResult.OutputPath = 'pester-results.xml'
+          Invoke-Pester -Configuration $c
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: pester-results.xml
