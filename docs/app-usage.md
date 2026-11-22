@@ -49,6 +49,28 @@ A check that has nothing to go on, or that would rule out every app, is skipped.
 
 When two or more apps are left after every check, the executable is reported as unmatched, and `CandidateTargets` lists the apps it could belong to. Those apps aren't reported as unused because of it. To settle it yourself, give your rule a narrower `target.displayName`.
 
+### Targets From Earlier Runs
+
+When a rule matches an executable, the script saves the target (the installed app, the rule ID, and whose rule it was) with the executable's usage on the device. The saved target keeps the executable matched after the evidence for the match is gone, for example after the app is uninstalled, so its usage stays credited to the app and the app can be reported as not installed.
+
+- A saved target is used only while its rule exists. If you delete a rule, the executables it matched are matched again from the remaining rules on the next run. The `ps-resolve-` rule IDs always exist.
+- A saved target from one of your rules wins over every PowerStacks match.
+- Your identity rules replace a saved PowerStacks target, even when the script couldn't verify the build that ran.
+- A PowerStacks match replaces a saved PowerStacks target only when the script verified the build. A match on the current file at the same path, for a build the script couldn't verify, doesn't replace it, and the conflict is written to the script's log.
+
+### Install Status
+
+Each executable's usage reports an `InstallStatus` for its target:
+
+| Value | Meaning |
+|---|---|
+| `Installed` | The target app is installed on the device, either for all users or for the user who ran the executable. An updated app still counts. |
+| `NotInstalled` | The script read the device's apps and the user's apps on this run, and the target app isn't there. Also used when the user's profile is no longer on the device. |
+| `Unknown` | The target is known, but the script couldn't read the device's apps or the user's apps on this run. |
+| `Unmatched` | No rule matched the executable, and it has no target from an earlier run. |
+
+An executable whose app was uninstalled stays matched to it, and its usage is still recorded. `NotInstalled` says only that the app isn't installed now. It doesn't say when or why the app was removed.
+
 ### File Format
 
 ```json

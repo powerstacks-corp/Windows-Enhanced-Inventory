@@ -3343,6 +3343,278 @@ function Get-AUClassification
     }
     return $Result
 }#endfunction
+
+# Retained targets and install status (D7, D17, D30, D38). A stored target keeps an executable mapped
+# after the evidence that matched it is gone, so NotInstalled stays possible.
+$script:AUTargetSections = @('Customer', 'PowerStacks')
+
+function Get-AUStoredTargetSection
+{
+    <#
+.SYNOPSIS
+    Returns the section (Customer or PowerStacks) of a stored target that still counts, else $null.
+.DESCRIPTION
+    A stored target counts when it has a section, a rule ID, and a target pattern, and its rule ID is
+    in RuleIds, which always holds the reserved ps-resolve-* IDs (F11). When the customer's rules are
+    unavailable this run (the file is Invalid or TooLarge), a stored customer target counts as it is,
+    so a broken file doesn't move apps back to PowerStacks matches (D41, D45).
+.PARAMETER StoredTarget
+    The entry's stored target, or $null.
+.PARAMETER Mappings
+    The whole Get-AUMappings result (F18).
+.PARAMETER CustomerRulesUnavailable
+    True when the customer file is present but Invalid or TooLarge.
+#>
+    param (
+        [pscustomobject]$StoredTarget,
+        [pscustomobject]$Mappings,
+        [bool]$CustomerRulesUnavailable
+    )
+
+    if ($null -eq $StoredTarget) { return $null }
+    $Text = ([string]$StoredTarget.Section).Trim()
+    $Section = $null
+    foreach ($Name in $script:AUTargetSections) { if ([string]::Equals($Text, $Name, [StringComparison]::OrdinalIgnoreCase)) { $Section = $Name } }
+    $RuleId = ([string]$StoredTarget.MatchRuleId).Trim()
+    if (-not $Section -or -not $RuleId -or [string]::IsNullOrWhiteSpace([string]$StoredTarget.TargetPattern)) { return $null }
+    if ($Section -eq 'Customer' -and $CustomerRulesUnavailable) { return $Section }
+    if ($null -ne $Mappings -and $null -ne $Mappings.RuleIds -and $Mappings.RuleIds.Contains($RuleId)) { return $Section }
+    return $null
+}#endfunction
+
+function Test-AUSameTarget
+{
+    <#
+.SYNOPSIS
+    Tests whether two targets name the same app: the same target pattern and publisher, ignoring case.
+.PARAMETER First
+    A target or stored target.
+.PARAMETER Second
+    A target or stored target.
+#>
+    param (
+        [pscustomobject]$First,
+        [pscustomobject]$Second
+    )
+
+    return ([string]::Equals(([string]$First.TargetPattern).Trim(), ([string]$Second.TargetPattern).Trim(), [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals(([string]$First.TargetPublisher).Trim(), ([string]$Second.TargetPublisher).Trim(), [StringComparison]::OrdinalIgnoreCase))
+}#endfunction
+
+function Resolve-AUTarget
+{
+    <#
+.SYNOPSIS
+    Decides an executable's final target: this run's identity match or the entry's stored target.
+.DESCRIPTION
+    Order (D38): a customer identity match, then a stored customer target, then a PowerStacks identity
+    match, then a stored PowerStacks target, then None. A stored target counts only while its rule ID
+    exists (Get-AUStoredTargetSection); it returns with MatchSection Retained and RetainedFrom
+    (Customer or PowerStacks). A PowerStacks identity match replaces a stored PowerStacks target only
+    when its evidence is Verified; otherwise the stored target wins, and a conflict with a different
+    target is logged (D17, D30, F15). A customer identity match always wins, even on current-file
+    evidence, and keeps that EvidenceUsed. When this run's match names the same app as the stored
+    target but resolved to no installed app, the stored ResolvedAppName (the last concrete
+    DisplayName), ProductCode, and PackageFamily fill the blanks. A None result keeps the identity's
+    CandidateTargets. Returns Resolve-AUIdentity's fields plus RetainedFrom ($null unless Retained).
+.PARAMETER Identity
+    The Resolve-AUIdentity result.
+.PARAMETER StoredTarget
+    The entry's stored target (ConvertTo-AUStoredTarget shape), or $null.
+.PARAMETER Mappings
+    The whole Get-AUMappings result (F18).
+.PARAMETER CustomerRulesUnavailable
+    Set when the customer file is present but Invalid or TooLarge (D41, D45).
+#>
+    param (
+        [pscustomobject]$Identity,
+        [pscustomobject]$StoredTarget,
+        [pscustomobject]$Mappings,
+        [switch]$CustomerRulesUnavailable
+    )
+
+    $StoredSection = Get-AUStoredTargetSection $StoredTarget $Mappings $CustomerRulesUnavailable.IsPresent
+    $IdentitySection = 'None'
+    if ($null -ne $Identity -and $Identity.MatchSection -cin $script:AUTargetSections) { $IdentitySection = $Identity.MatchSection }
+
+    $FromIdentity = {
+        $Result = [pscustomobject]@{
+            TargetPattern           = $null
+            TargetPublisher         = $null
+            ResolvedAppName         = $null
+            ProductCode             = $null
+            PackageFamily           = $null
+            MatchSection            = 'None'
+            MatchRuleId             = $null
+            RuleType                = $null
+            InstalledStateDependent = $false
+            EvidenceUsed            = 'None'
+            CandidateTargets        = $null
+            RetainedFrom            = $null
+        }
+        if ($null -eq $Identity) { return $Result }
+        foreach ($Name in @('TargetPattern', 'TargetPublisher', 'ResolvedAppName', 'ProductCode', 'PackageFamily', 'MatchRuleId', 'RuleType', 'InstalledStateDependent', 'EvidenceUsed', 'CandidateTargets'))
+        {
+            $Result.$Name = $Identity.$Name
+        }
+        $Result.MatchSection = $IdentitySection
+        if ($IdentitySection -ne 'None' -and $StoredSection -eq $IdentitySection -and [string]::IsNullOrWhiteSpace([string]$Result.ResolvedAppName) -and (Test-AUSameTarget $Result $StoredTarget))
+        {
+            foreach ($Name in @('ResolvedAppName', 'ProductCode', 'PackageFamily'))
+            {
+                if ([string]::IsNullOrWhiteSpace([string]$Result.$Name) -and -not [string]::IsNullOrWhiteSpace([string]$StoredTarget.$Name)) { $Result.$Name = [string]$StoredTarget.$Name }
+            }
+        }
+        return $Result
+    }
+    $FromStored = {
+        $RuleType = [string]$StoredTarget.RuleType
+        $Evidence = [string]$StoredTarget.EvidenceUsed
+        if (-not $Evidence) { $Evidence = 'None' }
+        return [pscustomobject]@{
+            TargetPattern           = [string]$StoredTarget.TargetPattern
+            TargetPublisher         = [string]$StoredTarget.TargetPublisher
+            ResolvedAppName         = $(if ($StoredTarget.ResolvedAppName) { [string]$StoredTarget.ResolvedAppName } else { $null })
+            ProductCode             = $(if ($StoredTarget.ProductCode) { [string]$StoredTarget.ProductCode } else { $null })
+            PackageFamily           = $(if ($StoredTarget.PackageFamily) { [string]$StoredTarget.PackageFamily } else { $null })
+            MatchSection            = 'Retained'
+            MatchRuleId             = ([string]$StoredTarget.MatchRuleId).Trim()
+            RuleType                = $(if ($RuleType) { $RuleType } else { $null })
+            InstalledStateDependent = ($RuleType -cin @('ownership', 'arpCompare'))
+            EvidenceUsed            = $Evidence
+            CandidateTargets        = $null
+            RetainedFrom            = $StoredSection
+        }
+    }
+
+    if ($IdentitySection -eq 'Customer') { return (& $FromIdentity) }
+    if ($StoredSection -eq 'Customer') { return (& $FromStored) }
+    if ($IdentitySection -eq 'PowerStacks')
+    {
+        if ($StoredSection -ne 'PowerStacks' -or $Identity.EvidenceUsed -ceq 'Verified') { return (& $FromIdentity) }
+        # Weaker evidence never replaces a stored PowerStacks target (D30, F15).
+        $Same = Test-AUSameTarget $Identity $StoredTarget
+        if ($Same -and $Identity.ResolvedAppName -and $StoredTarget.ResolvedAppName)
+        {
+            $Same = [string]::Equals(([string]$Identity.ResolvedAppName).Trim(), ([string]$StoredTarget.ResolvedAppName).Trim(), [StringComparison]::OrdinalIgnoreCase)
+        }
+        if (-not $Same)
+        {
+            Write-CMTraceLog -Message "App Usage: kept stored target $($StoredTarget.MatchRuleId) ($($StoredTarget.TargetPattern)) over $($Identity.EvidenceUsed) match $($Identity.MatchRuleId) ($($Identity.TargetPattern))." -Component 'AppUsage'
+        }
+        return (& $FromStored)
+    }
+    if ($StoredSection -eq 'PowerStacks') { return (& $FromStored) }
+    return (& $FromIdentity)
+}#endfunction
+
+function ConvertTo-AUStoredTarget
+{
+    <#
+.SYNOPSIS
+    Returns the target to store in the ledger entry, or $null when it must not be written back (F16).
+.DESCRIPTION
+    Written back: a customer match; a PowerStacks match that is Verified, ownership, or arpCompare;
+    and a Retained target, stored with its original section. Not written back: an unverified
+    PowerStacks identity match (D30), and None. Section is Customer or PowerStacks, never Retained.
+    Returns Section, MatchRuleId, RuleType, TargetPattern, TargetPublisher, ResolvedAppName,
+    ProductCode, PackageFamily, and EvidenceUsed.
+.PARAMETER Target
+    The Resolve-AUTarget result.
+#>
+    param (
+        [pscustomobject]$Target
+    )
+
+    if ($null -eq $Target) { return $null }
+    $Section = $null
+    switch -CaseSensitive ([string]$Target.MatchSection)
+    {
+        'Customer' { $Section = 'Customer' }
+        'PowerStacks'
+        {
+            if ($Target.EvidenceUsed -ceq 'Verified' -or $Target.RuleType -cin @('ownership', 'arpCompare')) { $Section = 'PowerStacks' }
+        }
+        'Retained'
+        {
+            if ($Target.RetainedFrom -cin $script:AUTargetSections) { $Section = [string]$Target.RetainedFrom }
+        }
+    }
+    if (-not $Section -or [string]::IsNullOrWhiteSpace([string]$Target.MatchRuleId) -or [string]::IsNullOrWhiteSpace([string]$Target.TargetPattern)) { return $null }
+
+    return [pscustomobject][ordered]@{
+        Section         = $Section
+        MatchRuleId     = [string]$Target.MatchRuleId
+        RuleType        = $Target.RuleType
+        TargetPattern   = [string]$Target.TargetPattern
+        TargetPublisher = $Target.TargetPublisher
+        ResolvedAppName = $Target.ResolvedAppName
+        ProductCode     = $Target.ProductCode
+        PackageFamily   = $Target.PackageFamily
+        EvidenceUsed    = $Target.EvidenceUsed
+    }
+}#endfunction
+
+function Get-AUInstallStatus
+{
+    <#
+.SYNOPSIS
+    Returns an executable entry's install status: Installed, NotInstalled, Unknown, or Unmatched (D7, D17).
+.DESCRIPTION
+    Unmatched only when there's no target (MatchSection None). The target's scope is Machine plus the
+    entry's user (F30). Installed when an installed app in that scope matches the target: its
+    DisplayName and Publisher match TargetPattern and TargetPublisher, or its ProductCode or
+    PackageFamily equals the target's, so an updated app still counts. An app with no scope counts as
+    in scope. Otherwise NotInstalled only when Machine was Read and the user's scope was Read or
+    Deleted (the profile is gone from ProfileList); else Unknown. A SID missing from ScopeRead counts
+    as Unread (F29). A mapped executable whose target is absent stays mapped.
+.PARAMETER Target
+    The Resolve-AUTarget result.
+.PARAMETER InstalledApps
+    The installed-app entries, with their internal Scope (Machine or a SID).
+.PARAMETER ScopeRead
+    Machine or a SID to Read, Unread, or Deleted.
+.PARAMETER UserSid
+    The entry's user SID.
+#>
+    param (
+        [pscustomobject]$Target,
+        [object[]]$InstalledApps,
+        [hashtable]$ScopeRead,
+        [string]$UserSid
+    )
+
+    if ($null -eq $Target -or $Target.MatchSection -cnotin @('Customer', 'PowerStacks', 'Retained')) { return 'Unmatched' }
+    $Sid = ([string]$UserSid).Trim()
+    $NamePattern = $Target.TargetPattern
+    $PublisherPattern = $Target.TargetPublisher
+    $Code = ([string]$Target.ProductCode).Trim()
+    $Family = ([string]$Target.PackageFamily).Trim()
+
+    foreach ($App in @($InstalledApps))
+    {
+        if ($null -eq $App) { continue }
+        $Scope = ([string]$App.Scope).Trim()
+        if ($Scope -and $Scope -ne 'Machine' -and -not ($Sid -and [string]::Equals($Scope, $Sid, [StringComparison]::OrdinalIgnoreCase))) { continue }
+        if ($Code -and [string]::Equals(([string]$App.ProductCode).Trim(), $Code, [StringComparison]::OrdinalIgnoreCase)) { return 'Installed' }
+        if ($Family -and [string]::Equals(([string]$App.PackageFamily).Trim(), $Family, [StringComparison]::OrdinalIgnoreCase)) { return 'Installed' }
+        $AppName = ([string]$App.DisplayName).Trim()
+        if ($AppName -and $null -ne $NamePattern -and $null -ne $PublisherPattern -and $AppName -like [string]$NamePattern -and ([string]$App.Publisher).Trim() -like [string]$PublisherPattern) { return 'Installed' }
+    }
+
+    $StateOf = {
+        param ([string]$Key)
+        if ($null -eq $ScopeRead) { return 'Unread' }
+        foreach ($Name in $ScopeRead.Keys)
+        {
+            if ([string]::Equals([string]$Name, $Key, [StringComparison]::OrdinalIgnoreCase)) { return [string]$ScopeRead[$Name] }
+        }
+        return 'Unread'
+    }
+    if ((& $StateOf 'Machine') -ne 'Read') { return 'Unknown' }
+    if ($Sid -and (& $StateOf $Sid) -notin @('Read', 'Deleted')) { return 'Unknown' }
+    return 'NotInstalled'
+}#endfunction
 #endregion APPUSAGE
 
 #region script
