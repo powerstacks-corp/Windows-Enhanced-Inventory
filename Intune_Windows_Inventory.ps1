@@ -2900,10 +2900,20 @@ function Get-AUIdentityRuleHit
         'identity'
         {
             if (-not (Test-AUIdentityWhen $Rule.when $Facts $Evidence)) { return $null }
-            foreach ($App in $InstalledApps)
+            # The Test-AUTextPattern checks, inlined: this loop runs over every installed app.
+            $NamePattern = $Rule.target.displayName
+            $PublisherPattern = $Rule.target.publisher
+            if ($null -ne $NamePattern -and $null -ne $PublisherPattern)
             {
-                if ([string]::IsNullOrWhiteSpace([string]$App.DisplayName)) { continue }
-                if ((Test-AUTextPattern ([string]$App.DisplayName) $Rule.target.displayName) -and (Test-AUTextPattern ([string]$App.Publisher) $Rule.target.publisher)) { $Candidates.Add($App) }
+                $NamePattern = [string]$NamePattern
+                $PublisherPattern = [string]$PublisherPattern
+                foreach ($App in $InstalledApps)
+                {
+                    if ($null -eq $App) { continue }
+                    $AppName = [string]$App.DisplayName
+                    if ([string]::IsNullOrWhiteSpace($AppName)) { continue }
+                    if ($AppName.Trim() -like $NamePattern -and ([string]$App.Publisher).Trim() -like $PublisherPattern) { $Candidates.Add($App) }
+                }
             }
             return [pscustomobject]@{ Candidates = $Candidates.ToArray(); TargetPattern = [string]$Rule.target.displayName; TargetPublisher = [string]$Rule.target.publisher }
         }
@@ -3182,6 +3192,11 @@ function Resolve-AUIdentity
     $Apps = @($InstalledApps)
     $Evidence = Get-AUIdentityEvidence $Facts
 
+    # An identity rule needs its exeName to match, so that check runs inline first: most rules fail it,
+    # and the full check costs a few function calls per rule.
+    $ExeText = $null
+    if ($null -ne $Facts.ExeName) { $ExeText = ([string]$Facts.ExeName).Trim() }
+
     $Hit = $null
     $Rule = $null
     $Section = $null
@@ -3190,6 +3205,11 @@ function Resolve-AUIdentity
         foreach ($Candidate in @($Pair[1].identityRules))
         {
             if ($null -eq $Candidate) { continue }
+            if ($Candidate.type -ceq 'identity')
+            {
+                $ExePattern = $Candidate.when.exeName
+                if ($null -eq $ExeText -or $null -eq $ExePattern -or -not ($ExeText -like [string]$ExePattern)) { continue }
+            }
             $Hit = Get-AUIdentityRuleHit $Candidate $Facts $Evidence $Apps
             if ($Hit) { $Rule = $Candidate; $Section = $Pair[0]; break }
         }
