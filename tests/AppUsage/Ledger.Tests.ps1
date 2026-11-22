@@ -153,6 +153,45 @@ Describe 'Merge-AUSrumRecords' {
         $E.FocusTotal | Should -Be 10
     }
 
+    It 'keeps counting a key of this epoch that one run missed, so it is never counted twice when it returns' {
+        $L = New-EmptyLedger
+        $All = @((New-Row $script:Local $script:Acro1 1 0 10), (New-Row $script:Local $script:Acro1 2 1 20), (New-Row $script:Local $script:Acro1 3 2 30))
+        Invoke-Merge $L $All
+        Invoke-Merge $L @($All[0], $All[2])
+        $E = Get-TestEntry $L $script:Local $script:Acro1
+        $E.Counted.ContainsKey('E1|2') | Should -BeTrue
+        $E.ArchivedFocus | Should -Be 0
+        $E.FocusTotal | Should -Be 60
+        Invoke-Merge $L $All
+        $E.FocusTotal | Should -Be 60
+        $E.ArchivedFocus | Should -Be 0
+    }
+
+    It 'archives nothing with -NoArchive, even a missing key below the lowest ID' {
+        $L = New-EmptyLedger
+        Invoke-Merge $L @((New-Row $script:Local $script:Acro1 1 0 10), (New-Row $script:Local $script:Acro1 2 1 20), (New-Row $script:Local $script:Acro1 3 2 30))
+        Merge-AUSrumRecords -Ledger $L -Rows @((New-Row $script:Local $script:Acro1 2 1 20), (New-Row $script:Local $script:Acro1 3 2 30)) -Epoch 'E1' -UserTypes $script:UserTypes -MinFocusSeconds 1 -NoArchive
+        $E = Get-TestEntry $L $script:Local $script:Acro1
+        $E.Counted.ContainsKey('E1|1') | Should -BeTrue
+        $E.ArchivedFocus | Should -Be 0
+        $E.FocusTotal | Should -Be 60
+    }
+
+    It 'archives a key below the lowest ID in this run once, and never again' {
+        $L = New-EmptyLedger
+        Invoke-Merge $L @((New-Row $script:Local $script:Acro1 1 0 10), (New-Row $script:Local $script:Acro1 2 1 20), (New-Row $script:Local $script:Acro1 3 2 30))
+        $Later = @((New-Row $script:Local $script:Acro1 2 1 20), (New-Row $script:Local $script:Acro1 3 2 30))
+        Invoke-Merge $L $Later
+        Invoke-Merge $L $Later
+        $E = Get-TestEntry $L $script:Local $script:Acro1
+        $E.Counted.ContainsKey('E1|1') | Should -BeFalse
+        $E.ArchivedFocus | Should -Be 10
+        $E.FocusTotal | Should -Be 60
+        Invoke-Merge $L @((New-Row $script:Local $script:Acro1 3 2 30), (New-Row $script:Local $script:Acro1 4 3 5))
+        $E.ArchivedFocus | Should -Be 30
+        $E.FocusTotal | Should -Be 65
+    }
+
     It 'archives every old-epoch key on a new epoch and counts the new-epoch rows once' {
         $L = New-EmptyLedger
         Invoke-Merge $L @((New-Row $script:Local $script:Acro1 1 0 10), (New-Row $script:Local $script:Acro1 2 1 20)) -Epoch 'E1'
@@ -607,5 +646,64 @@ Describe 'Invoke-AULedgerFold' {
         foreach ($Exe in @($script:Package, $Package2)) { (Get-TestEntry $L $script:Local $Exe).StoredTarget = New-TestStoredTarget }
         Invoke-AULedgerFold -Ledger $L
         $L.Entries.Count | Should -Be 3
+    }
+}
+
+Describe 'Ledger file access (D18)' {
+    BeforeAll {
+        function Assert-ProtectedAcl([string]$Path)
+        {
+            $Acl = Get-Acl -LiteralPath $Path
+            $Acl.AreAccessRulesProtected | Should -BeTrue
+            $Rules = @($Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+            $Rules.Count | Should -Be 2
+            @($Rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object) | Should -Be @('S-1-5-18', 'S-1-5-32-544')
+            foreach ($Rule in $Rules)
+            {
+                $Rule.AccessControlType | Should -Be 'Allow'
+                $Rule.FileSystemRights | Should -Be ([Security.AccessControl.FileSystemRights]::FullControl)
+                $Rule.IsInherited | Should -BeFalse
+            }
+        }
+    }
+
+    BeforeEach {
+        $script:Path = Join-Path $TestDrive "AppUsage_ACL$([guid]::NewGuid().ToString('N').Substring(0, 8)).json"
+    }
+
+    It 'gives a new ledger file a protected DACL for SYSTEM and Administrators only' {
+        $L = New-EmptyLedger
+        Invoke-Merge $L @(New-Row $script:Local $script:Acro1 1 0 10)
+        Write-AULedger -Ledger $L -Path $script:Path
+        Assert-ProtectedAcl $script:Path
+    }
+
+    It 'protects an existing ledger that had an inherited DACL when it replaces it' {
+        [IO.File]::WriteAllText($script:Path, '{"SchemaVersion":1,"WatchingSince":null,"Entries":[]}')
+        (Get-Acl -LiteralPath $script:Path).AreAccessRulesProtected | Should -BeFalse
+        $L = New-EmptyLedger
+        Invoke-Merge $L @(New-Row $script:Local $script:Acro1 1 0 10)
+        Write-AULedger -Ledger $L -Path $script:Path
+        Assert-ProtectedAcl $script:Path
+        (Read-AULedger -Path $script:Path).Entries.Count | Should -Be 1
+    }
+
+    It 'protects the moved-aside copy of an unreadable ledger' {
+        [IO.File]::WriteAllText($script:Path, 'not json')
+        $null = Read-AULedger -Path $script:Path
+        $Base = [IO.Path]::GetFileNameWithoutExtension($script:Path)
+        $Aside = @(Get-ChildItem -Path $TestDrive -Filter "$Base.corrupt-*.json")
+        $Aside.Count | Should -Be 1
+        Assert-ProtectedAcl $Aside[0].FullName
+    }
+
+    It 'still writes the ledger when the DACL cannot be set' {
+        Mock Set-AUProtectedAcl { throw 'acl failed' }
+        $L = New-EmptyLedger
+        Invoke-Merge $L @(New-Row $script:Local $script:Acro1 1 0 10)
+        { Write-AULedger -Ledger $L -Path $script:Path } | Should -Not -Throw
+        Should -Invoke Set-AUProtectedAcl -Times 1
+        (Get-TestEntry (Read-AULedger -Path $script:Path) $script:Local $script:Acro1).FocusTotal | Should -Be 10
+        Test-Path "$($script:Path).tmp" | Should -BeFalse
     }
 }

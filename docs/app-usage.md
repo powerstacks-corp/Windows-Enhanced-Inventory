@@ -4,10 +4,11 @@ App Usage (software metering) records which installed apps people actually use, 
 
 ## Usage History on the Device
 
-SRUM keeps only about 30 to 60 days of usage, so the script keeps its own history on each device, in `C:\Windows\AppUsage_<Serial>.json`, where `<Serial>` is the device's serial number. The file holds each user's usage of each executable build. Each run adds what SRUM recorded since the last run, and usage that was already counted is never counted again, so the history outlasts SRUM.
+SRUM keeps only about 30 to 60 days of usage, so the script keeps its own history on each device, in `C:\Windows\AppUsage_<Serial>.json`. `<Serial>` is the device's serial number, with any character that isn't allowed in a file name replaced by `_`. When the device reports no serial number, the computer name is used instead. The file holds each user's usage of each executable build. Each run adds the usage SRUM recorded since the last run. SRUM records the script has already counted add nothing when they're read again, and usage moves into the history once SRUM drops it, so the history outlasts SRUM.
 
-- The script writes a new copy of the file and then swaps it in, so a run that stops partway leaves the earlier file in place.
-- If the file can't be read, the script never overwrites it. It renames the file to `AppUsage_<Serial>.corrupt-<yyyyMMddHHmmss>.json`, with the time in UTC, starts a new history from what SRUM still holds, and reports `LedgerReset`.
+- Only SYSTEM and administrators can read or change the file, because it holds every user's activity on the device. Standard users can't open it.
+- The script writes a new copy of the file to disk and then swaps it in, so a run that stops partway, or a power loss, leaves the earlier file in place.
+- If the file can't be read, the script never overwrites it. It renames the file to `AppUsage_<Serial>.corrupt-<yyyyMMddHHmmss>.json`, with the time in UTC, starts a new history from what SRUM still holds, and reports `LedgerReset`. The renamed copy can also be read only by SYSTEM and administrators.
 - An app update brings a new build of its executable. Once SRUM holds no usage of the old build, the script combines the old build's history into a newer build of the same app for the same user. It combines builds only when both are matched to the same app, or, for unmatched builds, when the script verified both builds and they have the same company and product names. Executables that only share a file name, such as two `setup.exe` files from different publishers, are never combined.
 
 ## Mapping Rules

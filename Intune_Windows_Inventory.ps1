@@ -3883,6 +3883,8 @@ function Get-AUDerivedUse
 $script:AULedgerSchemaVersion = 1
 $script:AULedgerDateFormat = "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffffK"
 $script:AULedgerLastTimeFields = @('LastFocusOrInputTime', 'LastInteractiveRunTime', 'LastRanTime')
+# The ledger holds every user's activity, so only SYSTEM and Administrators may open it (D18).
+$script:AULedgerAclSids = @('S-1-5-18', 'S-1-5-32-544')
 $script:AUStoredTargetFields = @('Section', 'MatchRuleId', 'RuleType', 'TargetPattern', 'TargetPublisher', 'ResolvedAppName', 'ProductCode', 'PackageFamily', 'EvidenceUsed')
 
 function New-AULedger
@@ -4130,6 +4132,38 @@ function ConvertTo-AULedgerRecord
     return $Result
 }#endfunction
 
+function Set-AUProtectedAcl
+{
+    <#
+.SYNOPSIS
+    Gives a file a protected DACL: full control for SYSTEM and Administrators only, inheritance off.
+.DESCRIPTION
+    The ledger and its moved-aside copies hold every user's SIDs, executables, and usage times, so no
+    standard user may read them (D18). Uses the well-known SIDs, never localized names. Pass Stream to
+    set it through an open handle (opened with ChangePermissions), so the file is never readable by
+    others while it's written. Throws on failure; callers log it and carry on, so a failure to set
+    the DACL never loses ledger data.
+.PARAMETER Path
+    The file, when Stream isn't given.
+.PARAMETER Stream
+    An open FileStream for the file.
+#>
+    param (
+        [string]$Path,
+        [IO.FileStream]$Stream
+    )
+
+    $Security = New-Object Security.AccessControl.FileSecurity
+    $Security.SetAccessRuleProtection($true, $false)
+    foreach ($Sid in $script:AULedgerAclSids)
+    {
+        $Identity = New-Object Security.Principal.SecurityIdentifier $Sid
+        $Security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($Identity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)))
+    }
+    if ($null -ne $Stream) { $Stream.SetAccessControl($Security) }
+    else { [IO.File]::SetAccessControl($Path, $Security) }
+}#endfunction
+
 function Move-AUFileAtomic
 {
     <#
@@ -4159,7 +4193,8 @@ function Move-AUUnreadableLedger
     Moves an unreadable ledger aside to <name>.corrupt-<yyyyMMddHHmmss>.json, bytes intact.
 .DESCRIPTION
     The time stamp is UTC. A name already taken gets a -<n> suffix, so an earlier copy is never
-    overwritten. Returns the new path, or $null when the file couldn't be moved. Never throws.
+    overwritten. The copy gets the ledger's protected DACL (Set-AUProtectedAcl). Returns the new path,
+    or $null when the file couldn't be moved. Never throws.
 .PARAMETER Path
     The ledger path.
 #>
@@ -4181,6 +4216,8 @@ function Move-AUUnreadableLedger
         }
         [IO.File]::Move($Path, $Aside)
         Write-CMTraceLog -Message "App Usage: moved the unreadable ledger aside to $Aside." -Component 'AppUsage' -Type 2
+        try { Set-AUProtectedAcl -Path $Aside }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Aside`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         return $Aside
     }
     catch
@@ -4243,7 +4280,11 @@ function Write-AULedger
     Writes the ledger: a temp file next to the target, then Move-AUFileAtomic swaps it over the target.
 .DESCRIPTION
     The format is ConvertTo-Json -Depth 8 (Windows PowerShell 5.1 defaults to depth 2), UTF-8 without
-    a BOM, dates as Format-AUDate strings, and Entries as an array (F7). On failure the temp file is
+    a BOM, dates as Format-AUDate strings, and Entries as an array (F7). The temp file is opened
+    exclusively, given the protected DACL (Set-AUProtectedAcl) before any data is written, and flushed
+    to disk before the swap, so a power loss can't leave a renamed but empty ledger. An existing
+    ledger gets the protected DACL before the swap too, because [IO.File]::Replace keeps the
+    target's DACL. A DACL failure is logged and the write goes on. On failure the temp file is
     removed and the error is rethrown; the file on disk is unchanged (F8). A ledger that isn't
     Writable (an unreadable file that couldn't be moved aside) isn't written.
 .PARAMETER Ledger
@@ -4275,7 +4316,24 @@ function Write-AULedger
             Entries       = $Records.ToArray()
         }
         $Json = ConvertTo-Json -InputObject $Data -Depth 8 -Compress
-        [IO.File]::WriteAllText($Temp, $Json, (New-Object Text.UTF8Encoding $false))
+        $Bytes = (New-Object Text.UTF8Encoding $false).GetBytes($Json)
+
+        $Rights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::ReadPermissions -bor [Security.AccessControl.FileSystemRights]::ChangePermissions
+        $Stream = New-Object IO.FileStream($Temp, [IO.FileMode]::Create, $Rights, [IO.FileShare]::None, 65536, [IO.FileOptions]::None)
+        try
+        {
+            try { Set-AUProtectedAcl -Stream $Stream }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Temp`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            $Stream.Write($Bytes, 0, $Bytes.Length)
+            $Stream.Flush($true)
+        }
+        finally { $Stream.Dispose() }
+
+        if ([IO.File]::Exists($Path))
+        {
+            try { Set-AUProtectedAcl -Path $Path }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Path`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        }
         Move-AUFileAtomic -Source $Temp -Target $Path
     }
     catch
@@ -4295,9 +4353,14 @@ function Merge-AUSrumRecords
 .DESCRIPTION
     Each row is keyed <Epoch>|<AutoIncId> inside its entry (UserSid|ExeInfo). A key seen again replaces
     its counted values, so a duplicate adds nothing and an update adds only the difference. A new key
-    counts, however old its end time. A counted key missing from this run's rows has aged out: its
-    values move into ArchivedFocus and ArchivedInput, and it leaves Counted, so a new epoch archives
-    every old-epoch key. FocusTotal (ArchivedFocus plus the counted focus) is unchanged by archiving.
+    counts, however old its end time. A counted key missing from this run's rows has aged out only
+    when SRUM can no longer hold it: a key from an earlier epoch, or a key of this epoch whose
+    AutoIncId is below the lowest AutoIncId in this run's rows (SRUM ages rows out from the low end,
+    and new IDs only grow). Its values move into ArchivedFocus and ArchivedInput, and it leaves
+    Counted. A missing key of this epoch at or above that lowest ID stays counted, untouched, because
+    a lossy repair or a cut-short read can drop rows that a later clean read brings back, and an
+    archived key would then count twice. FocusTotal (ArchivedFocus plus the counted focus) is
+    unchanged by archiving.
     The last-time fields only move forward: LastRanTime for any user, LastInteractiveRunTime when
     Test-AUInteractiveUserType passes, and LastFocusOrInputTime when Test-AUFocusRecord does (F5, F6).
     FirstSeen is set once, to the earliest end time of the merge that first saw the entry, and
@@ -4314,13 +4377,18 @@ function Merge-AUSrumRecords
     SID to user type (Get-AUUserType). A SID that's missing counts as Unknown, never interactive.
 .PARAMETER MinFocusSeconds
     The focus floor, passed by the caller from $MinFocusSecondsForUse.
+.PARAMETER NoArchive
+    Archives nothing this run; every counted key stays in Counted. The caller sets it when the SRUM
+    copy needed repair (esentutl /p) or the read was incomplete, because rows missing from such a
+    read may still exist in SRUM.
 #>
     param (
         [pscustomobject]$Ledger,
         [object[]]$Rows,
         [string]$Epoch,
         [hashtable]$UserTypes,
-        [double]$MinFocusSeconds
+        [double]$MinFocusSeconds,
+        [switch]$NoArchive
     )
 
     $Epoch = ([string]$Epoch).Trim()
@@ -4335,6 +4403,7 @@ function Merge-AUSrumRecords
     $OpenFirstSeen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $Interactive = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
     $Earliest = $null
+    $LowestId = $null
     $Merged = 0
     $Skipped = 0
 
@@ -4348,6 +4417,8 @@ function Merge-AUSrumRecords
         $UserSid = ([string]$Row.UserSid).Trim()
         $Key = "$UserSid|$ExeInfo"
         $RecordKey = "$Epoch|$Id"
+        $Number = $Id -as [long]
+        if ($null -ne $Number -and ($null -eq $LowestId -or $Number -lt $LowestId)) { $LowestId = $Number }
         # SRUM times are UTC: an Unspecified date is marked Utc, and a Local one is converted.
         $Time = $Row.EndTimeUtc
         if ($Time -isnot [datetime]) { $Time = $null }
@@ -4404,13 +4475,20 @@ function Merge-AUSrumRecords
     }
 
     $Archived = 0
+    $EpochPrefix = "$Epoch|"
     foreach ($Key in @($Entries.Keys))
     {
         $Entry = $Entries[$Key]
         $Seen = $Present[$Key]
         foreach ($RecordKey in @($Entry.Counted.Keys))
         {
-            if ($null -ne $Seen -and $Seen.Contains($RecordKey)) { continue }
+            if ($NoArchive -or ($null -ne $Seen -and $Seen.Contains($RecordKey))) { continue }
+            if ($RecordKey.StartsWith($EpochPrefix, [StringComparison]::OrdinalIgnoreCase))
+            {
+                # This epoch: only a key below the lowest ID SRUM still holds has aged out.
+                $Number = $RecordKey.Substring($EpochPrefix.Length) -as [long]
+                if ($null -eq $Number -or $null -eq $LowestId -or $Number -ge $LowestId) { continue }
+            }
             $Record = $Entry.Counted[$RecordKey]
             $Entry.ArchivedFocus = [double]$Entry.ArchivedFocus + [double]$Record.F
             $Entry.ArchivedInput = [double]$Entry.ArchivedInput + [double]$Record.I
