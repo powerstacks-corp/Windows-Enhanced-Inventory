@@ -575,6 +575,109 @@ Describe 'Get-AUMappings' {
             $Two.CustomerHash | Should -Be $One.CustomerHash
         }
 
+        Context 'links and paths SYSTEM must not follow (I3)' {
+            BeforeAll {
+                # A valid customer file in a real folder; each test links to it.
+                $script:RealDir = New-TestDir 'linktarget'
+                $script:RealFile = Copy-TestFixture 'mappings-customer-valid.json' $script:RealDir 'customer-mappings.json'
+                $script:Links = New-Object 'System.Collections.Generic.List[string]'
+
+                function New-TestJunction([string]$Name)
+                {
+                    $Link = Join-Path (New-TestDir 'links') $Name
+                    $Out = cmd /c mklink /J "$Link" "$script:RealDir" 2>&1
+                    if ($LASTEXITCODE -ne 0) { throw "mklink /J failed: $Out" }
+                    $script:Links.Add($Link)
+                    return $Link
+                }
+
+                function Assert-TestRefused([object]$Result, [string]$Detail)
+                {
+                    $Result.CustomerSource | Should -Be 'Invalid'
+                    $Result.CustomerDetail | Should -BeExactly $Detail
+                    $Result.CustomerHash | Should -Be ''
+                    $Result.Mappings.customer.identityRules.Count | Should -Be 0
+                    $Result.Mappings.customer.classificationRules.Count | Should -Be 0
+                    $Result.RuleIds.Contains('c-timesheets-1') | Should -BeFalse
+                    $Result.Mappings.powerStacks.identityRules.Count | Should -Be 3
+                    $Result.Errors.Count | Should -BeGreaterThan 0
+                }
+            }
+
+            AfterAll {
+                # Remove each link itself, never what it points to.
+                foreach ($Link in $script:Links)
+                {
+                    if ([IO.Directory]::Exists($Link)) { [IO.Directory]::Delete($Link) }
+                    elseif ([IO.File]::Exists($Link)) { [IO.File]::Delete($Link) }
+                }
+                [IO.File]::Exists($script:RealFile) | Should -BeTrue
+            }
+
+            It 'uses the file through its real folder (the check passes ordinary paths)' {
+                $r = Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath $script:RealFile
+                $r.CustomerSource | Should -Be 'File'
+                $r.CustomerDetail | Should -BeExactly ''
+            }
+
+            It 'refuses the file when its folder is a junction, without opening the file it points to' {
+                $Link = New-TestJunction 'folderlink'
+                ([IO.File]::GetAttributes($Link) -band [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
+                # Held open with no sharing: opening it through the junction would fail with a sharing error instead.
+                $Lock = [IO.File]::Open($script:RealFile, 'Open', 'Read', 'None')
+                try { $r = Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath (Join-Path $Link 'customer-mappings.json') }
+                finally { $Lock.Dispose() }
+                Assert-TestRefused $r 'ReparsePoint'
+                ($r.Errors -join ' ') | Should -Match 'reparse point'
+            }
+
+            It 'refuses the file when a higher folder is a junction' {
+                $Sub = New-Item -ItemType Directory -Path (Join-Path $script:RealDir 'sub') -Force
+                Copy-TestFixture 'mappings-customer-valid.json' $Sub.FullName 'customer-mappings.json' | Out-Null
+                $Link = New-TestJunction 'higherlink'
+                Assert-TestRefused (Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath (Join-Path $Link 'sub\customer-mappings.json')) 'ReparsePoint'
+            }
+
+            It 'refuses the file when it is itself a symbolic link' {
+                $Link = Join-Path (New-TestDir 'links') 'filelink.json'
+                $Out = cmd /c mklink "$Link" "$script:RealFile" 2>&1
+                if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because "a file symbolic link needs elevation or Developer Mode: $Out"; return }
+                $script:Links.Add($Link)
+                Assert-TestRefused (Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath $Link) 'ReparsePoint'
+            }
+
+            It 'reports Absent, not a refusal, when a folder on the path doesn''t exist' {
+                $r = Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath (Join-Path $script:RealDir 'missing\customer-mappings.json')
+                $r.CustomerSource | Should -Be 'Absent'
+                $r.CustomerDetail | Should -BeExactly ''
+            }
+
+            It 'refuses <Kind> path <Path> as UnsafePath, without touching it' -ForEach @(
+                @{ Kind = 'a UNC'; Path = '\\127.0.0.1\c$\ProgramData\PowerStacks\AppUsage\customer-mappings.json' }
+                @{ Kind = 'a UNC'; Path = '//127.0.0.1/c$/customer-mappings.json' }
+                @{ Kind = 'a device'; Path = '\\?\UNC\127.0.0.1\c$\customer-mappings.json' }
+                @{ Kind = 'a device'; Path = '\\.\C:\customer-mappings.json' }
+                @{ Kind = 'an NT'; Path = '\??\C:\customer-mappings.json' }
+                @{ Kind = 'a relative'; Path = 'customer-mappings.json' }
+                @{ Kind = 'a drive-relative'; Path = 'C:customer-mappings.json' }
+            ) {
+                $r = Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath $Path
+                Assert-TestRefused $r 'UnsafePath'
+                ($r.Errors -join ' ') | Should -Match 'local drive path'
+            }
+
+            It 'refuses a device path even when it names a readable, valid file' {
+                Assert-TestRefused (Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath ('\\?\' + $script:RealFile)) 'UnsafePath'
+            }
+
+            It 'keeps a stored customer target when the file is refused, as for any invalid file (D45)' {
+                $Link = New-TestJunction 'keeplink'
+                $r = Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath (Join-Path $Link 'customer-mappings.json')
+                $Stored = [pscustomobject]@{ Section = 'Customer'; MatchRuleId = 'c-timesheets-1'; RuleType = 'identity'; TargetPattern = 'Contoso*'; TargetPublisher = 'Contoso*' }
+                Get-AUStoredTargetSection $Stored $r ($r.CustomerSource -in @('Invalid', 'TooLarge')) | Should -BeExactly 'Customer'
+            }
+        }
+
         It 'merges the customer rules alongside ours' {
             $Dir = New-TestDir 'merge'
             $Cust = Copy-TestFixture 'mappings-customer-valid.json' $Dir 'customer-mappings.json'
@@ -635,6 +738,18 @@ Describe 'Test-AppUsageMappings.ps1' {
     It 'exits 1 for a file that is not there' {
         $r = Invoke-Validator @('-Path', (Join-Path (New-TestDir 'validator-none') 'customer-mappings.json'))
         $r.ExitCode | Should -Be 1
+    }
+
+    It 'checks the file''s content wherever it is, even through a junction (the device path checks are for SYSTEM only)' {
+        $Real = New-TestDir 'validator-real'
+        Copy-TestFixture 'mappings-customer-valid.json' $Real 'customer-mappings.json' | Out-Null
+        $Link = Join-Path (New-TestDir 'validator-links') 'link'
+        $Out = cmd /c mklink /J "$Link" "$Real" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "mklink /J failed: $Out" }
+        try { $r = Invoke-Validator @('-Path', (Join-Path $Link 'customer-mappings.json')) }
+        finally { [IO.Directory]::Delete($Link) }
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        $r.Output | Should -Match 'is valid'
     }
 
     It 'exits 2 with a clear message when the inventory script is missing' {

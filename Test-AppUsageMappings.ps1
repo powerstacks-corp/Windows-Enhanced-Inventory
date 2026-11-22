@@ -67,7 +67,7 @@ if (-not (Get-Command Test-AUMappings -ErrorAction SilentlyContinue) -or -not (G
 
 $FullPath = $Path
 if (Test-Path -LiteralPath $Path) { $FullPath = (Resolve-Path -LiteralPath $Path).ProviderPath }
-$File = Read-AUCustomerMappingsFile -Path $FullPath
+$File = Read-AUCustomerMappingsFile -Path $FullPath -AnyPath
 switch ($File.State)
 {
     'Absent'

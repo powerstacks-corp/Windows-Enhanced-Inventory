@@ -293,6 +293,7 @@ The validator reads the file the same way devices do and uses the validation rul
 The script looks for your file at `$AppUsageCustomerMappingsPath`, which defaults to `C:\ProgramData\PowerStacks\AppUsage\customer-mappings.json`. To use another path, change that setting in the script.
 
 - The file has no permission requirement. The script uses any valid file of up to 1 MB at that path, whoever owns it. Anyone who can write the file can change how usage on that device is matched; `CustomerMappingsHash_s` shows any device whose file differs from the one you deployed.
+- The path must be a local drive path, and neither the file nor any folder above it can be a junction, symbolic link, or other reparse point; otherwise the script ignores the file as invalid and reports `InvalidCustomerMappings:UnsafePath` or `InvalidCustomerMappings:ReparsePoint`, so no user can redirect what the SYSTEM account opens.
 - Save the file as UTF-8. UTF-16 with a byte order mark, which Windows PowerShell `Out-File` writes, also works.
 - Devices use a new file on their next inventory run.
 

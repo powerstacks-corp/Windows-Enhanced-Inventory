@@ -2406,16 +2406,20 @@ function Test-AUMappings
     return , $Limited.ToArray()
 }#endfunction
 
-function Read-AUCustomerMappingsFile
+function Test-AUCustomerMappingsPath
 {
     <#
 .SYNOPSIS
-    Reads and parses the customer mappings file once, with a bounded read, without validating it.
+    Checks the customer mappings file path before SYSTEM opens it: Use, Absent, UnsafePath, or ReparsePoint.
 .DESCRIPTION
-    Returns State (Absent, TooLarge, Invalid, or Parsed), Data (the parsed JSON when Parsed), Hash
-    (SHA-256 hex of the bytes read, when no more than the limit), and Errors. The file is opened
-    read-only and read through one FileStream of at most the limit plus one byte, so the hash and
-    the parse use exactly the same bytes (F59). No owner or permission check (D45). It never throws.
+    UnsafePath: the path isn't a local drive path (UNC, device, NT, or relative), so nothing touches
+    it. ReparsePoint: the file or a folder above it is a junction, a symbolic link, or another reparse
+    point. The folders are checked from the drive root down, reading each one's own attributes, so no
+    check passes through a link. Otherwise a standard user who can create a folder on the path, such
+    as under C:\ProgramData, could point SYSTEM's open at any file or at a share. Absent: a folder or
+    the file doesn't exist, or the path is a folder. A link swapped in between this check and the
+    open isn't caught. Returns Verdict, Path (the full path, when Use), and Item (the reparse point,
+    when ReparsePoint). Not a permission check, so D45 holds. Throws only on a malformed path.
 .PARAMETER Path
     The customer mappings file path.
 #>
@@ -2423,11 +2427,77 @@ function Read-AUCustomerMappingsFile
         [string]$Path
     )
 
-    $Result = [pscustomobject]@{ State = 'Absent'; Data = $null; Hash = ''; Errors = @() }
+    $Result = [pscustomobject]@{ Verdict = 'UnsafePath'; Path = $null; Item = $null }
+    # Only X:\ paths: a UNC or device path would have SYSTEM open a share or any NT object.
+    if ($Path -notmatch '^[A-Za-z]:[\\/]') { return $Result }
+    $Full = [IO.Path]::GetFullPath($Path)
+    $Current = [IO.Path]::GetPathRoot($Full)
+    $Attributes = [IO.FileAttributes]::Directory
+    foreach ($Part in $Full.Substring($Current.Length).Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries))
+    {
+        $Current = [IO.Path]::Combine($Current, $Part)
+        # GetAttributes reads the item's own attributes; it doesn't follow the item when it's a link.
+        try { $Attributes = [IO.File]::GetAttributes($Current) }
+        catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { $Result.Verdict = 'Absent'; return $Result }
+        if ($Attributes -band [IO.FileAttributes]::ReparsePoint)
+        {
+            $Result.Verdict = 'ReparsePoint'
+            $Result.Item = $Current
+            return $Result
+        }
+    }
+    if ($Attributes -band [IO.FileAttributes]::Directory) { $Result.Verdict = 'Absent'; return $Result }
+    $Result.Verdict = 'Use'
+    $Result.Path = $Full
+    return $Result
+}#endfunction
+
+function Read-AUCustomerMappingsFile
+{
+    <#
+.SYNOPSIS
+    Reads and parses the customer mappings file once, with a bounded read, without validating it.
+.DESCRIPTION
+    Returns State (Absent, TooLarge, Invalid, or Parsed), Data (the parsed JSON when Parsed), Hash
+    (SHA-256 hex of the bytes read, when no more than the limit), Errors, and Detail (UnsafePath or
+    ReparsePoint when the file is refused, else ''). The file is opened read-only and read through
+    one FileStream of at most the limit plus one byte, so the hash and the parse use exactly the same
+    bytes (F59). No owner or permission check (D45). Before the file is opened, the path must pass
+    Test-AUCustomerMappingsPath; a path it refuses makes the file Invalid, never partly used, with
+    Detail set to its verdict. It never throws.
+.PARAMETER Path
+    The customer mappings file path.
+.PARAMETER AnyPath
+    Skips Test-AUCustomerMappingsPath. Only Test-AppUsageMappings.ps1 sets it: it reads a file an
+    administrator names, as that administrator, to check its content.
+#>
+    param (
+        [string]$Path,
+        [switch]$AnyPath
+    )
+
+    $Result = [pscustomobject]@{ State = 'Absent'; Data = $null; Hash = ''; Errors = @(); Detail = '' }
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Result }
     try
     {
-        if (-not [IO.File]::Exists($Path)) { return $Result }
+        if ($AnyPath)
+        {
+            if (-not [IO.File]::Exists($Path)) { return $Result }
+        }
+        else
+        {
+            $Check = Test-AUCustomerMappingsPath $Path
+            if ($Check.Verdict -eq 'Absent') { return $Result }
+            if ($Check.Verdict -ne 'Use')
+            {
+                $Result.State = 'Invalid'
+                $Result.Detail = $Check.Verdict
+                if ($Check.Verdict -eq 'UnsafePath') { $Result.Errors = @("The customer mappings file path must be a local drive path, not a UNC, device, or relative path, so it's ignored: $(Format-AUErrorText $Path)") }
+                else { $Result.Errors = @("The customer mappings file is ignored because it or a folder above it is a reparse point (a junction or a link): $(Format-AUErrorText $Check.Item)") }
+                return $Result
+            }
+            $Path = $Check.Path
+        }
         $Limit = $script:AUMaxCustomerMappingsBytes
         $Buffer = New-Object 'byte[]' ($Limit + 1)
         $Count = 0
@@ -2488,8 +2558,9 @@ function Get-AUMappings
     data, never run, and never written. Returns Source (Embedded, Beside, None), CustomerSource
     (File, Absent, Invalid, TooLarge), Mappings (schemaVersion, powerStacks, customer; a section
     that isn't used has empty rule arrays), Errors, PowerStacksVersion, CustomerHash (SHA-256 hex,
-    blank unless CustomerSource is File), and RuleIds (every rule ID in use plus the reserved
-    ps-resolve-* IDs, case-insensitive). It never throws.
+    blank unless CustomerSource is File), CustomerDetail (UnsafePath or ReparsePoint when the customer
+    file is refused before it's read, so CustomerSource is Invalid; else ''), and RuleIds (every rule
+    ID in use plus the reserved ps-resolve-* IDs, case-insensitive). It never throws.
 .PARAMETER Embedded
     The embedded PowerStacks rules, or empty.
 .PARAMETER BesideDir
@@ -2509,6 +2580,7 @@ function Get-AUMappings
     $Source = 'None'
     $CustomerSource = 'Absent'
     $CustomerHash = ''
+    $CustomerDetail = ''
     $Ours = [pscustomobject]@{ version = ''; identityRules = @(); classificationRules = @() }
     $Theirs = [pscustomobject]@{ identityRules = @(); classificationRules = @() }
 
@@ -2562,6 +2634,7 @@ function Get-AUMappings
         # The customer's rules: all or nothing.
         $File = Read-AUCustomerMappingsFile -Path $CustomerPath
         foreach ($Problem in $File.Errors) { $Errors.Add($Problem) }
+        $CustomerDetail = [string]$File.Detail
         switch ($File.State)
         {
             'Absent' { $CustomerSource = 'Absent' }
@@ -2607,6 +2680,7 @@ function Get-AUMappings
         Errors             = $Errors.ToArray()
         PowerStacksVersion = [string]$Ours.version
         CustomerHash       = $CustomerHash
+        CustomerDetail     = $CustomerDetail
         RuleIds            = $RuleIds
     }
 }#endfunction
