@@ -3796,6 +3796,86 @@ function Get-AURole
     if (Test-AUMainExe $Facts $Target $InstalledApps) { return 'App' }
     return 'Helper'
 }#endfunction
+
+# Credited use (D23, D32): the one definition of "used". The ledger, the per-app summary, and the
+# per-executable output all call these two functions, and nothing else decides use (F5).
+function Test-AUFocusRecord
+{
+    <#
+.SYNOPSIS
+    Tests whether a usage record has credited focus or input.
+.DESCRIPTION
+    True when the user is interactive (Test-AUInteractiveUserType) and the record's focus or input
+    seconds are at or above the floor. A record with no focus and no input is never credited, even
+    when the floor is 0 or unset, so a missing setting can't turn background runs into use (F3).
+    The ledger uses this to set LastFocusOrInputTime.
+.PARAMETER UserType
+    The record's user type, from Get-AUUserType.
+.PARAMETER FocusSeconds
+    The record's focus seconds (SRUM InFocusS).
+.PARAMETER InputSeconds
+    The record's input seconds (SRUM UserInputS).
+.PARAMETER MinFocusSeconds
+    The floor, passed by the caller from $MinFocusSecondsForUse. Never read from the global here.
+#>
+    param (
+        [string]$UserType,
+        [double]$FocusSeconds,
+        [double]$InputSeconds,
+        [double]$MinFocusSeconds
+    )
+
+    if (-not (Test-AUInteractiveUserType $UserType)) { return $false }
+    $Seconds = [Math]::Max($FocusSeconds, $InputSeconds)
+    return ($Seconds -gt 0 -and $Seconds -ge $MinFocusSeconds)
+}#endfunction
+
+function Get-AUDerivedUse
+{
+    <#
+.SYNOPSIS
+    Derives an entry's credited use from its stored dates.
+.DESCRIPTION
+    LastUsedTime is the entry's LastInteractiveRunTime when the role is CLI (a command-line tool's
+    focus goes to the terminal, so any interactive run counts), otherwise its LastFocusOrInputTime.
+    It's $null when the entry's current user type isn't interactive, so a corrected user type
+    re-evaluates history (F6). Derived when results are produced, not when records are merged, so a
+    role change re-evaluates history too (D13). The role is compared with -ceq because Get-AURole
+    returns canonical casing.
+.PARAMETER Entry
+    The ledger entry, with LastFocusOrInputTime, LastInteractiveRunTime, and LastRanTime (UTC
+    DateTimes or $null).
+.PARAMETER Role
+    The entry's role, from Get-AURole.
+.PARAMETER UserType
+    The entry's current user type, from Get-AUUserType.
+.OUTPUTS
+    An object with LastUsedTime, LastRanTime, and HasCreditedUse.
+#>
+    param (
+        [pscustomobject]$Entry,
+        [string]$Role,
+        [string]$UserType
+    )
+
+    $LastUsedTime = $null
+    $LastRanTime = $null
+    if ($null -ne $Entry)
+    {
+        $LastRanTime = $Entry.LastRanTime
+        if (Test-AUInteractiveUserType $UserType)
+        {
+            if ($Role -ceq 'CLI') { $LastUsedTime = $Entry.LastInteractiveRunTime }
+            else { $LastUsedTime = $Entry.LastFocusOrInputTime }
+        }
+    }
+
+    return [pscustomobject]@{
+        LastUsedTime   = $LastUsedTime
+        LastRanTime    = $LastRanTime
+        HasCreditedUse = ($null -ne $LastUsedTime)
+    }
+}#endfunction
 #endregion APPUSAGE
 
 #region script
