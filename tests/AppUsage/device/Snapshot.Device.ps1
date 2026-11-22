@@ -76,12 +76,14 @@ try
 {
     # A run killed 25 hours ago: its folder and a real shadow copy named in its marker. This run's
     # New-AUWorkDir must remove both.
+    # The root's state before this check: it must be C:\Windows\PowerStacksAppUsage.
+    $Out.RootExistedBefore = Test-Path -LiteralPath $script:AUWorkRoot
+    $Stale = New-AUWorkDir -RunId "devcheck-stale-$([guid]::NewGuid().ToString('N'))"
+    [IO.Directory]::SetCreationTimeUtc($Stale, [DateTime]::UtcNow.AddHours(-25))
     $Created = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = "$($env:SystemDrive)\"; Context = 'ClientAccessible' }
     $StaleShadowId = [string]$Created.ShadowID
-    $Stale = New-AUWorkDir -RunId "devcheck-stale-$([guid]::NewGuid().ToString('N'))"
-    [IO.File]::WriteAllText((Join-Path $Stale 'shadow.id'), $StaleShadowId)
+    Write-AUShadowMarker -Folder $Stale -ShadowId $StaleShadowId
     [IO.File]::WriteAllText((Join-Path $Stale 'SRUDB.dat'), 'left by a killed run')
-    [IO.Directory]::SetCreationTimeUtc($Stale, [DateTime]::UtcNow.AddHours(-25))
     $Out.StaleShadowCreated = [bool]@(Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $StaleShadowId }).Count
 
     $WorkDir = New-AUWorkDir -RunId $RunId

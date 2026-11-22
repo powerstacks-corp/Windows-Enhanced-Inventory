@@ -49,78 +49,98 @@ Describe 'New-AUWorkDir (F28, D18)' {
         @($Rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object) | Should -Be @('S-1-5-18', 'S-1-5-32-544')
     }
 
-    It 'moves a root that is a junction aside, and leaves the junction target alone' {
-        $Target = Join-Path $TestDrive 'elsewhere'
-        $null = New-Item -ItemType Directory -Path $Target
-        [IO.File]::WriteAllText((Join-Path $Target 'keep.txt'), 'keep')
-        $Root = Join-Path $TestDrive 'JunctionRoot'
-        $null = & cmd.exe /d /c mklink /j "$Root" "$Target"
-        ([IO.File]::GetAttributes($Root) -band [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
-        Mock Remove-AUFolderTree { }
-
-        $Path = New-AUWorkDir -RunId 'run-2' -Root $Root
-        ([IO.File]::GetAttributes($Root) -band [IO.FileAttributes]::ReparsePoint) | Should -Be 0
-        Assert-ProtectedFolderAcl $Root
-        Test-Path -LiteralPath $Path | Should -BeTrue
-        $Aside = @(Get-Item -Path "$Root.untrusted-*" -Force)
-        $Aside.Count | Should -Be 1
-        ($Aside[0].Attributes -band [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
-        Test-Path -LiteralPath (Join-Path $Target 'keep.txt') | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $Target 'run-2') | Should -BeFalse
-        Should -Invoke Remove-AUFolderTree -Times 0
+    It 'defaults to C:\Windows\PowerStacksAppUsage, next to the ledger, where standard users cannot create items' {
+        $script:AUWorkRoot | Should -Be (Join-Path $env:SystemRoot 'PowerStacksAppUsage')
+        (Get-Command New-AUWorkDir).Parameters['Root'] | Should -Not -BeNullOrEmpty
     }
 
-    Context 'a root someone else controls (squatted in C:\Windows\Temp)' {
+    Context 'an existing root it does not trust' {
         BeforeEach {
-            $script:Target = Join-Path $TestDrive "outside-$([guid]::NewGuid().ToString('N'))"
+            $script:Me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $script:Admins = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+            $script:Root = Join-Path $TestDrive "Untrusted-$([guid]::NewGuid().ToString('N'))"
+            $script:Target = Join-Path $TestDrive "Target-$([guid]::NewGuid().ToString('N'))"
             $null = New-Item -ItemType Directory -Path $script:Target
             [IO.File]::WriteAllText((Join-Path $script:Target 'keep.txt'), 'keep')
-            $script:Root = Join-Path $TestDrive "PlantedRoot-$([guid]::NewGuid().ToString('N'))"
-            $null = New-Item -ItemType Directory -Path $script:Root
-            [IO.File]::WriteAllText((Join-Path $script:Root 'planted.txt'), 'planted')
-            $null = & cmd.exe /d /c mklink /j "$(Join-Path $script:Root 'sub')" "$script:Target"
-            # The current user stands in for the standard user who squatted the root.
-            $Acl = Get-Acl -LiteralPath $script:Root
-            $Acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
-            Set-Acl -LiteralPath $script:Root -AclObject $Acl
-            (Get-Acl -LiteralPath $script:Root).GetOwner([Security.Principal.SecurityIdentifier]).Value | Should -Be ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
-            Test-AUTrustedFolder -Path $script:Root | Should -BeFalse
+            $script:TargetSddl = (Get-Acl -LiteralPath $script:Target).Sddl
             Mock Remove-AUFolderTree { }
+            Mock Clear-AUStaleRuns { }
+            Mock New-AUProtectedFolder { }
         }
 
-        It 'moves it aside whole, never looking inside or deleting, and makes a fresh root' {
-            $null = New-AUWorkDir -RunId 'run-3' -Root $script:Root
-            Assert-ProtectedFolderAcl $script:Root
-            Test-Path -LiteralPath (Join-Path $script:Root 'planted.txt') | Should -BeFalse
-            $Aside = @(Get-Item -Path "$($script:Root).untrusted-*" -Force)
-            $Aside.Count | Should -Be 1
-            Test-Path -LiteralPath (Join-Path $Aside[0].FullName 'planted.txt') | Should -BeTrue
+        It 'skips with SrumReadFailed:WorkDirUntrusted and leaves a <Kind> exactly as it was' -ForEach @(
+            @{ Kind = 'file' }
+            @{ Kind = 'junction' }
+            @{ Kind = 'folder a standard user owns' }
+            @{ Kind = 'administrator-owned folder with an inherited DACL' }
+            @{ Kind = 'protected folder that also lets Users in' }
+        ) {
+            switch ($Kind)
+            {
+                'file' { [IO.File]::WriteAllText($script:Root, 'planted') }
+                'junction' { $null = & cmd.exe /d /c mklink /j "$($script:Root)" "$($script:Target)" }
+                'folder a standard user owns'
+                {
+                    $null = New-Item -ItemType Directory -Path $script:Root
+                    $Acl = Get-Acl -LiteralPath $script:Root
+                    $Acl.SetOwner($script:Me)
+                    Set-Acl -LiteralPath $script:Root -AclObject $Acl
+                }
+                'administrator-owned folder with an inherited DACL'
+                {
+                    $null = New-Item -ItemType Directory -Path $script:Root
+                    $Acl = Get-Acl -LiteralPath $script:Root
+                    $Acl.SetOwner($script:Admins)
+                    Set-Acl -LiteralPath $script:Root -AclObject $Acl
+                }
+                'protected folder that also lets Users in'
+                {
+                    $Security = New-AUProtectedSecurity -Folder
+                    $Security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+                    [void][IO.Directory]::CreateDirectory($script:Root, $Security)
+                }
+            }
+            if ($Kind -ne 'file' -and $Kind -ne 'junction') { [IO.File]::WriteAllText((Join-Path $script:Root 'planted.txt'), 'planted') }
+            $Attributes = [IO.File]::GetAttributes($script:Root)
+            $Sddl = $(if ($Kind -ne 'junction') { (Get-Acl -LiteralPath $script:Root).Sddl })
+            Test-AUTrustedFolder -Path $script:Root | Should -BeFalse
+
+            { New-AUWorkDir -RunId 'run-x' -Root $script:Root } | Should -Throw -ExpectedMessage 'SrumReadFailed:WorkDirUntrusted*'
+
+            [IO.File]::GetAttributes($script:Root) | Should -Be $Attributes
+            if ($Kind -ne 'junction') { (Get-Acl -LiteralPath $script:Root).Sddl | Should -Be $Sddl }
+            if ($Kind -ne 'file' -and $Kind -ne 'junction')
+            {
+                Test-Path -LiteralPath (Join-Path $script:Root 'planted.txt') | Should -BeTrue
+                Test-Path -LiteralPath (Join-Path $script:Root 'run-x') | Should -BeFalse
+            }
+            @(Get-Item -Path "$($script:Root).*" -Force -ErrorAction SilentlyContinue).Count | Should -Be 0
+            (Get-Acl -LiteralPath $script:Target).Sddl | Should -Be $script:TargetSddl
             Test-Path -LiteralPath (Join-Path $script:Target 'keep.txt') | Should -BeTrue
             Should -Invoke Remove-AUFolderTree -Times 0
+            Should -Invoke Clear-AUStaleRuns -Times 0
+            Should -Invoke New-AUProtectedFolder -Times 0
         }
 
-        It 'skips with SrumReadFailed:WorkDirUntrusted, deleting nothing, when it cannot be moved aside' {
-            Mock Move-AUUntrustedItem { throw 'the folder is in use' }
-            { New-AUWorkDir -RunId 'run-4' -Root $script:Root } | Should -Throw -ExpectedMessage 'SrumReadFailed:WorkDirUntrusted*'
-            Test-Path -LiteralPath (Join-Path $script:Root 'planted.txt') | Should -BeTrue
-            Test-Path -LiteralPath (Join-Path $script:Root 'run-4') | Should -BeFalse
-            Test-Path -LiteralPath (Join-Path $script:Target 'keep.txt') | Should -BeTrue
-            Should -Invoke Remove-AUFolderTree -Times 0
-        }
     }
 
-    It 'moves aside a root an administrator owns whose DACL lets others in' {
-        $Root = Join-Path $TestDrive 'LooseRoot'
-        $null = New-AUWorkDir -RunId 'run-5' -Root $Root
-        $Acl = Get-Acl -LiteralPath $Root
-        $Acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
-        Set-Acl -LiteralPath $Root -AclObject $Acl
-        Test-AUTrustedFolder -Path $Root | Should -BeFalse
+    It 'skips when the trust check fails for any other reason' {
+        $Root = Join-Path $TestDrive 'MockedTrust'
+        $null = New-AUWorkDir -RunId 'first' -Root $Root
+        Mock Test-AUTrustedFolder { $false }
+        Mock Clear-AUStaleRuns { }
+        { New-AUWorkDir -RunId 'second' -Root $Root } | Should -Throw -ExpectedMessage 'SrumReadFailed:WorkDirUntrusted*'
+        Test-Path -LiteralPath (Join-Path $Root 'second') | Should -BeFalse
+        Should -Invoke Clear-AUStaleRuns -Times 0
+    }
 
-        $null = New-AUWorkDir -RunId 'run-6' -Root $Root
-        Assert-ProtectedFolderAcl $Root
-        @(Get-Item -Path "$Root.untrusted-*" -Force).Count | Should -Be 1
-        Test-Path -LiteralPath (Join-Path $Root 'run-5') | Should -BeFalse
+    It 'skips when the run folder already exists, and never changes it' {
+        $Root = Join-Path $TestDrive 'ExistingRun'
+        $null = New-AUWorkDir -RunId 'first' -Root $Root
+        $null = New-Item -ItemType Directory -Path (Join-Path $Root 'taken')
+        $Sddl = (Get-Acl -LiteralPath (Join-Path $Root 'taken')).Sddl
+        { New-AUWorkDir -RunId 'taken' -Root $Root } | Should -Throw -ExpectedMessage 'SrumReadFailed:WorkDirUntrusted*'
+        (Get-Acl -LiteralPath (Join-Path $Root 'taken')).Sddl | Should -Be $Sddl
     }
 
     It 'rejects a RunId that is not a plain folder name' {
@@ -129,38 +149,137 @@ Describe 'New-AUWorkDir (F28, D18)' {
     }
 }
 
-Describe 'Stale run cleanup (F28)' {
-    It 'removes run folders a killed run left more than 24 hours ago, and the shadow copies their markers name' {
-        Mock Remove-AUShadowCopy { $true }
-        $Root = Join-Path $TestDrive 'SweepRoot'
-        $Recent = New-AUWorkDir -RunId 'recent-run' -Root $Root
-        [IO.Directory]::SetCreationTimeUtc($Recent, [datetime]::UtcNow.AddHours(-23))
-        $Old = New-AUWorkDir -RunId 'old-run' -Root $Root
-        [IO.File]::WriteAllText((Join-Path $Old 'shadow.id'), '{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}')
-        $null = New-Item -ItemType Directory -Path (Join-Path $Old 'sru')
-        [IO.File]::WriteAllText((Join-Path $Old 'sru\SRUDB.dat'), 'copy')
-        [IO.Directory]::SetCreationTimeUtc($Old, [datetime]::UtcNow.AddHours(-25))
+Describe 'Test-AUTrustedFolder and Test-AUItemPresent' {
+    It 'trusts only a protected folder it created' {
+        $Root = Join-Path $TestDrive 'Trusted'
+        New-AUProtectedFolder -Path $Root
+        Test-AUTrustedFolder -Path $Root | Should -BeTrue
+        Test-AUTrustedFolder -Path (Join-Path $TestDrive 'missing') | Should -BeFalse
+        Test-AUTrustedFolder -Path $TestDrive | Should -BeFalse
+    }
 
-        $Current = New-AUWorkDir -RunId 'current-run' -Root $Root
+    It 'tells a missing path from a file, a folder, and a broken link' {
+        Test-AUItemPresent -Path (Join-Path $TestDrive 'missing') | Should -BeFalse
+        Test-AUItemPresent -Path (Join-Path $TestDrive 'missing\deeper') | Should -BeFalse
+        [IO.File]::WriteAllText((Join-Path $TestDrive 'a-file'), 'x')
+        Test-AUItemPresent -Path (Join-Path $TestDrive 'a-file') | Should -BeTrue
+        $Gone = Join-Path $TestDrive 'gone-target'
+        $null = New-Item -ItemType Directory -Path $Gone
+        $Link = Join-Path $TestDrive 'broken-link'
+        $null = & cmd.exe /d /c mklink /j "$Link" "$Gone"
+        Remove-Item -LiteralPath $Gone
+        Test-AUItemPresent -Path $Link | Should -BeTrue
+    }
+}
+
+Describe 'Stale run cleanup (F28)' {
+    BeforeAll {
+        function New-StaleRun([string]$Root, [string]$Name, [double]$HoursAgo)
+        {
+            $Path = Join-Path $Root $Name
+            New-AUProtectedFolder -Path $Path
+            $null = New-Item -ItemType Directory -Path (Join-Path $Path 'sru')
+            [IO.File]::WriteAllText((Join-Path $Path 'sru\SRUDB.dat'), 'copy')
+            [IO.Directory]::SetCreationTimeUtc($Path, [datetime]::UtcNow.AddHours(-$HoursAgo))
+            return $Path
+        }
+    }
+
+    BeforeEach {
+        $script:Root = Join-Path $TestDrive "Sweep-$([guid]::NewGuid().ToString('N'))"
+        $null = New-AUWorkDir -RunId 'setup' -Root $script:Root
+        $script:Id = '{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}'
+        # The shadow copy exists and was made 2 hours ago, unless a test says otherwise.
+        $script:InstallDate = (Get-Date).AddHours(-2)
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:Id; InstallDate = $script:InstallDate } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Mock Remove-AUShadowCopy { $true }
+    }
+
+    It 'skips the sweep on a root this call created' {
+        Mock Clear-AUStaleRuns { }
+        $Fresh = Join-Path $TestDrive "Fresh-$([guid]::NewGuid().ToString('N'))"
+        $null = New-AUWorkDir -RunId 'one' -Root $Fresh
+        Should -Invoke Clear-AUStaleRuns -Times 0 -Exactly
+        $null = New-AUWorkDir -RunId 'two' -Root $Fresh
+        Should -Invoke Clear-AUStaleRuns -Times 1 -Exactly
+    }
+
+    It 'removes a protected run folder more than 24 hours old, and the shadow copy its marker names when that run made it' {
+        $Old = New-StaleRun $script:Root 'old-run' 25
+        Write-AUShadowMarker -Folder $Old -ShadowId $script:Id
+        $Recent = New-StaleRun $script:Root 'recent-run' 23
+        $null = New-AUWorkDir -RunId 'current' -Root $script:Root
         Test-Path -LiteralPath $Old | Should -BeFalse
         Test-Path -LiteralPath $Recent | Should -BeTrue
-        Test-Path -LiteralPath $Current | Should -BeTrue
-        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq '{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}' }
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:Id }
+    }
+
+    It 'never deletes a shadow copy made outside the run folder''s lifetime, or one that does not exist' {
+        $Old = New-StaleRun $script:Root 'old-run' 25
+        Write-AUShadowMarker -Folder $Old -ShadowId $script:Id
+        $script:InstallDate = (Get-Date).AddHours(-30)
+        $null = New-AUWorkDir -RunId 'current' -Root $script:Root
+        Test-Path -LiteralPath $Old | Should -BeFalse
+        Should -Invoke Remove-AUShadowCopy -Times 0
+
+        $Old2 = New-StaleRun $script:Root 'old-run-2' 25
+        Write-AUShadowMarker -Folder $Old2 -ShadowId $script:Id
+        Mock Get-CimInstance { } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        $null = New-AUWorkDir -RunId 'current-2' -Root $script:Root
+        Should -Invoke Remove-AUShadowCopy -Times 0
+    }
+
+    It 'never acts on a marker that a standard user owns' {
+        $Old = New-StaleRun $script:Root 'old-run' 25
+        $Marker = Join-Path $Old 'shadow.id'
+        [IO.File]::WriteAllText($Marker, $script:Id)
+        $Acl = Get-Acl -LiteralPath $Marker
+        $Acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+        Set-Acl -LiteralPath $Marker -AclObject $Acl
+        Read-AUShadowMarker -Folder $Old | Should -BeNullOrEmpty
+        $null = New-AUWorkDir -RunId 'current' -Root $script:Root
+        Should -Invoke Remove-AUShadowCopy -Times 0
+    }
+
+    It 'never deletes a backdated run folder that is not protected or that a standard user owns' {
+        Mock Remove-AUFolderTree { }
+        $Planted = Join-Path $script:Root 'planted-run'
+        $null = New-Item -ItemType Directory -Path $Planted
+        [IO.File]::WriteAllText((Join-Path $Planted 'planted.txt'), 'planted')
+        $Acl = Get-Acl -LiteralPath $Planted
+        $Acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+        Set-Acl -LiteralPath $Planted -AclObject $Acl
+        [IO.Directory]::SetCreationTimeUtc($Planted, [datetime]::UtcNow.AddHours(-48))
+        $Inherited = Join-Path $script:Root 'inherited-run'
+        $null = New-Item -ItemType Directory -Path $Inherited
+        [IO.Directory]::SetCreationTimeUtc($Inherited, [datetime]::UtcNow.AddHours(-48))
+
+        $null = New-AUWorkDir -RunId 'current' -Root $script:Root
+        Test-Path -LiteralPath (Join-Path $Planted 'planted.txt') | Should -BeTrue
+        Test-Path -LiteralPath $Inherited | Should -BeTrue
+        Should -Invoke Remove-AUFolderTree -Times 0
+        Should -Invoke Remove-AUShadowCopy -Times 0
     }
 
     It 'never follows or removes a link in the work root' {
-        $Root = Join-Path $TestDrive 'SweepLinkRoot'
-        $null = New-AUWorkDir -RunId 'first' -Root $Root
-        $Target = Join-Path $TestDrive 'sweep-target'
+        $Target = Join-Path $TestDrive "sweep-target-$([guid]::NewGuid().ToString('N'))"
         $null = New-Item -ItemType Directory -Path $Target
         [IO.File]::WriteAllText((Join-Path $Target 'keep.txt'), 'keep')
         [IO.Directory]::SetCreationTimeUtc($Target, [datetime]::UtcNow.AddHours(-48))
-        $Link = Join-Path $Root 'link'
+        $Link = Join-Path $script:Root 'link'
         $null = & cmd.exe /d /c mklink /j "$Link" "$Target"
 
-        $null = New-AUWorkDir -RunId 'second' -Root $Root
+        $null = New-AUWorkDir -RunId 'current' -Root $script:Root
         Test-Path -LiteralPath $Link | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $Target 'keep.txt') | Should -BeTrue
+    }
+
+    It 'lists nothing when the root has become a link' {
+        Mock Test-AUReparsePoint { $true } -ParameterFilter { $Path -eq $script:Root }
+        Mock Remove-AUFolderTree { }
+        $null = New-StaleRun $script:Root 'old-run' 25
+        Clear-AUStaleRuns -Root $script:Root -Except 'current' -MaxAgeHours 24
+        Should -Invoke Remove-AUFolderTree -Times 0
     }
 }
 

@@ -4136,32 +4136,23 @@ function Set-AUProtectedAcl
 {
     <#
 .SYNOPSIS
-    Gives a file or folder a protected DACL: full control for SYSTEM and Administrators only, inheritance off.
+    Gives a file a protected DACL: full control for SYSTEM and Administrators only, inheritance off.
 .DESCRIPTION
     The ledger and its moved-aside copies hold every user's SIDs, executables, and usage times, so no
     standard user may read them (D18). Uses the well-known SIDs, never localized names
     (New-AUProtectedSecurity). Pass Stream to set it through an open handle (opened with
-    ChangePermissions), so the file is never readable by others while it's written. Pass Folder for a
-    work folder: its two entries are inherited by everything inside (F28). Throws on failure; callers
-    log it and carry on, so a failure to set the DACL never loses ledger data.
+    ChangePermissions), so the file is never readable by others while it's written. Throws on
+    failure; callers log it and carry on, so a failure to set the DACL never loses ledger data.
 .PARAMETER Path
     The file, when Stream isn't given.
 .PARAMETER Stream
     An open FileStream for the file.
-.PARAMETER Folder
-    A folder, instead of a file.
 #>
     param (
         [string]$Path,
-        [IO.FileStream]$Stream,
-        [string]$Folder
+        [IO.FileStream]$Stream
     )
 
-    if ($Folder)
-    {
-        [IO.Directory]::SetAccessControl($Folder, (New-AUProtectedSecurity -Folder))
-        return
-    }
     $Security = New-AUProtectedSecurity
     if ($null -ne $Stream) { $Stream.SetAccessControl($Security) }
     else { [IO.File]::SetAccessControl($Path, $Security) }
@@ -5439,8 +5430,10 @@ function Invoke-AUWithLock
 }#endfunction
 
 # Snapshot and SRUM reader (Task 12). Copies come only from a shadow copy, into the protected work
-# folder (D18, F28); the live SRUDB.dat and live hives are never opened.
-$script:AUWorkRoot = [IO.Path]::Combine($env:SystemRoot, 'Temp\PowerStacksAppUsage')
+# folder C:\Windows\PowerStacksAppUsage\<RunId> (D18, F28); the live SRUDB.dat and live hives are
+# never opened.
+# Next to the ledger: standard users can't create items in C:\Windows, so nobody else can make it first.
+$script:AUWorkRoot = [IO.Path]::Combine($env:SystemRoot, 'PowerStacksAppUsage')
 $script:AUEsentPath = [IO.Path]::Combine($env:SystemRoot, 'Microsoft.NET\assembly\GAC_MSIL\microsoft.isam.esent.interop\v4.0_10.0.0.0__31bf3856ad364e35\Microsoft.Isam.Esent.Interop.dll')
 $script:AUEsentutlPath = [IO.Path]::Combine($env:SystemRoot, 'System32\esentutl.exe')
 $script:AUCmdPath = [IO.Path]::Combine($env:SystemRoot, 'System32\cmd.exe')
@@ -5503,9 +5496,9 @@ function Remove-AUFolderTree
 .SYNOPSIS
     Deletes a folder SYSTEM created under the protected work root, and everything in it, never following a link.
 .DESCRIPTION
-    Only for trees no standard user can write to (a run folder inside the protected root): a folder
-    someone else controls could be swapped for a junction mid-delete, so an untrusted folder is
-    moved aside, never passed here (Initialize-AUProtectedFolder). A link is deleted itself, never
+    Only for trees no standard user can write to (a run folder inside the protected root that
+    Test-AUTrustedFolder trusts): a folder someone else controls could be swapped for a junction
+    mid-delete, so an untrusted folder is never passed here. A link is deleted itself, never
     its target. [IO.Directory]::Delete with recursion can't be used: on .NET Framework it fails on
     a junction inside the tree. Read-only files are made writable first. Throws on failure.
 .PARAMETER Path
@@ -5529,6 +5522,67 @@ function Remove-AUFolderTree
     $Folder.Delete()
 }#endfunction
 
+function Test-AUItemPresent
+{
+    <#
+.SYNOPSIS
+    Returns true when anything (a file, folder, or link, even a broken one) is at Path.
+.DESCRIPTION
+    Reads the entry's own attributes, without following a link. Fails closed: any error but "not
+    found" counts as present, so the caller treats it as untrusted. Never throws.
+.PARAMETER Path
+    The path.
+#>
+    param (
+        [string]$Path
+    )
+
+    try
+    {
+        [void][IO.File]::GetAttributes($Path)
+        return $true
+    }
+    catch
+    {
+        if ((Test-AUExceptionType $_.Exception ([IO.FileNotFoundException])) -or (Test-AUExceptionType $_.Exception ([IO.DirectoryNotFoundException]))) { return $false }
+        return $true
+    }
+}#endfunction
+
+function Test-AUReparsePoint
+{
+    <#
+.SYNOPSIS
+    Returns true when Path is a link (a reparse point), or when its attributes can't be read.
+.DESCRIPTION
+    GetAttributes reads the entry itself and doesn't follow a link. Fails closed: an error counts as
+    a link. Never throws.
+.PARAMETER Path
+    The file or folder.
+#>
+    param (
+        [string]$Path
+    )
+
+    try { return (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -ne 0) }
+    catch { return $true }
+}#endfunction
+
+function Test-AUTrustedOwner
+{
+    <#
+.SYNOPSIS
+    Returns true when a security descriptor's owner is SYSTEM or Administrators.
+.PARAMETER Security
+    A FileSecurity or DirectorySecurity.
+#>
+    param (
+        $Security
+    )
+
+    return ($script:AULedgerAclSids -contains $Security.GetOwner([Security.Principal.SecurityIdentifier]).Value)
+}#endfunction
+
 function Test-AUTrustedFolder
 {
     <#
@@ -5537,7 +5591,11 @@ function Test-AUTrustedFolder
 .DESCRIPTION
     True only for a folder that isn't a link, is owned by SYSTEM or Administrators, and has a
     protected DACL whose every entry is SYSTEM or Administrators. Its contents were then written by
-    SYSTEM or an administrator only, so it's safe to look inside. Never throws.
+    SYSTEM or an administrator only.
+    In-box .NET can't read a folder's attributes and security from one handle that doesn't follow
+    links, and GetAccessControl opens the path and follows one. So the attributes are read right
+    before and right after the security, and the folder fails when either read shows a link or the
+    two differ. Fails closed on any error. Never throws.
 .PARAMETER Path
     The folder.
 #>
@@ -5547,10 +5605,12 @@ function Test-AUTrustedFolder
 
     try
     {
-        $Attributes = [IO.File]::GetAttributes($Path)
-        if (($Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or ($Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        $Before = [IO.File]::GetAttributes($Path)
         $Acl = [IO.Directory]::GetAccessControl($Path, [Security.AccessControl.AccessControlSections]'Owner, Access')
-        if ($script:AULedgerAclSids -notcontains $Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { return $false }
+        $After = [IO.File]::GetAttributes($Path)
+        if ($Before -ne $After) { return $false }
+        if (($Before -band [IO.FileAttributes]::Directory) -eq 0 -or ($Before -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        if (-not (Test-AUTrustedOwner -Security $Acl)) { return $false }
         if (-not $Acl.AreAccessRulesProtected) { return $false }
         $Rules = @($Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
         if ($Rules.Count -eq 0) { return $false }
@@ -5563,61 +5623,25 @@ function Test-AUTrustedFolder
     catch { return $false }
 }#endfunction
 
-function Move-AUUntrustedItem
+function New-AUProtectedFolder
 {
     <#
 .SYNOPSIS
-    Renames an untrusted file, folder, or link aside to <Path>.untrusted-<guid> and returns the new path.
+    Creates a new folder with the protected DACL, owned by Administrators, and checks the result.
 .DESCRIPTION
-    A rename changes only the directory entry: nothing inside is opened, followed, or deleted, so a
-    junction swapped in by its owner can't turn it into a delete as SYSTEM. Throws on failure.
+    Only ever creates: the DACL is set at creation (CreateDirectory with a DirectorySecurity), never
+    on an existing item. CreateDirectory accepts a folder that already exists without applying the
+    DACL, so the result must pass Test-AUTrustedFolder. Throws, with a message starting
+    $script:AUWorkDirUntrustedStatus, when it doesn't.
 .PARAMETER Path
-    The item to move aside.
+    The folder to create; nothing may exist at it.
 #>
     param (
         [string]$Path
     )
 
-    $Aside = "$Path.untrusted-$([guid]::NewGuid().ToString('N'))"
-    if ([IO.Directory]::Exists($Path)) { [IO.Directory]::Move($Path, $Aside) }
-    else { [IO.File]::Move($Path, $Aside) }
-    return $Aside
-}#endfunction
-
-function Initialize-AUProtectedFolder
-{
-    <#
-.SYNOPSIS
-    Makes Path a real folder, owned by Administrators, with the protected DACL.
-.DESCRIPTION
-    Standard users can create folders in C:\Windows\Temp, so an existing item isn't trusted as
-    found. Anything at Path that Test-AUTrustedFolder doesn't trust (a link, a file, a folder owned
-    by someone else, or one with other entries) is renamed aside (Move-AUUntrustedItem), never
-    opened or deleted, and a fresh folder is made. A folder this function creates gets the
-    protected DACL at creation, so it's never readable by others; a trusted existing folder gets
-    the DACL set again. The result is checked again afterwards, because CreateDirectory accepts a
-    folder someone made in the meantime.
-    Throws when the untrusted item can't be moved aside, or the result isn't trusted; the message
-    starts with $script:AUWorkDirUntrustedStatus, the status Invoke-AppUsage reports when it skips
-    App Usage for the run. Other failures throw as they are.
-.PARAMETER Path
-    The folder.
-#>
-    param (
-        [string]$Path
-    )
-
-    if (([IO.Directory]::Exists($Path) -or [IO.File]::Exists($Path)) -and -not (Test-AUTrustedFolder -Path $Path))
-    {
-        try { $Aside = Move-AUUntrustedItem -Path $Path }
-        catch { throw "$($script:AUWorkDirUntrustedStatus): $Path isn't trusted and couldn't be moved aside: $($_.Exception.Message)" }
-        Write-CMTraceLog -Message "App Usage: moved $Path aside to $Aside, because the work folder must be a real folder only SYSTEM and Administrators control." -Component 'AppUsage' -Type 2
-    }
-
-    if ([IO.Directory]::Exists($Path)) { Set-AUProtectedAcl -Folder $Path }
-    else { [void][IO.Directory]::CreateDirectory($Path, (New-AUProtectedSecurity -Folder)) }
-
-    if (-not (Test-AUTrustedFolder -Path $Path)) { throw "$($script:AUWorkDirUntrustedStatus): $Path changed while it was being created." }
+    [void][IO.Directory]::CreateDirectory($Path, (New-AUProtectedSecurity -Folder))
+    if (-not (Test-AUTrustedFolder -Path $Path)) { throw "$($script:AUWorkDirUntrustedStatus): $Path isn't the protected folder just created." }
 }#endfunction
 
 function Remove-AUShadowCopy
@@ -5646,17 +5670,77 @@ function Remove-AUShadowCopy
     }
 }#endfunction
 
+function Test-AUShadowFromRun
+{
+    <#
+.SYNOPSIS
+    Returns true when the shadow copy exists and was made while the run folder existed.
+.DESCRIPTION
+    A stale run's marker names the shadow copy it made. It's deleted only when Win32_ShadowCopy has
+    it and its InstallDate falls between the run folder's creation and now, so a marker can never
+    point the sweep at another shadow copy. Never throws.
+.PARAMETER ShadowId
+    The shadow copy ID from the marker, a GUID in braces.
+.PARAMETER SinceUtc
+    The run folder's creation time.
+#>
+    param (
+        [string]$ShadowId,
+        [datetime]$SinceUtc
+    )
+
+    try
+    {
+        if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { return $false }
+        $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -ErrorAction Stop | Select-Object -First 1
+        if (-not $Shadow -or $Shadow.InstallDate -isnot [datetime]) { return $false }
+        $Installed = $Shadow.InstallDate.ToUniversalTime()
+        return ($Installed -ge $SinceUtc.ToUniversalTime() -and $Installed -le [datetime]::UtcNow)
+    }
+    catch { return $false }
+}#endfunction
+
+function Read-AUShadowMarker
+{
+    <#
+.SYNOPSIS
+    Returns the shadow copy ID in a run folder's marker, or $null when there's no trusted marker.
+.DESCRIPTION
+    The marker counts only when it isn't a link and SYSTEM or Administrators owns it (New-AUSnapshot
+    creates it with that owner). Never throws.
+.PARAMETER Folder
+    The run folder.
+#>
+    param (
+        [string]$Folder
+    )
+
+    try
+    {
+        $Marker = [IO.Path]::Combine($Folder, $script:AUShadowMarker)
+        if (-not [IO.File]::Exists($Marker) -or (Test-AUReparsePoint -Path $Marker)) { return $null }
+        if (-not (Test-AUTrustedOwner -Security ([IO.File]::GetAccessControl($Marker, [Security.AccessControl.AccessControlSections]::Owner)))) { return $null }
+        if (Test-AUReparsePoint -Path $Marker) { return $null }
+        $ShadowId = ([IO.File]::ReadAllText($Marker)).Trim()
+        if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { return $null }
+        return $ShadowId
+    }
+    catch { return $null }
+}#endfunction
+
 function Clear-AUStaleRuns
 {
     <#
 .SYNOPSIS
-    Removes run folders, and the shadow copies their markers name, that a killed run left in the protected root.
+    Removes run folders, and the shadow copies their markers name, that a killed run left in the work root.
 .DESCRIPTION
-    Only call it on a root Test-AUTrustedFolder trusts, so everything inside was made by SYSTEM or
-    an administrator. A run folder created more than MaxAgeHours ago is stale: the shadow copy in
-    its marker file (New-AUSnapshot writes <run>\$script:AUShadowMarker) is deleted, then the folder
-    (Remove-AUFolderTree). A link in the root is never followed or removed, and the current run's
-    folder is skipped. Never throws.
+    Only call it on a root Test-AUTrustedFolder trusts that this call didn't just create. The root's
+    link flag is checked again right before it's listed. A child is considered only when it's a real
+    folder that Test-AUTrustedFolder trusts, it isn't the current run, and it was created more than
+    MaxAgeHours ago. Its marker's shadow copy is deleted only when the marker is trusted
+    (Read-AUShadowMarker) and the shadow copy was made during the folder's lifetime
+    (Test-AUShadowFromRun); then the folder is removed (Remove-AUFolderTree). Anything else is left
+    alone. Never throws.
 .PARAMETER Root
     The protected work root.
 .PARAMETER Except
@@ -5672,25 +5756,32 @@ function Clear-AUStaleRuns
 
     try
     {
+        if (Test-AUReparsePoint -Path $Root)
+        {
+            Write-CMTraceLog -Message "App Usage: $Root became a link, so no stale runs were checked." -Component 'AppUsage' -Type 3
+            return
+        }
         $Cutoff = [datetime]::UtcNow.AddHours(-$MaxAgeHours)
         foreach ($Folder in (New-Object IO.DirectoryInfo $Root).GetDirectories())
         {
             try
             {
-                if (($Folder.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+                if ([string]::Equals($Folder.Name, $Except, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                if (($Folder.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not (Test-AUTrustedFolder -Path $Folder.FullName))
                 {
-                    Write-CMTraceLog -Message "App Usage: left the link $($Folder.FullName) in the work root alone." -Component 'AppUsage' -Type 2
+                    Write-CMTraceLog -Message "App Usage: left $($Folder.FullName) alone, because it isn't a protected run folder." -Component 'AppUsage' -Type 2
                     continue
                 }
-                if ([string]::Equals($Folder.Name, $Except, [StringComparison]::OrdinalIgnoreCase) -or $Folder.CreationTimeUtc -gt $Cutoff) { continue }
-                $Marker = [IO.Path]::Combine($Folder.FullName, $script:AUShadowMarker)
-                if ([IO.File]::Exists($Marker) -and ([IO.File]::GetAttributes($Marker) -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+                $CreatedUtc = $Folder.CreationTimeUtc
+                if ($CreatedUtc -gt $Cutoff) { continue }
+                $ShadowId = Read-AUShadowMarker -Folder $Folder.FullName
+                if ($ShadowId)
                 {
-                    $ShadowId = ([IO.File]::ReadAllText($Marker)).Trim()
-                    if ($ShadowId) { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+                    if (Test-AUShadowFromRun -ShadowId $ShadowId -SinceUtc $CreatedUtc) { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+                    else { Write-CMTraceLog -Message "App Usage: left shadow copy $ShadowId alone; it isn't one that $($Folder.FullName) made." -Component 'AppUsage' -Type 2 }
                 }
                 Remove-AUFolderTree -Path $Folder.FullName
-                Write-CMTraceLog -Message "App Usage: removed the stale run folder $($Folder.FullName), created $($Folder.CreationTimeUtc.ToString('o'))." -Component 'AppUsage' -Type 2
+                Write-CMTraceLog -Message "App Usage: removed the stale run folder $($Folder.FullName), created $($CreatedUtc.ToString('o'))." -Component 'AppUsage' -Type 2
             }
             catch { Write-CMTraceLog -Message "App Usage: couldn't remove the stale run folder $($Folder.FullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         }
@@ -5704,17 +5795,21 @@ function New-AUWorkDir
 .SYNOPSIS
     Creates this run's protected work folder, <Root>\<RunId>, and returns its path (F28).
 .DESCRIPTION
-    The root and the run folder both get the protected DACL (SYSTEM and Administrators full control
-    only, inheritance off), and copies made inside inherit it, so no standard user can read another
-    user's hive copy or anyone's SRUM activity (D18). An untrusted root is moved aside, never
-    deleted (Initialize-AUProtectedFolder). Run folders a killed run left behind more than 24 hours
-    ago are removed, with their shadow copies (Clear-AUStaleRuns). Throws when RunId isn't a plain
-    folder name or a folder can't be made safe; for an untrusted root that can't be moved aside, the
-    message starts with $script:AUWorkDirUntrustedStatus.
+    The root is C:\Windows\PowerStacksAppUsage, next to the ledger: standard users can't create
+    items in C:\Windows, so nobody else can make the root first. A missing root is created with the
+    protected DACL (SYSTEM and Administrators full control only, inheritance off, owner
+    Administrators), and so is the run folder; copies made inside inherit it, so no standard user
+    can read another user's hive copy or anyone's SRUM activity (D18).
+    An existing root that Test-AUTrustedFolder doesn't trust (not a folder, a link, another owner, or
+    another DACL) is never moved, changed, listed, or deleted: this throws, with a message starting
+    $script:AUWorkDirUntrustedStatus, and App Usage skips the run with that status. The DACL is only
+    ever set on a folder this call creates. On an existing trusted root, run folders a killed run
+    left more than $script:AUStaleRunHours hours ago are removed, with their shadow copies
+    (Clear-AUStaleRuns). Throws when RunId isn't a plain folder name or a folder can't be made.
 .PARAMETER RunId
     This run's ID: letters, digits, '.', '_', and '-', starting with a letter or digit.
 .PARAMETER Root
-    The work root, C:\Windows\Temp\PowerStacksAppUsage by default. Tests pass a TestDrive path.
+    The work root, C:\Windows\PowerStacksAppUsage by default. Tests pass a TestDrive path.
 #>
     param (
         [string]$RunId,
@@ -5722,10 +5817,16 @@ function New-AUWorkDir
     )
 
     if ($RunId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "New-AUWorkDir needs a plain folder name for RunId; got '$RunId'." }
-    Initialize-AUProtectedFolder -Path $Root
-    Clear-AUStaleRuns -Root $Root -Except $RunId -MaxAgeHours $script:AUStaleRunHours
+    if (Test-AUItemPresent -Path $Root)
+    {
+        if (-not (Test-AUTrustedFolder -Path $Root)) { throw "$($script:AUWorkDirUntrustedStatus): $Root isn't a folder only SYSTEM and Administrators control, so it was left alone." }
+        Clear-AUStaleRuns -Root $Root -Except $RunId -MaxAgeHours $script:AUStaleRunHours
+    }
+    else { New-AUProtectedFolder -Path $Root }
+
     $Path = [IO.Path]::Combine($Root, $RunId)
-    Initialize-AUProtectedFolder -Path $Path
+    if (Test-AUItemPresent -Path $Path) { throw "$($script:AUWorkDirUntrustedStatus): the run folder $Path already exists." }
+    New-AUProtectedFolder -Path $Path
     return $Path
 }#endfunction
 
@@ -5955,6 +6056,36 @@ function Test-AUHiveLoaded
     finally { if ($null -ne $Key) { $Key.Close() } }
 }#endfunction
 
+function Write-AUShadowMarker
+{
+    <#
+.SYNOPSIS
+    Creates <Folder>\shadow.id holding the shadow copy ID, owned by Administrators with the protected DACL.
+.DESCRIPTION
+    The owner is set at creation, so the stale-run sweep (Read-AUShadowMarker) trusts it even when an
+    elevated administrator, whose token may make the user the default owner, ran the inventory.
+    Throws on failure.
+.PARAMETER Folder
+    The run folder.
+.PARAMETER ShadowId
+    The shadow copy ID.
+#>
+    param (
+        [string]$Folder,
+        [string]$ShadowId
+    )
+
+    $Security = New-AUProtectedSecurity
+    $Security.SetOwner((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
+    $Stream = [IO.File]::Create([IO.Path]::Combine($Folder, $script:AUShadowMarker), 4096, [IO.FileOptions]::None, $Security)
+    try
+    {
+        $Bytes = [Text.Encoding]::ASCII.GetBytes($ShadowId)
+        $Stream.Write($Bytes, 0, $Bytes.Length)
+    }
+    finally { $Stream.Dispose() }
+}#endfunction
+
 function New-AUSnapshot
 {
     <#
@@ -6005,7 +6136,7 @@ function New-AUSnapshot
             if ($Created.ReturnValue -ne 0 -or -not $Created.ShadowID) { throw "Win32_ShadowCopy.Create returned $($Created.ReturnValue)." }
             $Snapshot.ShadowId = [string]$Created.ShadowID
             # A run killed from here on leaves this marker, so a later run deletes the shadow copy.
-            try { [IO.File]::WriteAllText([IO.Path]::Combine($WorkDir, $script:AUShadowMarker), $Snapshot.ShadowId) }
+            try { Write-AUShadowMarker -Folder $WorkDir -ShadowId $Snapshot.ShadowId }
             catch { Write-CMTraceLog -Message "App Usage: couldn't write the shadow marker in $WorkDir`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
             $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($Snapshot.ShadowId)'" -ErrorAction Stop
             if (-not $Shadow -or -not $Shadow.DeviceObject) { throw "shadow copy $($Snapshot.ShadowId) has no device path." }
@@ -6103,7 +6234,7 @@ function Remove-AUSnapshot
 .PARAMETER Snapshot
     The object from New-AUSnapshot, or $null.
 .PARAMETER Root
-    The protected work root, C:\Windows\Temp\PowerStacksAppUsage by default. Tests pass a TestDrive path.
+    The protected work root, C:\Windows\PowerStacksAppUsage by default. Tests pass a TestDrive path.
 #>
     param (
         $Snapshot,
