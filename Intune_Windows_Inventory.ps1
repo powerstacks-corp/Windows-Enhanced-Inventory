@@ -164,7 +164,10 @@ $DceURI = "<ENTER YOUR DATA COLLECTION ENDPOINT - LOG INGESTION URL HERE>"
 $DcrImmutableId = "<ENTER YOUR DATA COLLECTION RULE - IMMUTABLE ID HERE>"
 
 ##### OPTIONAL ####
-#secretless ingestion via the PowerStacks Entra Token Broker. When $BrokerUrl is set to a
+# NOTE: The Entra Token Broker is an independent, third-party tool. It is NOT a PowerStacks
+# product and is not affiliated with, endorsed by, or supported by PowerStacks. It is provided
+# as-is, with no warranty, and PowerStacks is not responsible for it. Use at your own risk.
+#secretless ingestion via the Entra Token Broker. When $BrokerUrl is set to a
 # real URL, the device authenticates to the broker with its Entra Join certificate (mutual TLS),
 # receives a short-lived signed assertion, and posts straight to the DCR using a broker-minted token -
 # no secret on the device and no relay hop. This replaces the client secret on the DCR upload path;
@@ -1841,7 +1844,7 @@ function Send-LogIngestionAPI(
     $payloadsize = ("Upload payload size is " + ($body.Length / 1024).ToString("#.#") + "Kb ")
 
     # Acquire the ingestion token. When $BrokerUrl is configured, this device authenticates to the
-    # PowerStacks Entra Token Broker with its Entra Join certificate (mutual TLS) and exchanges the
+    # Entra Token Broker with its Entra Join certificate (mutual TLS) and exchanges the
     # returned assertion for the inventory managed identity's token - no secret on the device.
     # Otherwise fall back to the classic client-secret token (New-BearerToken, unchanged). The DCR
     # upload below is identical either way.
