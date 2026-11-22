@@ -3442,6 +3442,31 @@ function Test-AUSameTarget
         [string]::Equals(([string]$First.TargetPublisher).Trim(), ([string]$Second.TargetPublisher).Trim(), [StringComparison]::OrdinalIgnoreCase))
 }#endfunction
 
+function Test-AUSameApp
+{
+    <#
+.SYNOPSIS
+    Tests whether two targets resolved to the same installed app: the same ResolvedAppName,
+    ProductCode, or PackageFamily, ignoring case. A blank value never matches.
+.PARAMETER First
+    A target or stored target.
+.PARAMETER Second
+    A target or stored target.
+#>
+    param (
+        [pscustomobject]$First,
+        [pscustomobject]$Second
+    )
+
+    foreach ($Name in @('ResolvedAppName', 'ProductCode', 'PackageFamily'))
+    {
+        $A = ([string]$First.$Name).Trim()
+        $B = ([string]$Second.$Name).Trim()
+        if ($A -and $B -and [string]::Equals($A, $B, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}#endfunction
+
 function Resolve-AUTarget
 {
     <#
@@ -3452,8 +3477,10 @@ function Resolve-AUTarget
     match, then a stored PowerStacks target, then None. A stored target counts only while its rule ID
     exists (Get-AUStoredTargetSection); it returns with MatchSection Retained and RetainedFrom
     (Customer or PowerStacks). A PowerStacks identity match replaces a stored PowerStacks target only
-    when its evidence is Verified; otherwise the stored target wins, and a conflict with a different
-    target is logged (D17, D30, F15). A customer identity match always wins, even on current-file
+    when its evidence is Verified and, for a stored target a D47 step chose (ps-resolve-*), only when
+    it resolved to the same app (Test-AUSameApp), so a match that lands on a sibling after the chosen
+    app is removed keeps the chosen app; otherwise the stored target wins, and a conflict with a
+    different target is logged (D17, D30, F11, F15). A customer identity match always wins, even on current-file
     evidence, and keeps that EvidenceUsed. When this run's match names the same app as the stored
     target but resolved to no installed app, the stored ResolvedAppName (the last concrete
     DisplayName), ProductCode, and PackageFamily fill the blanks. A None result keeps the identity's
@@ -3532,7 +3559,11 @@ function Resolve-AUTarget
     if ($StoredSection -eq 'Customer') { return (& $FromStored) }
     if ($IdentitySection -eq 'PowerStacks')
     {
-        if ($StoredSection -ne 'PowerStacks' -or $Identity.EvidenceUsed -ceq 'Verified') { return (& $FromIdentity) }
+        if ($StoredSection -ne 'PowerStacks') { return (& $FromIdentity) }
+        # A target a D47 step chose among siblings (ps-resolve-*) is replaced only by a match to the
+        # same app. A match that lands on a sibling because the chosen app is gone keeps it (F11, D17).
+        $ChosenAmongSiblings = (([string]$StoredTarget.MatchRuleId).Trim() -like 'ps-resolve-*')
+        if ($Identity.EvidenceUsed -ceq 'Verified' -and (-not $ChosenAmongSiblings -or (Test-AUSameApp $Identity $StoredTarget))) { return (& $FromIdentity) }
         # Weaker evidence never replaces a stored PowerStacks target (D30, F15).
         $Same = Test-AUSameTarget $Identity $StoredTarget
         if ($Same -and $Identity.ResolvedAppName -and $StoredTarget.ResolvedAppName)
@@ -3606,6 +3637,11 @@ function Get-AUTargetKeys
     and, for an ownership or arpCompare target (whose patterns are escaped exact values), the
     normalized name and publisher keys (Get-AUNormalizedText) of its ResolvedAppName (or the unescaped
     TargetPattern) and TargetPublisher. The keys are blank for other targets.
+    A target a D47 step chose among siblings (MatchRuleId ps-resolve-*) names one app, so its name
+    pattern is its ResolvedAppName, matched literally, even when its rule's pattern is wider. It gets
+    the normalized name key too (an identity rule's target keeps its publisher pattern, PublisherLike),
+    except after the arch or version step: those steps separate siblings whose names normalize the
+    same, so a normalized match could be the sibling (F11).
 .PARAMETER Target
     The Resolve-AUTarget result.
 #>
@@ -3620,13 +3656,20 @@ function Get-AUTargetKeys
         PublisherPattern = $Target.TargetPublisher
         NameKey          = ''
         PublisherKey     = ''
+        PublisherLike    = $false
     }
-    if ($Target.InstalledStateDependent -eq $true -or $Target.RuleType -cin @('ownership', 'arpCompare'))
+    $RuleId = ([string]$Target.MatchRuleId).Trim()
+    $Resolved = ([string]$Target.ResolvedAppName).Trim()
+    $ChosenAmongSiblings = ($Resolved -and $RuleId -like 'ps-resolve-*')
+    if ($ChosenAmongSiblings) { $Keys.NamePattern = ConvertTo-AUWildcardLiteral $Resolved }
+    $ExactTarget = ($Target.InstalledStateDependent -eq $true -or $Target.RuleType -cin @('ownership', 'arpCompare'))
+    if (($ExactTarget -or $ChosenAmongSiblings) -and $RuleId -notin @('ps-resolve-arch', 'ps-resolve-version'))
     {
-        $Name = [string]$Target.ResolvedAppName
-        if ([string]::IsNullOrWhiteSpace($Name)) { $Name = [Management.Automation.WildcardPattern]::Unescape([string]$Keys.NamePattern) }
+        $Name = $Resolved
+        if (-not $Name) { $Name = [Management.Automation.WildcardPattern]::Unescape([string]$Keys.NamePattern) }
         $Keys.NameKey = Get-AUNormalizedText $Name -Kind Name
-        $Keys.PublisherKey = Get-AUNormalizedText ([Management.Automation.WildcardPattern]::Unescape([string]$Keys.PublisherPattern)) -Kind Publisher
+        if ($ExactTarget) { $Keys.PublisherKey = Get-AUNormalizedText ([Management.Automation.WildcardPattern]::Unescape([string]$Keys.PublisherPattern)) -Kind Publisher }
+        elseif ($null -ne $Keys.PublisherPattern) { $Keys.PublisherLike = $true }
     }
     return $Keys
 }#endfunction
@@ -3638,10 +3681,10 @@ function Test-AUTargetApp
     Tests whether an installed app is the target app, ignoring scope.
 .DESCRIPTION
     True when its ProductCode or PackageFamily equals the target's, its DisplayName and Publisher
-    match TargetPattern and TargetPublisher, or (ownership and arpCompare targets) its normalized
-    DisplayName and Publisher equal the target's keys, so an update that renames the entry, Contoso
-    Alpha 1.0 to Contoso Alpha 1.1, still counts. The one definition for Get-AUInstallStatus and
-    Test-AUMainExe.
+    match TargetPattern and TargetPublisher, or (ownership and arpCompare targets, and most targets a
+    D47 step chose; see Get-AUTargetKeys) its normalized DisplayName and Publisher equal the target's
+    keys, so an update that renames the entry, Contoso Alpha 1.0 to Contoso Alpha 1.1, still counts.
+    The one definition for Get-AUInstallStatus and Test-AUMainExe.
 .PARAMETER App
     The installed-app entry.
 .PARAMETER Keys
@@ -3669,7 +3712,15 @@ function Test-AUTargetApp
         }
         if ($Hit) { return $true }
     }
-    if ($Keys.NameKey -and $Keys.PublisherKey -and (Get-AUNormalizedText ([string]$App.Publisher) -Kind Publisher) -ceq $Keys.PublisherKey -and (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -ceq $Keys.NameKey) { return $true }
+    if (-not $Keys.NameKey) { return $false }
+    if ($Keys.PublisherKey) { $SamePublisher = ((Get-AUNormalizedText ([string]$App.Publisher) -Kind Publisher) -ceq $Keys.PublisherKey) }
+    elseif ($Keys.PublisherLike)
+    {
+        try { $SamePublisher = (([string]$App.Publisher).Trim() -like [string]$Keys.PublisherPattern) }
+        catch { $SamePublisher = $false }
+    }
+    else { return $false }
+    if ($SamePublisher -and (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -ceq $Keys.NameKey) { return $true }
     return $false
 }#endfunction
 

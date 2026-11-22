@@ -362,6 +362,125 @@ Describe 'Resolve-AUTarget' {
         }
     }
 
+    Context 'Targets resolved among siblings (D47, F11, I2)' {
+        BeforeAll {
+            # A 64-bit build in Program Files, with a 64-bit and a 32-bit sibling installed. The names
+            # normalize the same, and neither has an install folder, so the arch step decides.
+            $script:ArchFacts = New-TestFacts @{ FileCompanyName = 'Contoso'; FileProductName = 'Contoso Tool'; RunPath = 'C:\Program Files\Contoso Tool\tool.exe' }
+            $script:Tool64 = New-TestApp 'Contoso Tool' 'Contoso' @{ Architecture = 'x64' }
+            $script:Tool32 = New-TestApp 'Contoso Tool (x86)' 'Contoso' @{ Architecture = 'x86' }
+            $script:RuleContosoTool = '{ "id": "ps-contoso-tool", "type": "identity", "when": { "exeName": "tool.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso*", "publisher": "Contoso*" } }'
+        }
+
+        It 'keeps a <Rule> target resolved by arch on the chosen app when it is uninstalled and a sibling stays: Retained, NotInstalled' -ForEach @(
+            @{ Rule = 'arpCompare'; Json = '{ "id": "ps-arp-compare", "type": "arpCompare" }'; Replacement = 'ps-arp-compare' }
+            @{ Rule = 'identity'; Json = '{ "id": "ps-contoso-tool", "type": "identity", "when": { "exeName": "tool.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso*", "publisher": "Contoso*" } }'; Replacement = 'ps-contoso-tool' }
+        ) {
+            Mock Write-CMTraceLog { }
+            $m = New-TestMappings -PowerStacks @($Json)
+            $first = Resolve-AUTarget (Resolve-AUIdentity $script:ArchFacts $m @($script:Tool64, $script:Tool32)) $null $m
+            $first.MatchRuleId | Should -BeExactly 'ps-resolve-arch'
+            $first.ResolvedAppName | Should -BeExactly 'Contoso Tool'
+            $stored = ConvertTo-AUStoredTarget $first
+
+            # The chosen app is uninstalled. This run's Verified match lands on the sibling.
+            $identity = Resolve-AUIdentity $script:ArchFacts $m @($script:Tool32)
+            $identity.MatchRuleId | Should -BeExactly $Replacement
+            $identity.EvidenceUsed | Should -BeExactly 'Verified'
+            $identity.ResolvedAppName | Should -BeExactly 'Contoso Tool (x86)'
+
+            $t = Resolve-AUTarget $identity $stored $m
+            $t.MatchSection | Should -BeExactly 'Retained'
+            $t.RetainedFrom | Should -BeExactly 'PowerStacks'
+            $t.MatchRuleId | Should -BeExactly 'ps-resolve-arch'
+            $t.ResolvedAppName | Should -BeExactly 'Contoso Tool'
+            Get-AUInstallStatus $t @($script:Tool32) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+            Get-AUInstallStatus $t @($script:Tool32) (New-TestScopeRead @{ Machine = 'Unread' }) $script:TestSid | Should -BeExactly 'Unknown'
+            Get-AUTargetAppNames $t (New-AUAppIndex @($script:Tool32)) | Should -BeNullOrEmpty
+            (ConvertTo-AUStoredTarget $t).MatchRuleId | Should -BeExactly 'ps-resolve-arch'
+            (ConvertTo-AUStoredTarget $t).ResolvedAppName | Should -BeExactly 'Contoso Tool'
+            Should -Invoke Write-CMTraceLog -Times 1 -Exactly -ParameterFilter { $Message -like '*kept stored target ps-resolve-arch*' }
+        }
+
+        It 'is still Installed when the chosen app is reinstalled, with or without the sibling' {
+            $m = New-TestMappings -PowerStacks @($script:RuleArp)
+            $stored = ConvertTo-AUStoredTarget (Resolve-AUTarget (Resolve-AUIdentity $script:ArchFacts $m @($script:Tool64, $script:Tool32)) $null $m)
+            $stored.MatchRuleId | Should -BeExactly 'ps-resolve-arch'
+            foreach ($Apps in @(, @($script:Tool64, $script:Tool32)) + @(, @($script:Tool64)))
+            {
+                $t = Resolve-AUTarget (Resolve-AUIdentity $script:ArchFacts $m $Apps) $stored $m
+                $t.MatchSection | Should -BeExactly 'PowerStacks'
+                $t.ResolvedAppName | Should -BeExactly 'Contoso Tool'
+                Get-AUInstallStatus $t $Apps (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+                @(Get-AUTargetAppNames $t (New-AUAppIndex $Apps)) | Should -Be @('Contoso Tool')
+            }
+        }
+
+        It 'is replaced by a Verified match to the same app by ProductCode, even under a new DisplayName' {
+            $m = New-TestMappings -PowerStacks @($script:RuleArp)
+            $stored = New-TestStored @{ MatchRuleId = 'ps-resolve-path'; TargetPattern = 'Contoso Tool'; ResolvedAppName = 'Contoso Tool'; ProductCode = '{AAAAAAAA-0000-0000-0000-000000000001}' }
+            $renamed = New-TestApp 'Contoso Tool 2' 'Contoso' @{ ProductCode = '{aaaaaaaa-0000-0000-0000-000000000001}' }
+            $identity = Resolve-AUIdentity (New-TestFacts @{ FileCompanyName = 'Contoso'; FileProductName = 'Contoso Tool 2' }) $m @($renamed)
+            $t = Resolve-AUTarget $identity $stored $m
+            $t.MatchSection | Should -BeExactly 'PowerStacks'
+            $t.ResolvedAppName | Should -BeExactly 'Contoso Tool 2'
+        }
+
+        It 'is replaced by a customer match to the sibling' {
+            $m = New-TestMappings -Customer @('{ "id": "c-tool-x86", "type": "identity", "when": { "exeName": "tool.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso Tool (x86)", "publisher": "Contoso*" } }') -PowerStacks @($script:RuleArp)
+            $stored = New-TestStored @{ MatchRuleId = 'ps-resolve-arch'; TargetPattern = 'Contoso Tool'; ResolvedAppName = 'Contoso Tool' }
+            $t = Resolve-AUTarget (Resolve-AUIdentity $script:ArchFacts $m @($script:Tool32)) $stored $m
+            $t.MatchSection | Should -BeExactly 'Customer'
+            $t.MatchRuleId | Should -BeExactly 'c-tool-x86'
+            Get-AUInstallStatus $t @($script:Tool32) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+        }
+
+        It 'with no PowerStacks rules at all (Source None), keeps the stored target, and a customer match still replaces it' {
+            $dir = (New-Item -ItemType Directory -Path (Join-Path 'TestDrive:\' 'source-none') -Force).FullName
+            $none = Get-AUMappings -Embedded '' -BesideDir $dir -CustomerPath ''
+            $none.Source | Should -BeExactly 'None'
+            $stored = New-TestStored @{ MatchRuleId = 'ps-resolve-arch'; TargetPattern = 'Contoso Tool'; ResolvedAppName = 'Contoso Tool' }
+            $t = Resolve-AUTarget (Resolve-AUIdentity $script:ArchFacts $none @($script:Tool32)) $stored $none
+            $t.MatchSection | Should -BeExactly 'Retained'
+            $t.MatchRuleId | Should -BeExactly 'ps-resolve-arch'
+            Get-AUInstallStatus $t @($script:Tool32) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+            Get-AUInstallStatus $t @($script:Tool64, $script:Tool32) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+
+            $customerPath = Join-Path $dir 'customer-mappings.json'
+            [IO.File]::WriteAllText($customerPath, '{ "schemaVersion": 1, "customer": { "identityRules": [{ "id": "c-tool-x86", "type": "identity", "when": { "exeName": "tool.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso Tool (x86)", "publisher": "Contoso*" } }] } }')
+            $customer = Get-AUMappings -Embedded '' -BesideDir $dir -CustomerPath $customerPath
+            $customer.Source | Should -BeExactly 'None'
+            $customer.CustomerSource | Should -BeExactly 'File'
+            $t = Resolve-AUTarget (Resolve-AUIdentity $script:ArchFacts $customer @($script:Tool32)) $stored $customer
+            $t.MatchSection | Should -BeExactly 'Customer'
+            $t.MatchRuleId | Should -BeExactly 'c-tool-x86'
+        }
+
+        It 'a target resolved by <Step> never counts a sibling with the same normalized name as installed' -ForEach @(
+            @{ Step = 'arch'; Chosen = 'Contoso Tool'; Sibling = 'Contoso Tool (x86)' }
+            @{ Step = 'version'; Chosen = 'Contoso Tool 8.1'; Sibling = 'Contoso Tool 7.2' }
+        ) {
+            $t = Resolve-AUTarget $script:NoMatch (New-TestStored @{ MatchRuleId = "ps-resolve-$Step"; TargetPattern = (ConvertTo-AUWildcardLiteral $Chosen); ResolvedAppName = $Chosen }) (New-TestMappings -PowerStacks @($script:RuleArp))
+            $t.MatchSection | Should -BeExactly 'Retained'
+            Get-AUInstallStatus $t @((New-TestApp $Sibling 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+            Get-AUInstallStatus $t @((New-TestApp $Chosen 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+        }
+
+        It 'an identity-rule target resolved by a D47 step counts only the chosen app, not every app its pattern matches' {
+            $m = New-TestMappings -PowerStacks @($script:RuleContosoTool)
+            $t = Resolve-AUTarget $script:NoMatch (New-TestStored @{ MatchRuleId = 'ps-resolve-arch'; RuleType = 'identity'; TargetPattern = 'Contoso*'; TargetPublisher = 'Contoso*'; ResolvedAppName = 'Contoso Tool' }) $m
+            Get-AUInstallStatus $t @((New-TestApp 'Contoso Other' 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+            Get-AUInstallStatus $t @($script:Tool64) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+        }
+
+        It 'an identity-rule target resolved by path still counts the chosen app after an update renames it' {
+            $m = New-TestMappings -PowerStacks @($script:RuleContosoTool)
+            $t = Resolve-AUTarget $script:NoMatch (New-TestStored @{ MatchRuleId = 'ps-resolve-path'; RuleType = 'identity'; TargetPattern = 'Contoso*'; TargetPublisher = 'Contoso*'; ResolvedAppName = 'Contoso Tool 8.1' }) $m
+            Get-AUInstallStatus $t @((New-TestApp 'Contoso Tool 8.2' 'Contoso Ltd')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+            Get-AUInstallStatus $t @((New-TestApp 'Contoso Tool 8.2' 'Fabrikam')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+        }
+    }
+
     Context 'Precedence (D38, D30, F15)' {
         It 'a new customer identity match beats a stored PowerStacks target' {
             $m = New-TestMappings -Customer @($script:RuleCustomerBeta) -PowerStacks @($script:RuleArp)
