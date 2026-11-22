@@ -255,6 +255,22 @@ Describe 'Get-AUAppUsage across users (D19)' {
         $value.AppLastUsedDate | Should -BeNullOrEmpty
         $value.AppUsersWithUse | Should -Be 0
         $value.AppLastRanDate | Should -BeExactly '2026-11-21T09:45:12.0000000Z'
+        $value.AppInFocusSeconds | Should -Be 0
+    }
+
+    It 'counts focus and users only for interactive users with a SID' {
+        $entries = @(
+            (New-TestUsedEntry $script:Today)
+            (New-TestUsedEntry $script:Today @{ UserSid = ''; UserType = 'CloudOnly' })
+            (New-TestEntry @{ UserSid = 'S-1-5-19'; UserType = 'Service'; LastRanTime = $script:Today; FocusTotal = [double]50 })
+            (New-TestEntry @{ UserSid = 'S-1-5-99'; UserType = 'Unknown'; LastRanTime = $script:Today; FocusTotal = [double]70 })
+        )
+        $value = (Invoke-TestAppUsage -Entries $entries)['Contoso Alpha']
+        $value.AppUsersWithUse | Should -Be 1
+        $value.AppInFocusSeconds | Should -Be 240
+        $out = (ConvertTo-AUExeUsage $entries)[0]
+        $out.UsersWithUse | Should -Be 1
+        $out.InFocusSeconds | Should -Be 240
     }
 
     It 'is NotUsed when its exes are known and none ran' {
@@ -329,6 +345,72 @@ Describe 'Get-AUAppUsage Ambiguous (D30, D47)' {
         $result = Invoke-TestAppUsage -Entries @($script:Unresolved, $pro) -Apps $script:ViewerApps -Known $script:ViewerKnown
         $result['Contoso Viewer'].AppUsageStatus | Should -BeExactly 'Ambiguous'
         $result['Contoso Viewer Pro'].AppUsageStatus | Should -BeExactly 'Used'
+    }
+}
+
+Describe 'Get-AUAppUsage known exe that ran unmatched (D30)' {
+    BeforeAll {
+        $script:AlphaCode = '{11111111-1111-1111-1111-111111111111}'
+        $script:AlphaApps = @((New-TestApp 'Contoso Alpha' 'Contoso' @{ ProductCode = $script:AlphaCode }))
+        # An unverified alpha.exe build that ran today with focus: MSI ownership needs a verified build,
+        # so it stays unmatched with no candidates.
+        function New-TestUnmatchedRun([string]$ExeName = 'alpha.exe', [hashtable]$Values = @{})
+        {
+            $Base = @{ UserSid = $script:UserB; UserType = 'Domain'; ExeInfo = "!!$ExeName!2026/11/01:00:00:00!77777!"; ExeName = $ExeName; Role = 'Unmatched'; InstallStatus = 'Unmatched'; Target = (New-TestUnresolved); Facts = (New-TestFacts @{ ExeName = $ExeName; FactsVerified = $false; FileVersion = $null; FileCompanyName = $null }); FactsVerified = $false; FocusTotal = [double]600 }
+            foreach ($Key in $Values.Keys) { $Base[$Key] = $Values[$Key] }
+            return New-TestUsedEntry $script:Today $Base
+        }
+    }
+
+    It 'is Ambiguous, not NotUsed, when an exe Windows Installer lists for the app ran unmatched' {
+        $run = New-TestUnmatchedRun
+        $known = Get-AUKnownExes $script:AlphaApps @{ 'c:\program files\contoso\alpha\alpha.exe' = $script:AlphaCode } $null @($run)
+        @($known['Contoso Alpha']) | Should -Be @('alpha.exe')
+        (Invoke-TestAppUsage -Entries @($run) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'is Ambiguous when an exe an identity rule names for the app ran unmatched' {
+        $mappings = New-TestMappings @('{ "id": "ps-alpha-1", "type": "identity", "when": { "exeName": "alpha.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso Alpha", "publisher": "Contoso*" } }')
+        $run = New-TestUnmatchedRun
+        $known = Get-AUKnownExes $script:AlphaApps @{} $mappings @($run)
+        (Invoke-TestAppUsage -Entries @($run) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'is Ambiguous when an earlier, matched build of the exe is known and a new build ran unmatched' {
+        $old = New-TestEntry @{ ExeInfo = '!!alpha.exe!2026/06/01:00:00:00!11111!'; LastRanTime = (New-TestUtc '2026-09-01T00:00:00') }
+        $run = New-TestUnmatchedRun
+        $entries = @($old, $run)
+        $value = (Invoke-TestAppUsage -Entries $entries -Apps $script:AlphaApps -Known (Get-AUKnownExes $script:AlphaApps @{} $null $entries))['Contoso Alpha']
+        $value.AppUsageStatus | Should -BeExactly 'Ambiguous'
+        $value.AppMatchedExeCount | Should -Be 1
+    }
+
+    It 'matches an unmatched run against a wildcard exeName with -like' {
+        $mappings = New-TestMappings @('{ "id": "ps-alpha-2", "type": "identity", "when": { "exeName": "contoso*.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso Alpha", "publisher": "Contoso*" } }')
+        $known = Get-AUKnownExes $script:AlphaApps @{} $mappings @()
+        @($known['Contoso Alpha']) | Should -Be @('contoso*.exe')
+        (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'contosoalpha.exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'Ambiguous'
+        (Invoke-TestAppUsage -Entries @((New-TestUnmatchedRun 'fabrikam.exe')) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'stays NotUsed when the unmatched run is ignored, has another name, or ran before WatchingSince' {
+        $known = New-TestKnown @{ 'Contoso Alpha' = 'alpha.exe' }
+        $ignored = New-TestUnmatchedRun 'alpha.exe' @{ Classification = (New-TestClassification 'ps-ignore-1') }
+        $other = New-TestUnmatchedRun 'beta.exe'
+        $early = New-TestUnmatchedRun 'alpha.exe' @{ LastRanTime = (New-TestUtc '2026-09-01T00:00:00'); LastFocusOrInputTime = (New-TestUtc '2026-09-01T00:00:00'); LastInteractiveRunTime = (New-TestUtc '2026-09-01T00:00:00') }
+        foreach ($Entry in @($ignored, $other, $early))
+        {
+            (Invoke-TestAppUsage -Entries @($Entry) -Apps $script:AlphaApps -Known $known)['Contoso Alpha'].AppUsageStatus | Should -BeExactly 'NotUsed' -Because $Entry.ExeInfo
+        }
+    }
+
+    It 'keeps NotUsed for an app whose known exe ran but resolved to another app (sample 11)' {
+        $apps = @((New-TestApp 'Fabrikam Studio 7' 'Fabrikam' @{ ProductCode = '{77777777-7777-7777-7777-777777777777}' }), (New-TestApp 'Fabrikam Studio Pro 7' 'Fabrikam'))
+        $editor = New-TestUsedEntry $script:Today @{ ExeInfo = '!!editor.exe!2026/09/15:00:00:00!cccc3!'; ExeName = 'editor.exe'; Target = (New-TestTarget 'Fabrikam Studio Pro 7' @{ TargetPublisher = 'Fabrikam'; MatchRuleId = 'ps-resolve-path' }) }
+        $known = Get-AUKnownExes $apps @{ 'c:\program files\fabrikam\studio\editor.exe' = '{77777777-7777-7777-7777-777777777777}' } $null @($editor)
+        $result = Invoke-TestAppUsage -Entries @($editor) -Apps $apps -Known $known
+        $result['Fabrikam Studio 7'].AppUsageStatus | Should -BeExactly 'NotUsed'
+        $result['Fabrikam Studio Pro 7'].AppUsageStatus | Should -BeExactly 'Used'
     }
 }
 
@@ -540,7 +622,7 @@ Describe 'ConvertTo-AUExeUsage (D30, D31, F25, F26)' {
     It 'carries CandidateTargets as an array of both DisplayNames on an ambiguous exe' {
         $entry = New-TestEntry @{ Target = (New-TestUnresolved @('Contoso Viewer', 'Contoso Viewer Pro')); InstallStatus = 'Unmatched'; Role = 'Unmatched' }
         $out = (ConvertTo-AUExeUsage @($entry))[0]
-        $out.PSObject.Properties.Name | Should -Contain 'CandidateTargets'
+        @($out.PSObject.Properties.Name) | Should -Be ($script:ExeFields + 'CandidateTargets')
         , $out.CandidateTargets | Should -BeOfType [string[]]
         $out.CandidateTargets | Should -Be @('Contoso Viewer', 'Contoso Viewer Pro')
         $json = ConvertTo-Json @($out) -Depth 5 -Compress
@@ -558,6 +640,23 @@ Describe 'ConvertTo-AUExeUsage (D30, D31, F25, F26)' {
         $out.RanAsSystemOnly | Should -BeTrue
         $out.LastUsedTime | Should -BeNullOrEmpty
         $out.UsersWithUse | Should -Be 0
+        $out.InFocusSeconds | Should -Be 0
+    }
+
+    It 'is RanAsSystemOnly <Expected> for runs by <Types>' -ForEach @(
+        @{ Types = @('System', 'Service'); Expected = $true }
+        @{ Types = @('Service'); Expected = $true }
+        @{ Types = @('Unknown'); Expected = $false }
+        @{ Types = @('System', 'Unknown'); Expected = $false }
+        @{ Types = @('System', 'CloudOnly'); Expected = $false }
+    ) {
+        $i = 0
+        $entries = @(foreach ($Type in $Types) { $i++; New-TestEntry @{ UserSid = "S-1-5-21-9-9-9-$i"; UserType = $Type; LastRanTime = $script:Today } })
+        (ConvertTo-AUExeUsage $entries)[0].RanAsSystemOnly | Should -Be $Expected
+    }
+
+    It 'is not RanAsSystemOnly when it never ran' {
+        (ConvertTo-AUExeUsage @((New-TestEntry @{ UserSid = $script:SystemSid; UserType = 'System' })))[0].RanAsSystemOnly | Should -BeFalse
     }
 
     It 'labels unverified identity evidence and blanks the build-specific facts' {

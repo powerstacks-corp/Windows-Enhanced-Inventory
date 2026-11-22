@@ -34,7 +34,7 @@ The App Inventory data keeps one entry for each DisplayName, with the newest ver
 | `AppLastUsedDate` | The latest use by any user, in UTC, formatted `yyyy-MM-ddTHH:mm:ss.fffffffZ`. Blank when nobody used it. |
 | `AppUsageStatus` | Whether the app is used. See [Usage Status](#usage-status). |
 | `AppLastRanDate` | The latest run of any kind, by any account, including background runs. Same format. |
-| `AppInFocusSeconds` | Total focus time across users, in whole seconds. |
+| `AppInFocusSeconds` | Total focus time under people's accounts, in whole seconds. Focus under SYSTEM or a service account isn't counted. |
 | `AppUsersWithUse` | How many users used the app. A count, not names. |
 | `AppMatchedExeCount` | How many of the app's executables App Usage has seen. |
 | `AppRunsAsService` | `true` when one of the app's executables is the program of a Windows service, or has the `Service` role. Don't treat these apps as unused only because nobody focused them. |
@@ -49,12 +49,12 @@ When App Usage is off, or fails on a run, these fields are blank. An executable 
 |---|---|
 | `Used` | Someone used one of the app's executables since the device's watching-since date, the earliest usage App Usage has for the device. |
 | `RanNotUsed` | One of the app's executables ran since then, but nobody used it: for example, it ran only in the background or only under SYSTEM. Not a reclamation candidate on its own. |
-| `Ambiguous` | Nothing is credited to the app, but an executable that could belong to it or to another app ran (see [When a Rule Matches Several Installed Apps](#when-a-rule-matches-several-installed-apps)). Not a reclamation candidate. |
-| `NotUsed` | App Usage knows the app's executables, and none of them ran since the watching-since date. The only value that marks a reclamation candidate. |
+| `Ambiguous` | Nothing is credited to the app, but an executable that might be the app's ran: one that could belong to it or to another app (see [When a Rule Matches Several Installed Apps](#when-a-rule-matches-several-installed-apps)), or an unmatched executable with the name of one of the app's known executables, for example a build the script couldn't verify. Not a reclamation candidate. |
+| `NotUsed` | App Usage knows the app's executables, and none of them ran since the watching-since date, whether matched to the app or not. The only value that marks a reclamation candidate. |
 | `NotCovered` | App Usage knows no executable for the app, so it can't measure its use. |
 | Blank | App Usage didn't run or failed on this run, the watching-since date isn't known yet, or the script couldn't read every place the app is installed (the device's apps, or a user's apps). Blank never means `NotUsed`. |
 
-App Usage knows an app's executables when Windows Installer lists them as part of the app, when an identity rule whose target matches the app names them in `when.exeName`, or when it has seen one of them run and matched it to the app.
+App Usage knows an app's executables when Windows Installer lists them as part of the app, when an identity rule whose target matches the app names them in `when.exeName` (a pattern such as `contoso*.exe` covers every name it matches), or when it has seen one of them run and matched it to the app. An executable matched to a different app doesn't count as a run of this one.
 
 ### Executable Usage
 
@@ -78,13 +78,13 @@ App Usage also sends one entry for each executable build it has seen and each ap
 | `MatchSection` | `Customer` (one of your rules), `PowerStacks`, `Retained` (a target saved from an earlier run), or `None`. |
 | `MatchRuleId` | The ID of the rule that matched it. |
 | `InstallStatus` | Whether the target app is installed. See [Install Status](#install-status). With several users, it's `Installed` when the app is installed for any of them, else `Unknown` when any of them is unknown, else `NotInstalled`. |
-| `CandidateTargets` | Only for an executable left unmatched with two or more candidate apps: the DisplayNames of those apps. Absent otherwise. |
 | `FirstSeen` | The first time App Usage saw the build run, in UTC. |
 | `LastUsedTime` | The latest use by any user, in UTC. |
 | `LastRanTime` | The latest run of any kind, in UTC. |
-| `InFocusSeconds` | Total focus time across users, in whole seconds. |
-| `UsersWithUse` | How many users used it. |
-| `RanAsSystemOnly` | `true` when it ran, but never under a person's account: only under SYSTEM or a service account. |
+| `InFocusSeconds` | Total focus time under people's accounts, in whole seconds. Focus under SYSTEM or a service account isn't counted. |
+| `UsersWithUse` | How many users used it. A count, not names. |
+| `RanAsSystemOnly` | `true` when it ran, and every run was under SYSTEM or a service account. |
+| `CandidateTargets` | Only for an executable left unmatched with two or more candidate apps: the DisplayNames of those apps. Absent otherwise. |
 
 ## Mapping Rules
 

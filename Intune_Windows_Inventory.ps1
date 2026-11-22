@@ -4867,7 +4867,7 @@ function Get-AUAppUsage
     One value per de-duplicated inventory entry (its AppName), combined across every user on the
     device (D19). Each value holds AppLastUsedDate (the latest credited use by any user),
     AppUsageStatus, AppLastRanDate (the latest run of any kind), AppInFocusSeconds (total focus, whole
-    seconds), AppUsersWithUse (how many users had credited use), AppMatchedExeCount (how many of the
+    seconds, interactive users only), AppUsersWithUse (how many users had credited use), AppMatchedExeCount (how many of the
     app's executables were seen), and AppRunsAsService (a matched executable is a service binary or
     has the Service role). Dates are UTC text from Format-AUDate. No user identity (D31).
     An entry belongs to the apps Get-AUTargetAppNames gives for its target. Use comes only from
@@ -4875,8 +4875,10 @@ function Get-AUAppUsage
     are left out (F22).
     AppUsageStatus, first that applies (D32): Used (a matched exe has credited use since
     WatchingSince), RanNotUsed (a matched exe ran since then), Ambiguous (an unresolved exe with this
-    app among its CandidateTargets ran since then, D30), NotUsed (the app has known exes, or matched
-    exes, and none ran), NotCovered (none known). It's blank ($null) unless CollectionOk is true,
+    app among its CandidateTargets ran since then, or an unmatched exe whose name is one of the app's
+    known or matched exes ran since then, a wildcard known exe compared with -like, D30), NotUsed (the
+    app has known exes, or matched exes, and none ran, matched or not), NotCovered (none known). An exe
+    matched to another app never makes this app Ambiguous. It's blank ($null) unless CollectionOk is true,
     WatchingSince is known, and every scope holding the app in Apps (a blank Scope is Machine) is Read
     in ScopeRead, so missing coverage is never NotUsed. When CollectionOk is false, every field is
     blank.
@@ -4943,6 +4945,10 @@ function Get-AUAppUsage
         }
     }
 
+    # Exe names (ExeName, or ExeInfo for a package) of unmatched entries that ran since WatchingSince.
+    # An app whose known exe ran unmatched (an unverified build, say) is Ambiguous, never NotUsed (D30).
+    $UnmatchedRan = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
     # Inline per-entry work: this loop runs once per ledger entry, thousands of times.
     foreach ($Entry in @($Entries))
     {
@@ -4958,7 +4964,11 @@ function Get-AUAppUsage
         if ($null -eq $Target -or [string]$Target.MatchSection -cnotin $script:AUMatchedSections)
         {
             # Unresolved (D30, D47): each surviving candidate that is installed may be Ambiguous.
-            if (-not $RanSince -or $null -eq $Target) { continue }
+            if (-not $RanSince) { continue }
+            $Exe = ([string]$Entry.ExeName).Trim()
+            if (-not $Exe) { $Exe = ([string]$Entry.ExeInfo).Trim() }
+            if ($Exe) { [void]$UnmatchedRan.Add($Exe) }
+            if ($null -eq $Target) { continue }
             $Candidates = New-Object 'Collections.Generic.List[string]'
             foreach ($Candidate in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Candidate)) { $Candidates.Add(([string]$Candidate).Trim()) } }
             if ($Candidates.Count -lt 2) { continue }
@@ -4969,20 +4979,25 @@ function Get-AUAppUsage
         $Exe = ([string]$Entry.ExeName).Trim()
         if (-not $Exe) { $Exe = ([string]$Entry.ExeInfo).Trim() }
         $IsService = ([string]$Entry.Role -ceq 'Service' -or ($null -ne $Entry.Facts -and $Entry.Facts.IsServiceBinary -eq $true))
+        # Focus counts only for interactive users, as credited use does.
+        $Focus = [double]0
+        if (Test-AUInteractiveUserType ([string]$Entry.UserType)) { $Focus = [double]$Entry.FocusTotal }
+        $UserSid = ([string]$Entry.UserSid).Trim()
         foreach ($Name in @(Get-AUTargetAppNames $Target $Index))
         {
             $State = $States[$Name]
             if ($null -eq $State) { continue }
             if ($null -ne $LastUsed -and ($null -eq $State.LastUsed -or $LastUsed -gt $State.LastUsed)) { $State.LastUsed = $LastUsed }
             if ($null -ne $LastRan -and ($null -eq $State.LastRan -or $LastRan -gt $State.LastRan)) { $State.LastRan = $LastRan }
-            $State.Focus += [double]$Entry.FocusTotal
+            $State.Focus += $Focus
             if ($Exe) { [void]$State.Exes.Add($Exe) }
             if ($IsService) { $State.Service = $true }
             if ($RanSince) { $State.Ran = $true }
             if ($UsedSince) { $State.Credited = $true }
-            if ($Use.HasCreditedUse) { [void]$State.Users.Add(([string]$Entry.UserSid).Trim()) }
+            if ($Use.HasCreditedUse -and $UserSid) { [void]$State.Users.Add($UserSid) }
         }
     }
+    $UnmatchedNames = [string[]]@($UnmatchedRan)
 
     # Coverage (D32): every scope holding the app must have been read this run.
     $ReadState = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
@@ -5011,7 +5026,22 @@ function Get-AUAppUsage
             if ($State.Credited) { $Status = 'Used' }
             elseif ($State.Ran) { $Status = 'RanNotUsed' }
             elseif ($State.Ambiguous) { $Status = 'Ambiguous' }
-            elseif ($State.Exes.Count -gt 0 -or ($null -ne $KnownExes -and @($KnownExes).Count -gt 0)) { $Status = 'NotUsed' }
+            elseif ($State.Exes.Count -gt 0 -or ($null -ne $KnownExes -and @($KnownExes).Count -gt 0))
+            {
+                $Status = 'NotUsed'
+                if ($UnmatchedNames.Count -gt 0)
+                {
+                    foreach ($Exe in @(@($State.Exes) + @($KnownExes | Where-Object { $null -ne $_ })))
+                    {
+                        $Pattern = [string]$Exe
+                        if ($UnmatchedRan.Contains($Pattern) -or ([Management.Automation.WildcardPattern]::ContainsWildcardCharacters($Pattern) -and @($UnmatchedNames -like $Pattern).Count -gt 0))
+                        {
+                            $Status = 'Ambiguous'
+                            break
+                        }
+                    }
+                }
+            }
             else { $Status = 'NotCovered' }
         }
         $Result[$Name] = [pscustomobject][ordered]@{
@@ -5111,13 +5141,13 @@ function ConvertTo-AUExeUsage
     EvidenceSource (CurrentFileAtPath; present only for an unverified build with current-file
     evidence, D30), Subsystem, Role, ClassificationRuleId, ResolvedAppName, TargetPattern, Publisher
     (the target's publisher pattern), ProductCode (or the package family), MatchSection, MatchRuleId,
-    InstallStatus, CandidateTargets (only when two or more candidates survived D47, F26), FirstSeen,
-    LastUsedTime, LastRanTime, InFocusSeconds, UsersWithUse, and RanAsSystemOnly.
+    InstallStatus, FirstSeen, LastUsedTime, LastRanTime, InFocusSeconds, UsersWithUse,
+    RanAsSystemOnly, and last CandidateTargets (only when two or more candidates survived D47, F26).
     Across users (F25), InstallStatus is Unmatched when there's no target, else Installed if any
     user's is, else Unknown if any is (or is missing), else NotInstalled. FirstSeen is the earliest,
-    LastUsedTime (Get-AUDerivedUse, F5) and LastRanTime the latest, InFocusSeconds the total in whole
-    seconds, UsersWithUse the users with credited use, and RanAsSystemOnly true when it ran but never
-    for an interactive user. The facts, role, and classification come from the group's
+    LastUsedTime (Get-AUDerivedUse, F5) and LastRanTime the latest, InFocusSeconds the interactive
+    users' total in whole seconds, UsersWithUse the users (non-blank SIDs) with credited use, and
+    RanAsSystemOnly true when it ran and every run was by SYSTEM or a service account. The facts, role, and classification come from the group's
     representative (Get-AUExeGroups). No user identity (D31).
 .PARAMETER Entries
     The entries, with this run's Target, Classification, Role, UserType, and InstallStatus.
@@ -5177,16 +5207,19 @@ function ConvertTo-AUExeUsage
         $LastRan = $null
         $Focus = [double]0
         $Users = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        $InteractiveRun = $false
+        $OtherRun = $false
         foreach ($Entry in $Group.Entries)
         {
             $Use = Get-AUDerivedUse $Entry ([string]$Entry.Role) ([string]$Entry.UserType)
             if ($null -ne $Entry.FirstSeen -and ($null -eq $FirstSeen -or $Entry.FirstSeen -lt $FirstSeen)) { $FirstSeen = $Entry.FirstSeen }
             if ($null -ne $Use.LastUsedTime -and ($null -eq $LastUsed -or $Use.LastUsedTime -gt $LastUsed)) { $LastUsed = $Use.LastUsedTime }
             if ($null -ne $Use.LastRanTime -and ($null -eq $LastRan -or $Use.LastRanTime -gt $LastRan)) { $LastRan = $Use.LastRanTime }
-            $Focus += [double]$Entry.FocusTotal
-            if ($Use.HasCreditedUse) { [void]$Users.Add(([string]$Entry.UserSid).Trim()) }
-            if ($null -ne $Use.LastRanTime -and (Test-AUInteractiveUserType ([string]$Entry.UserType))) { $InteractiveRun = $true }
+            $UserType = [string]$Entry.UserType
+            if (Test-AUInteractiveUserType $UserType) { $Focus += [double]$Entry.FocusTotal }
+            $UserSid = ([string]$Entry.UserSid).Trim()
+            if ($Use.HasCreditedUse -and $UserSid) { [void]$Users.Add($UserSid) }
+            # A run by anything but SYSTEM or a service account (a person, or an unknown type).
+            if ($null -ne $Use.LastRanTime -and $UserType -cnotin @('System', 'Service')) { $OtherRun = $true }
         }
 
         $Matched = $Group.Matched
@@ -5215,13 +5248,13 @@ function ConvertTo-AUExeUsage
             MatchRuleId          = $(if ($Matched -and $Target.MatchRuleId) { [string]$Target.MatchRuleId } else { $null })
             InstallStatus        = $Status
         }
-        if ($null -ne $Candidates) { $Out['CandidateTargets'] = $Candidates }
         $Out['FirstSeen'] = ConvertTo-AUOutputDate $FirstSeen
         $Out['LastUsedTime'] = ConvertTo-AUOutputDate $LastUsed
         $Out['LastRanTime'] = ConvertTo-AUOutputDate $LastRan
         $Out['InFocusSeconds'] = [long][Math]::Round($Focus)
         $Out['UsersWithUse'] = $Users.Count
-        $Out['RanAsSystemOnly'] = ($null -ne $LastRan -and -not $InteractiveRun)
+        $Out['RanAsSystemOnly'] = ($null -ne $LastRan -and -not $OtherRun)
+        if ($null -ne $Candidates) { $Out['CandidateTargets'] = $Candidates }
         $Output.Add([pscustomobject]$Out)
     }
     return $Output.ToArray()
