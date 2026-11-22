@@ -322,9 +322,11 @@ Describe 'Get-AUAppUsage across users (D19)' {
 }
 
 Describe 'Get-AUAppUsage with a target resolved among siblings (D47, F11, I2)' {
-    It 'credits none of the chosen app''s use to a sibling that stays installed after the chosen app is removed' {
+    It 'credits none of the chosen app''s use to a sibling that stays installed after the chosen app is removed (<RuleId>)' -ForEach @(
+        @{ RuleId = 'ps-resolve-arch' }, @{ RuleId = 'ps-resolve-path' }
+    ) {
         $apps = @((New-TestApp 'Contoso Tool (x86)' 'Contoso' @{ Architecture = 'x86' }))
-        $target = New-TestTarget 'Contoso Tool' @{ MatchSection = 'Retained'; RetainedFrom = 'PowerStacks'; MatchRuleId = 'ps-resolve-arch'; RuleType = 'arpCompare'; InstalledStateDependent = $true }
+        $target = New-TestTarget 'Contoso Tool' @{ MatchSection = 'Retained'; RetainedFrom = 'PowerStacks'; MatchRuleId = $RuleId; RuleType = 'arpCompare'; InstalledStateDependent = $true }
         $tool = New-TestUsedEntry $script:Today @{ ExeInfo = '!!tool.exe!2026/09/15:00:00:00!aaaa1!'; ExeName = 'tool.exe'; Target = $target; InstallStatus = 'NotInstalled' }
         $value = (Invoke-TestAppUsage -Entries @($tool) -Apps $apps)['Contoso Tool (x86)']
         $value.AppUsageStatus | Should -BeExactly 'NotCovered'

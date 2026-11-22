@@ -456,14 +456,63 @@ Describe 'Resolve-AUTarget' {
             $t.MatchRuleId | Should -BeExactly 'c-tool-x86'
         }
 
-        It 'a target resolved by <Step> never counts a sibling with the same normalized name as installed' -ForEach @(
-            @{ Step = 'arch'; Chosen = 'Contoso Tool'; Sibling = 'Contoso Tool (x86)' }
-            @{ Step = 'version'; Chosen = 'Contoso Tool 8.1'; Sibling = 'Contoso Tool 7.2' }
+        It 'a target resolved by <Step> never counts a sibling that differs only in its tags (<Chosen> / <Sibling>)' -ForEach @(
+            foreach ($Step in @('path', 'msi', 'publisher', 'product', 'version', 'arch', 'scope'))
+            {
+                @{ Step = $Step; Chosen = 'Contoso Tool'; Sibling = 'Contoso Tool (x86)' }
+                @{ Step = $Step; Chosen = 'Contoso Tool (x86)'; Sibling = 'Contoso Tool' }
+                @{ Step = $Step; Chosen = 'Contoso Tool 64-bit'; Sibling = 'Contoso Tool 32-bit' }
+                @{ Step = $Step; Chosen = 'Contoso Tool [EU]'; Sibling = 'Contoso Tool [US]' }
+            }
         ) {
             $t = Resolve-AUTarget $script:NoMatch (New-TestStored @{ MatchRuleId = "ps-resolve-$Step"; TargetPattern = (ConvertTo-AUWildcardLiteral $Chosen); ResolvedAppName = $Chosen }) (New-TestMappings -PowerStacks @($script:RuleArp))
             $t.MatchSection | Should -BeExactly 'Retained'
             Get-AUInstallStatus $t @((New-TestApp $Sibling 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
             Get-AUInstallStatus $t @((New-TestApp $Chosen 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+        }
+
+        It 'a target resolved by <Step> still counts a renamed version update: <Chosen> to <Renamed>' -ForEach @(
+            foreach ($Step in @('path', 'version', 'arch'))
+            {
+                @{ Step = $Step; Chosen = 'Contoso Tool 1.0'; Renamed = 'Contoso Tool 1.1' }
+                @{ Step = $Step; Chosen = 'Contoso Tool (x86) 1.0'; Renamed = 'Contoso Tool (x86) 1.1' }
+                @{ Step = $Step; Chosen = 'Contoso Tool 24.08 (x64)'; Renamed = 'Contoso Tool 24.09 (x64)' }
+                @{ Step = $Step; Chosen = 'Contoso Tool (v1.0)'; Renamed = 'Contoso Tool (v1.1)' }
+            }
+        ) {
+            $t = Resolve-AUTarget $script:NoMatch (New-TestStored @{ MatchRuleId = "ps-resolve-$Step"; TargetPattern = (ConvertTo-AUWildcardLiteral $Chosen); ResolvedAppName = $Chosen }) (New-TestMappings -PowerStacks @($script:RuleArp))
+            Get-AUInstallStatus $t @((New-TestApp $Renamed 'Contoso Ltd')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+        }
+
+        It 'a target that no D47 step chose keeps today''s normalized match, tags ignored' {
+            $t = Resolve-AUTarget $script:NoMatch (New-TestStored @{ MatchRuleId = 'ps-arp-compare'; TargetPattern = 'Contoso Tool'; ResolvedAppName = 'Contoso Tool' }) (New-TestMappings -PowerStacks @($script:RuleArp))
+            Get-AUInstallStatus $t @((New-TestApp 'Contoso Tool (x86)' 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+        }
+
+        It 'keeps the review''s install-folder pair on the chosen app: ps-resolve-path, chosen removed, sibling installed' {
+            Mock Write-CMTraceLog { }
+            $m = New-TestMappings -PowerStacks @($script:RuleArp)
+            $facts = New-TestFacts @{ FileCompanyName = 'Contoso'; FileProductName = 'Contoso Tool'; RunPath = 'C:\Program Files\Contoso Tool\tool.exe' }
+            $tool64 = New-TestApp 'Contoso Tool' 'Contoso' @{ InstallLocation = 'C:\Program Files\Contoso Tool' }
+            $tool32 = New-TestApp 'Contoso Tool (x86)' 'Contoso' @{ InstallLocation = 'C:\Program Files (x86)\Contoso Tool' }
+            $first = Resolve-AUTarget (Resolve-AUIdentity $facts $m @($tool64, $tool32)) $null $m
+            $first.MatchRuleId | Should -BeExactly 'ps-resolve-path'
+            $stored = ConvertTo-AUStoredTarget $first
+
+            $identity = Resolve-AUIdentity $facts $m @($tool32)
+            $identity.ResolvedAppName | Should -BeExactly 'Contoso Tool (x86)'
+            $t = Resolve-AUTarget $identity $stored $m
+            $t.MatchSection | Should -BeExactly 'Retained'
+            $t.MatchRuleId | Should -BeExactly 'ps-resolve-path'
+            $t.ResolvedAppName | Should -BeExactly 'Contoso Tool'
+            Get-AUInstallStatus $t @($tool32) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+            Get-AUTargetAppNames $t (New-AUAppIndex @($tool32)) | Should -BeNullOrEmpty
+            (ConvertTo-AUStoredTarget $t).ResolvedAppName | Should -BeExactly 'Contoso Tool'
+
+            # Reinstalled: Installed again, on the chosen app only.
+            $back = Resolve-AUTarget (Resolve-AUIdentity $facts $m @($tool64, $tool32)) $stored $m
+            Get-AUInstallStatus $back @($tool64, $tool32) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+            @(Get-AUTargetAppNames $back (New-AUAppIndex @($tool64, $tool32))) | Should -Be @('Contoso Tool')
         }
 
         It 'Get-AUTargetAppNames tells apart two targets that differ only in their rule, on one shared index' {

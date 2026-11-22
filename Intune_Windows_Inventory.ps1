@@ -3722,8 +3722,9 @@ function Get-AUTargetKeys
     A target a D47 step chose among siblings (MatchRuleId ps-resolve-*) names one app, so its name
     pattern is its ResolvedAppName, matched literally, even when its rule's pattern is wider. It gets
     the normalized name key too (an identity rule's target keeps its publisher pattern, PublisherLike),
-    except after the arch or version step: those steps separate siblings whose names normalize the
-    same, so a normalized match could be the sibling (F11).
+    plus TagKey, the architecture and bracketed tags of its name (Get-AUNameTags): siblings such as
+    Contoso Tool and Contoso Tool (x86) normalize the same, so the normalized match also needs the
+    same tags, which a renamed version update keeps (F11).
 .PARAMETER Target
     The Resolve-AUTarget result.
 #>
@@ -3739,21 +3740,62 @@ function Get-AUTargetKeys
         NameKey          = ''
         PublisherKey     = ''
         PublisherLike    = $false
+        TagKey           = $null
     }
     $RuleId = ([string]$Target.MatchRuleId).Trim()
     $Resolved = ([string]$Target.ResolvedAppName).Trim()
     $ChosenAmongSiblings = ($Resolved -and $RuleId -like 'ps-resolve-*')
     if ($ChosenAmongSiblings) { $Keys.NamePattern = ConvertTo-AUWildcardLiteral $Resolved }
     $ExactTarget = ($Target.InstalledStateDependent -eq $true -or $Target.RuleType -cin @('ownership', 'arpCompare'))
-    if (($ExactTarget -or $ChosenAmongSiblings) -and $RuleId -notin @('ps-resolve-arch', 'ps-resolve-version'))
+    if ($ExactTarget -or $ChosenAmongSiblings)
     {
         $Name = $Resolved
         if (-not $Name) { $Name = [Management.Automation.WildcardPattern]::Unescape([string]$Keys.NamePattern) }
         $Keys.NameKey = Get-AUNormalizedText $Name -Kind Name
         if ($ExactTarget) { $Keys.PublisherKey = Get-AUNormalizedText ([Management.Automation.WildcardPattern]::Unescape([string]$Keys.PublisherPattern)) -Kind Publisher }
         elseif ($null -ne $Keys.PublisherPattern) { $Keys.PublisherLike = $true }
+        if ($ChosenAmongSiblings) { $Keys.TagKey = Get-AUNameTags $Resolved }
     }
     return $Keys
+}#endfunction
+
+function Get-AUNameTags
+{
+    <#
+.SYNOPSIS
+    Returns the architecture and bracketed tags of an app name as one comparable string.
+.DESCRIPTION
+    The tags Get-AUNormalizedText drops: architecture tokens such as x86, x64, 32-bit, and arm64
+    anywhere in the name, and the content of each (...) or [...] group, lowercased, with version
+    tokens removed and punctuation as spaces. Sorted and joined, so Contoso Tool (x86) 1.0 and Contoso
+    Tool (x86) 1.1 give the same tags, and Contoso Tool gives none. Results are cached for the run.
+.PARAMETER Text
+    The app name.
+#>
+    param (
+        [AllowNull()][string]$Text
+    )
+
+    $Key = 'Tags|' + $Text
+    $Cached = $null
+    if ($script:AUNormalizedText.TryGetValue($Key, [ref]$Cached)) { return $Cached }
+
+    $Value = ([string]$Text).ToLowerInvariant()
+    $Tags = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
+    foreach ($Token in ($Value -split '[\s()\[\],;:]+'))
+    {
+        if ($Token -and $Token -in $script:AUArchTokens) { [void]$Tags.Add('a:' + $Token) }
+    }
+    foreach ($Group in [regex]::Matches($Value, '\(([^)]*)\)|\[([^\]]*)\]'))
+    {
+        $Content = $Group.Groups[1].Value + $Group.Groups[2].Value
+        $Kept = @($Content -split '\s+' | Where-Object { $_ -and $_ -notmatch '^v?\d+([.,_]\d+)+[a-z]?$' })
+        $Content = [regex]::Replace(($Kept -join ' '), '[^\p{L}\p{Nd}+#]+', ' ').Trim()
+        if ($Content) { [void]$Tags.Add('b:' + $Content) }
+    }
+    $Result = @($Tags) -join '|'
+    $script:AUNormalizedText[$Key] = $Result
+    return $Result
 }#endfunction
 
 function Test-AUTargetApp
@@ -3763,10 +3805,11 @@ function Test-AUTargetApp
     Tests whether an installed app is the target app, ignoring scope.
 .DESCRIPTION
     True when its ProductCode or PackageFamily equals the target's, its DisplayName and Publisher
-    match TargetPattern and TargetPublisher, or (ownership and arpCompare targets, and most targets a
-    D47 step chose; see Get-AUTargetKeys) its normalized DisplayName and Publisher equal the target's
-    keys, so an update that renames the entry, Contoso Alpha 1.0 to Contoso Alpha 1.1, still counts.
-    The one definition for Get-AUInstallStatus and Test-AUMainExe.
+    match TargetPattern and TargetPublisher, or (ownership and arpCompare targets, and targets a D47
+    step chose, which also need the same architecture and bracketed tags; see Get-AUTargetKeys) its
+    normalized DisplayName and Publisher equal the target's keys, so an update that renames the
+    entry, Contoso Alpha 1.0 to Contoso Alpha 1.1, still counts. The one definition for
+    Get-AUInstallStatus and Test-AUMainExe.
 .PARAMETER App
     The installed-app entry.
 .PARAMETER Keys
@@ -3802,8 +3845,10 @@ function Test-AUTargetApp
         catch { $SamePublisher = $false }
     }
     else { return $false }
-    if ($SamePublisher -and (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -ceq $Keys.NameKey) { return $true }
-    return $false
+    if (-not $SamePublisher -or (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -cne $Keys.NameKey) { return $false }
+    # A target a D47 step chose among siblings also needs the same architecture and bracketed tags.
+    if ($null -ne $Keys.TagKey -and (Get-AUNameTags ([string]$App.DisplayName)) -cne $Keys.TagKey) { return $false }
+    return $true
 }#endfunction
 
 function Get-AUInstallStatus
