@@ -1977,6 +1977,131 @@ function Test-AUInteractiveUserType
 
     return ($UserType -in @('CloudOnly', 'Domain', 'Local'))
 }#endfunction
+
+function ConvertFrom-AUExeInfo
+{
+    <#
+.SYNOPSIS
+    Parses a SRUM ExeInfo value into its exe name, PE link time, PE CheckSum, and kind.
+.DESCRIPTION
+    A Win32 value is a build fingerprint, !!<exe>!<yyyy/MM/dd:HH:mm:ss>!<hex>!: the exe name, the
+    PE header TimeDateStamp in UTC, and the PE optional-header CheckSum. It returns Kind Win32, the
+    lowercase ExeName, LinkTimeUtc (Utc kind), and CheckSum ([uint32]). A link time or CheckSum
+    that doesn't parse is $null; the value is still Win32.
+    A package full name, or a package family name with an optional !AppId, is Kind Package, with
+    ExeName, LinkTimeUtc, and CheckSum all $null.
+    Anything else (a path, a plain name, or an empty value) is Kind Other, with ExeName the
+    lowercase final path element ($null when empty) and no link time or CheckSum.
+.PARAMETER ExeInfo
+    The SRUM ExeInfo string.
+#>
+    param (
+        [string]$ExeInfo
+    )
+
+    $Result = [pscustomobject]@{
+        ExeName     = $null
+        LinkTimeUtc = $null
+        CheckSum    = $null
+        Kind        = 'Other'
+    }
+    if ([string]::IsNullOrWhiteSpace($ExeInfo)) { return $Result }
+    $Value = $ExeInfo.Trim()
+
+    $Win32 = [regex]::Match($Value, '^!!(?<Name>[^!]+)!(?<Time>[^!]*)!(?<Sum>[^!]*)!')
+    if ($Win32.Success)
+    {
+        $Result.Kind = 'Win32'
+        $Result.ExeName = $Win32.Groups['Name'].Value.Trim().ToLowerInvariant()
+
+        $LinkTime = [datetime]::MinValue
+        $Styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+        if ([datetime]::TryParseExact($Win32.Groups['Time'].Value, 'yyyy/MM/dd:HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture, $Styles, [ref]$LinkTime))
+        {
+            $Result.LinkTimeUtc = [datetime]::SpecifyKind($LinkTime, [DateTimeKind]::Utc)
+        }
+
+        $Sum = [uint32]0
+        if ([uint32]::TryParse($Win32.Groups['Sum'].Value, [Globalization.NumberStyles]::AllowHexSpecifier, [Globalization.CultureInfo]::InvariantCulture, [ref]$Sum))
+        {
+            $Result.CheckSum = $Sum
+        }
+        return $Result
+    }
+
+    # Package full name: Name_Version_Architecture_ResourceId_PublisherId. Package family name:
+    # Name_PublisherId. The publisher ID is 13 base32 characters. Either may carry an !AppId.
+    $PackageFullName = '^[A-Za-z0-9.\-]+_\d+\.\d+\.\d+\.\d+_(x86|x64|arm|arm64|neutral)_[A-Za-z0-9.\-~]*_[a-hj-km-np-tv-z0-9]{13}(![A-Za-z0-9.\-_]+)?$'
+    $PackageFamilyName = '^[A-Za-z0-9.\-]+_[a-hj-km-np-tv-z0-9]{13}(![A-Za-z0-9.\-_]+)?$'
+    if ($Value -match $PackageFullName -or $Value -match $PackageFamilyName)
+    {
+        $Result.Kind = 'Package'
+        return $Result
+    }
+
+    $Leaf = ($Value -split '[\\/]')[-1].Trim()
+    if ($Leaf) { $Result.ExeName = $Leaf.ToLowerInvariant() }
+    return $Result
+}#endfunction
+
+function ConvertFrom-AUFileTime
+{
+    <#
+.SYNOPSIS
+    Converts a Windows FILETIME (100-ns intervals since 1601-01-01 UTC) to a Utc-kind date.
+.DESCRIPTION
+    Returns $null for 0 (SRUM's unset value), a negative value, or a value past the last
+    representable date. It never throws.
+.PARAMETER FileTime
+    The FILETIME as a 64-bit integer.
+#>
+    param (
+        [long]$FileTime
+    )
+
+    if ($FileTime -le 0) { return $null }
+    try { return [datetime]::FromFileTimeUtc($FileTime) }
+    catch { return $null }
+}#endfunction
+
+function ConvertFrom-AUOleDate
+{
+    <#
+.SYNOPSIS
+    Converts an OLE Automation date (days since 1899-12-30) to a date, treating the value as UTC.
+.DESCRIPTION
+    SRUM stores its TimeStamp column as an OLE date in UTC. The result is Utc kind; no local time
+    conversion is applied. Returns $null for 0 or less (unset), a non-finite value, or a value out
+    of the OLE date range. It never throws.
+.PARAMETER OleDate
+    The OLE Automation date.
+#>
+    param (
+        [double]$OleDate
+    )
+
+    if ([double]::IsNaN($OleDate) -or [double]::IsInfinity($OleDate) -or $OleDate -le 0) { return $null }
+    try { return [datetime]::SpecifyKind([datetime]::FromOADate($OleDate), [DateTimeKind]::Utc) }
+    catch { return $null }
+}#endfunction
+
+function Format-AUDate
+{
+    <#
+.SYNOPSIS
+    Formats a Utc-kind date as yyyy-MM-ddTHH:mm:ss.fffffffZ, independent of the current culture.
+.DESCRIPTION
+    Throws when the date is Local or Unspecified kind, so a local time is never written with a Z.
+.PARAMETER Utc
+    The date to format. It must be Utc kind.
+#>
+    param (
+        [datetime]$Utc
+    )
+
+    if ($Utc.Kind -ne [DateTimeKind]::Utc) { throw "Format-AUDate needs a Utc date; got Kind $($Utc.Kind)." }
+    return $Utc.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+}#endfunction
 #endregion APPUSAGE
 
 #region script
