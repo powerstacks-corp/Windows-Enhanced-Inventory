@@ -85,7 +85,7 @@ Each executable's usage reports a `Role`, the kind of executable it is. The firs
 | `Helper` | It's matched to an app, and it isn't the app's main executable. |
 | `Unmatched` | It isn't matched to an app. |
 
-An executable is the app's main executable when an identity rule matched it, through its `exeName`, or when its path is the file in the app's **DisplayIcon** uninstall value and the script verified the build. Every executable an identity rule matches is a main executable, so with a pattern such as `contoso*.exe`, add a classification rule with the `Helper` role for the ones that aren't.
+An executable is the app's main executable when an identity rule matched it, through its `exeName`, or when its path is the file in the app's **DisplayIcon** uninstall value and the script verified the build. A Store or MSIX app is its own main executable, so a matched one is `App`. Every executable an identity rule matches is a main executable, so with a pattern such as `contoso*.exe`, add a classification rule with the `Helper` role for the ones that aren't.
 
 An executable that's matched to an app stays `App` or `Helper` after the app is uninstalled. There's no role for SYSTEM: who ran an executable doesn't change its role.
 

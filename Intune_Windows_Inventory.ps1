@@ -3659,10 +3659,11 @@ function Test-AUMainExe
     Tests whether an executable is its target app's main executable (F19).
 .DESCRIPTION
     True when the target came from an identity rule: the rule's exeName named this executable, and a
-    retained target keeps its rule type. Otherwise true when the build is verified and its run path
-    equals the DisplayIcon file of an installed app that is the target app (its ProductCode or
-    PackageFamily equals the target's, or its DisplayName and Publisher match TargetPattern and
-    TargetPublisher). The paths are compared ignoring case, quotes, and the icon index.
+    retained target keeps its rule type. True for a Package-kind entry (a Store or MSIX package: no
+    ExeName, a PackageFamily), whose package identity is the app. Otherwise true when the build is
+    verified and its run path equals the DisplayIcon file of an installed app that is the target app
+    (its ProductCode or PackageFamily equals the target's, or its DisplayName and Publisher match
+    TargetPattern and TargetPublisher). The paths are compared ignoring case, quotes, and the icon index.
 .PARAMETER Facts
     The executable facts.
 .PARAMETER Target
@@ -3677,6 +3678,9 @@ function Test-AUMainExe
     )
 
     if ($Target.RuleType -ceq 'identity') { return $true }
+    # A Package-kind entry (Store or MSIX) has no exe name, only its package identity, which is the
+    # app itself, so it is its own main executable.
+    if ([string]::IsNullOrWhiteSpace([string]$Facts.ExeName) -and -not [string]::IsNullOrWhiteSpace([string]$Facts.PackageFamily)) { return $true }
     if ($Facts.FactsVerified -ne $true) { return $false }
     $RunPath = ([string]$Facts.RunPath).Trim().Replace('/', '\')
     if ($RunPath.StartsWith('\\?\')) { $RunPath = $RunPath.Substring(4) }
@@ -3717,7 +3721,7 @@ function Get-AURole
     The first that applies, in order: Installer when it ran from a Temp, Download, or ManagementCache
     location; the classification rule's role; Service for a service binary; CLI for the console
     subsystem; App for a matched executable that is its target's main executable (Test-AUMainExe,
-    F19); Helper for any other matched executable; else Unmatched. Matched means the target's
+    F19; a matched Store or MSIX package always is); Helper for any other matched executable; else Unmatched. Matched means the target's
     MatchSection is Customer, PowerStacks, or Retained, so a retained target is still App or Helper
     (D17, F20). A matched executable whose subsystem isn't known (a Store package, or a file that's
     gone) is treated as GUI, so it stays App or Helper. There's no System role, and the user type

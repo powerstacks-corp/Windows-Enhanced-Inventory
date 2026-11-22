@@ -242,6 +242,46 @@ Describe 'Get-AURole main exe by DisplayIcon (F19)' {
     }
 }
 
+Describe 'Get-AURole for a Store or MSIX package' {
+    BeforeAll {
+        $script:Family = 'Contoso.Notes_8wekyb3d8bbwe'
+        $script:Mappings = New-TestMappings @('{ "id": "ps-own-store", "type": "ownership", "source": "store" }', $script:RuleArp)
+        $script:Apps = @((New-TestApp 'Contoso Notes' 'Contoso' @{ PackageFamily = $script:Family }))
+        # A Package-kind ExeInfo has no exe name (ConvertFrom-AUExeInfo), and its subsystem isn't known.
+        $script:PackageFacts = @{ ExeName = $null; PackageFamily = $script:Family; Subsystem = $null; FactsVerified = $false; RunPath = $null }
+    }
+
+    It 'is App when the package is matched' {
+        (ConvertFrom-AUExeInfo 'Contoso.Notes_8wekyb3d8bbwe!App').Kind | Should -BeExactly 'Package'
+        Get-TestRole (New-TestFacts $script:PackageFacts) $script:Mappings $script:Apps | Should -BeExactly 'App'
+    }
+
+    It 'is App when the package target is retained after the package is removed' {
+        $stored = [pscustomobject]@{ Section = 'PowerStacks'; MatchRuleId = 'ps-own-store'; RuleType = 'ownership'; TargetPattern = 'Contoso Notes'; TargetPublisher = 'Contoso'; ResolvedAppName = 'Contoso Notes'; ProductCode = $null; PackageFamily = $script:Family; EvidenceUsed = 'Verified' }
+        $facts = New-TestFacts $script:PackageFacts
+        $target = Resolve-AUTarget (Resolve-AUIdentity $facts $script:Mappings @()) $stored $script:Mappings
+        $target.MatchSection | Should -BeExactly 'Retained'
+        Get-AURole $facts $target (New-TestClassification) @() | Should -BeExactly 'App'
+    }
+
+    It 'uses the classification role over App' {
+        $facts = New-TestFacts $script:PackageFacts
+        $target = Resolve-AUTarget (Resolve-AUIdentity $facts $script:Mappings $script:Apps) $null $script:Mappings
+        Get-AURole $facts $target (New-TestClassification 'Helper') $script:Apps | Should -BeExactly 'Helper'
+    }
+
+    It 'is Unmatched when the package is not matched' {
+        $facts = New-TestFacts $script:PackageFacts
+        $facts.PackageFamily = 'Fabrikam.Other_8wekyb3d8bbwe'
+        Get-TestRole $facts $script:Mappings $script:Apps | Should -BeExactly 'Unmatched'
+    }
+
+    It 'doesn''t make a Win32 exe with a PackageFamily the main exe' {
+        $facts = New-TestFacts @{ ExeName = 'notes.exe'; PackageFamily = $script:Family }
+        Get-AURole $facts (New-TestTarget @{ RuleType = 'ownership'; MatchRuleId = 'ps-own-store'; PackageFamily = $script:Family }) (New-TestClassification) @() | Should -BeExactly 'Helper'
+    }
+}
+
 Describe 'Get-AURole with a retained target (F20)' {
     BeforeAll {
         $script:Mappings = New-TestMappings @($script:RuleAcrobat, $script:RuleArp)
