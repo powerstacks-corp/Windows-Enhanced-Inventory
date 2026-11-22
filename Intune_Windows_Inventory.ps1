@@ -3564,10 +3564,15 @@ function Get-AUInstallStatus
     Unmatched only when there's no target (MatchSection None). The target's scope is Machine plus the
     entry's user (F30). Installed when an installed app in that scope matches the target: its
     DisplayName and Publisher match TargetPattern and TargetPublisher, or its ProductCode or
-    PackageFamily equals the target's, so an updated app still counts. An app with no scope counts as
-    in scope. Otherwise NotInstalled only when Machine was Read and the user's scope was Read or
-    Deleted (the profile is gone from ProfileList); else Unknown. A SID missing from ScopeRead counts
-    as Unread (F29). A mapped executable whose target is absent stays mapped.
+    PackageFamily equals the target's, so an updated app still counts. An ownership or arpCompare
+    target holds the exact DisplayName it was matched to, so for those an app also counts when its
+    normalized DisplayName and Publisher (Get-AUNormalizedText, the arpCompare comparison) equal the
+    target's ResolvedAppName and publisher: an update that renames the entry, Contoso Alpha 1.0 to
+    Contoso Alpha 1.1, still counts. An app with no scope counts as in scope. Otherwise NotInstalled
+    only when Machine was Read and the user's scope was Read or Deleted (the profile is gone from
+    ProfileList); else Unknown. A blank UserSid leaves the user's scope unknown, so Unknown; a SID
+    missing from ScopeRead counts as Unread (F29). A mapped executable whose target is absent stays
+    mapped.
 .PARAMETER Target
     The Resolve-AUTarget result.
 .PARAMETER InstalledApps
@@ -3590,6 +3595,16 @@ function Get-AUInstallStatus
     $PublisherPattern = $Target.TargetPublisher
     $Code = ([string]$Target.ProductCode).Trim()
     $Family = ([string]$Target.PackageFamily).Trim()
+    # Normalized keys for an ownership or arpCompare target, whose patterns are escaped exact values.
+    $NameKey = ''
+    $PublisherKey = ''
+    if ($Target.InstalledStateDependent -eq $true -or $Target.RuleType -cin @('ownership', 'arpCompare'))
+    {
+        $Name = [string]$Target.ResolvedAppName
+        if ([string]::IsNullOrWhiteSpace($Name)) { $Name = [Management.Automation.WildcardPattern]::Unescape([string]$NamePattern) }
+        $NameKey = Get-AUNormalizedText $Name -Kind Name
+        $PublisherKey = Get-AUNormalizedText ([Management.Automation.WildcardPattern]::Unescape([string]$PublisherPattern)) -Kind Publisher
+    }
 
     foreach ($App in @($InstalledApps))
     {
@@ -3600,6 +3615,7 @@ function Get-AUInstallStatus
         if ($Family -and [string]::Equals(([string]$App.PackageFamily).Trim(), $Family, [StringComparison]::OrdinalIgnoreCase)) { return 'Installed' }
         $AppName = ([string]$App.DisplayName).Trim()
         if ($AppName -and $null -ne $NamePattern -and $null -ne $PublisherPattern -and $AppName -like [string]$NamePattern -and ([string]$App.Publisher).Trim() -like [string]$PublisherPattern) { return 'Installed' }
+        if ($NameKey -and $PublisherKey -and (Get-AUNormalizedText ([string]$App.Publisher) -Kind Publisher) -ceq $PublisherKey -and (Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name) -ceq $NameKey) { return 'Installed' }
     }
 
     $StateOf = {
@@ -3612,7 +3628,8 @@ function Get-AUInstallStatus
         return 'Unread'
     }
     if ((& $StateOf 'Machine') -ne 'Read') { return 'Unknown' }
-    if ($Sid -and (& $StateOf $Sid) -notin @('Read', 'Deleted')) { return 'Unknown' }
+    # The target may be a per-user install, and with no SID that scope can't have been read.
+    if (-not $Sid -or (& $StateOf $Sid) -notin @('Read', 'Deleted')) { return 'Unknown' }
     return 'NotInstalled'
 }#endfunction
 #endregion APPUSAGE

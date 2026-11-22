@@ -179,10 +179,47 @@ Describe 'Get-AUInstallStatus' {
         Get-AUInstallStatus $script:Target $apps (New-TestScopeRead @{ $script:OtherSid = 'Read' }) $script:TestSid | Should -BeExactly 'NotInstalled'
     }
 
-    It 'is NotInstalled for a per-user target whose user scope is Read and absent (F30)' {
+    It 'is Installed for a per-user target present in the entry user''s scope (F30)' {
         $apps = @((New-TestApp 'Contoso Alpha' 'Contoso' @{ Scope = $script:OtherSid }))
         Get-AUInstallStatus $script:Target $apps @{ Machine = 'Read'; $script:OtherSid = 'Read' } $script:OtherSid | Should -BeExactly 'Installed'
+    }
+
+    It 'is NotInstalled for a per-user target whose user scope is Read and absent (F30)' {
         Get-AUInstallStatus $script:Target @() @{ Machine = 'Read'; $script:OtherSid = 'Read' } $script:OtherSid | Should -BeExactly 'NotInstalled'
+    }
+
+    It 'is Unknown with a blank UserSid, even with Machine Read, because the user scope is unknown' {
+        Get-AUInstallStatus $script:Target @() (New-TestScopeRead) '' | Should -BeExactly 'Unknown'
+        Get-AUInstallStatus $script:Target @() (New-TestScopeRead) $null | Should -BeExactly 'Unknown'
+        Get-AUInstallStatus $script:Target @((New-TestApp 'Contoso Alpha' 'Contoso')) (New-TestScopeRead) '' | Should -BeExactly 'Installed'
+    }
+
+    It 'is Installed after an update renames the entry and changes its ProductCode, on an unverified run (arpCompare)' {
+        Mock Write-CMTraceLog { }
+        $m = New-TestMappings -PowerStacks @($script:RuleArp)
+        $old = @((New-TestApp 'Contoso Alpha 1.0' 'Contoso Ltd' @{ ProductCode = '{AAAAAAAA-0000-0000-0000-000000000001}' }))
+        $new = @((New-TestApp 'Contoso Alpha 1.1' 'Contoso Ltd' @{ ProductCode = '{AAAAAAAA-0000-0000-0000-000000000002}' }))
+
+        # First run, verified: the target is stored as the exact DisplayName Contoso Alpha 1.0.
+        $stored = ConvertTo-AUStoredTarget (Resolve-AUTarget (Resolve-AUIdentity (New-TestFacts @{ FileCompanyName = 'Contoso'; FileProductName = 'Contoso Alpha' }) $m $old) $null $m)
+        $stored.TargetPattern | Should -BeExactly 'Contoso Alpha 1.0'
+
+        # After the update, an unverified run: the stored target is kept (D30) and the renamed entry still counts.
+        $identity = Resolve-AUIdentity (New-TestUnverifiedFacts 'Contoso' 'Contoso Alpha') $m $new
+        $identity.EvidenceUsed | Should -BeExactly 'CurrentFileAtPath'
+        $identity.ResolvedAppName | Should -BeExactly 'Contoso Alpha 1.1'
+        $t = Resolve-AUTarget $identity $stored $m
+        $t.MatchSection | Should -BeExactly 'Retained'
+        $t.TargetPattern | Should -BeExactly 'Contoso Alpha 1.0'
+        Get-AUInstallStatus $t $new (New-TestScopeRead) $script:TestSid | Should -BeExactly 'Installed'
+
+        # A different app from the same publisher doesn't count.
+        Get-AUInstallStatus $t @((New-TestApp 'Contoso Beta 1.1' 'Contoso Ltd')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
+    }
+
+    It 'keeps identity-rule targets on their pattern only: no normalized-name match' {
+        $t = [pscustomobject]@{ MatchSection = 'Customer'; MatchRuleId = 'c-tool-1'; RuleType = 'identity'; InstalledStateDependent = $false; TargetPattern = 'Contoso Alpha 1.0'; TargetPublisher = 'Contoso'; ResolvedAppName = 'Contoso Alpha 1.0'; ProductCode = $null; PackageFamily = $null }
+        Get-AUInstallStatus $t @((New-TestApp 'Contoso Alpha 1.1' 'Contoso')) (New-TestScopeRead) $script:TestSid | Should -BeExactly 'NotInstalled'
     }
 
     It 'is Unmatched with no target' {
