@@ -5508,6 +5508,55 @@ function Get-AUUnmatchedExeCount
     return $Count
 }#endfunction
 
+function ConvertTo-AUChunks
+{
+    <#
+.SYNOPSIS
+    GZips JSON, Base64-encodes it, and splits it into ordered pieces of at most ChunkSize characters (F46).
+.DESCRIPTION
+    The one copy of version 19's InstalledApps compression and split (F32): the InstalledApps upload
+    calls it with metering off and on, and the ExeUsage blob uses it too. The GZip stream and the
+    StreamWriter keep their defaults (default compression level, UTF-8 without a BOM), as version 19
+    did, so the pieces equal version 19's for the same JSON. Version 19 split with
+    -split "(.{N})" and dropped the empty strings; the Substring loop gives the same pieces (Base64
+    has no line breaks) without the regex cost on a large blob. No cap: the caller decides how many
+    pieces fit (D44). A failure (such as text UTF-8 can't encode) throws to the caller, as in version 19.
+.PARAMETER Json
+    The JSON text. $null is the empty string, as version 19 wrote an empty app list.
+.PARAMETER ChunkSize
+    The piece length: 64512 for the Log Ingestion API, 31744 for the classic API.
+#>
+    [OutputType([string[]])]
+    param (
+        [string]$Json,
+        [ValidateRange(1, 2147483647)]
+        [int]$ChunkSize
+    )
+
+    $Buffer = New-Object System.IO.MemoryStream
+    $Writer = $null
+    try
+    {
+        $Gzip = New-Object System.IO.Compression.GZipStream($Buffer, [System.IO.Compression.CompressionMode]::Compress)
+        $Writer = New-Object System.IO.StreamWriter($Gzip)
+        $Writer.Write($Json)
+        $Writer.Close()
+        $Base64 = [System.Convert]::ToBase64String($Buffer.ToArray())
+    }
+    finally
+    {
+        if ($null -ne $Writer) { $Writer.Dispose() }
+        $Buffer.Dispose()
+    }
+
+    $Pieces = New-Object System.Collections.Generic.List[string]
+    for ($Start = 0; $Start -lt $Base64.Length; $Start += $ChunkSize)
+    {
+        $Pieces.Add($Base64.Substring($Start, [Math]::Min($ChunkSize, $Base64.Length - $Start)))
+    }
+    return , $Pieces.ToArray()
+}#endfunction
+
 $script:AULockName = 'Global\PowerStacksAppUsage'
 # Well-known SIDs, never localized names: SYSTEM and Administrators (F27).
 $script:AULockAclSids = @('S-1-5-18', 'S-1-5-32-544')
@@ -8575,16 +8624,13 @@ if ($CollectAppInventory)
     $InstalledAppJson = $AppArray | ConvertTo-Json
     Write-CMTraceLog "App inventory JSON size: $($InstalledAppJson.Length) characters"
 
-    Write-CMTraceLog "Compressing app inventory JSON with GZip..."
+    Write-CMTraceLog "Compressing app inventory JSON with GZip and splitting it into chunks..."
     try
     {
-        $ms = New-Object System.IO.MemoryStream
-        $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
-        $sw = New-Object System.IO.StreamWriter($cs)
-        $sw.Write($InstalledAppJson)
-        $sw.Close()
-        $InstalledAppJson = [System.Convert]::ToBase64String($ms.ToArray())
-        Write-CMTraceLog "App inventory compressed successfully, Base64 size: $($InstalledAppJson.Length) characters"
+        $InstalledAppJsonArr = @(ConvertTo-AUChunks -Json $InstalledAppJson -ChunkSize $(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744}))
+        $InstalledAppBase64Length = 0
+        foreach ($InstalledApp in $InstalledAppJsonArr) { $InstalledAppBase64Length += $InstalledApp.Length }
+        Write-CMTraceLog "App inventory compressed successfully, Base64 size: $InstalledAppBase64Length characters"
     }
     catch
     {
@@ -8597,8 +8643,7 @@ if ($CollectAppInventory)
     $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
     $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
 
-    Write-CMTraceLog "Splitting app inventory into chunks..."
-    $InstalledAppJsonArr = $InstalledAppJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
+    Write-CMTraceLog "Adding app inventory chunks to the upload object..."
     $i = 0
     foreach ($InstalledApp in $InstalledAppJsonArr)
     {
@@ -8610,7 +8655,7 @@ if ($CollectAppInventory)
     }
     Write-CMTraceLog "App inventory split into $i chunk(s)"
 
-    if ($InstalledAppJson.Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+    if ($InstalledAppBase64Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
             {
                 10 * 63 * 1024
             }
@@ -8619,7 +8664,7 @@ if ($CollectAppInventory)
                 10 * 31 * 1024
             }))
     {
-        $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "Kb"
+        $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppBase64Length / 1024).ToString("#.#") + "Kb"
         Write-CMTraceLog $errorMsg -ErrorMsg
         throw($errorMsg)
     }
