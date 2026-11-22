@@ -297,6 +297,24 @@ Describe 'Test-AUMappings' {
     }
 }
 
+Describe 'Format-AUErrorText' {
+    It 'keeps the text up to the position number and drops the echoed input' {
+        Format-AUErrorText ("Invalid object passed in, ':' or '}' expected. (147): " + '{ "schemaVersion"' + (' ' * 5000)) |
+            Should -Be "Invalid object passed in, ':' or '}' expected. (147)"
+    }
+
+    It 'caps a long message with no position marker and makes it one line' {
+        $t = Format-AUErrorText ("Invalid JSON primitive:`r`n" + ('x' * 5000))
+        $t.Length | Should -BeLessOrEqual 303
+        $t | Should -Match '^Invalid JSON primitive: x+\.\.\.$'
+    }
+
+    It 'returns a short message unchanged and an empty string for none' {
+        Format-AUErrorText 'Invalid JSON primitive: not.' | Should -Be 'Invalid JSON primitive: not.'
+        Format-AUErrorText $null | Should -Be ''
+    }
+}
+
 Describe 'Get-AUMappings' {
     BeforeAll {
         $Absent = Join-Path (New-TestDir 'nothing') 'customer-mappings.json'
@@ -371,6 +389,17 @@ Describe 'Get-AUMappings' {
             $r.Mappings.powerStacks.classificationRules.Count | Should -Be 0
             $r.PowerStacksVersion | Should -Be ''
             $r.RuleIds.Count | Should -Be 7
+        }
+    }
+
+    It 'keeps Errors short for large invalid embedded or beside text' {
+        $Bad = '{ "schemaVersion": 1 "powerStacks": ' + (' ' * 500000) + '}'
+        $Dir = New-TestDir 'largebadours'
+        [IO.File]::WriteAllText((Join-Path $Dir 'powerstacks-mappings.json'), $Bad, (New-Object Text.UTF8Encoding($false)))
+        foreach ($r in @((Get-AUMappings -Embedded (ConvertTo-TestEmbedded $Bad) -BesideDir '' -CustomerPath $Absent), (Get-AUMappings -Embedded '' -BesideDir $Dir -CustomerPath $Absent)))
+        {
+            $r.Errors.Count | Should -BeGreaterThan 0
+            foreach ($Problem in $r.Errors) { $Problem.Length | Should -BeLessOrEqual 400 }
         }
     }
 
@@ -455,6 +484,35 @@ Describe 'Get-AUMappings' {
             $r.Mappings.customer.identityRules.Count | Should -Be 0
             $r.Mappings.powerStacks.identityRules.Count | Should -Be 3
             $r.Errors.Count | Should -BeGreaterThan 0
+        }
+
+        It 'keeps Errors short for a large file with a syntax error at its head or its tail' {
+            $Dir = New-TestDir 'largebad'
+            $Head = Join-Path $Dir 'head.json'
+            [IO.File]::WriteAllText($Head, '{ "schemaVersion": 1 "customer": ' + (' ' * 1000000) + '}', (New-Object Text.UTF8Encoding($false)))
+            $Tail = Join-Path $Dir 'tail.json'
+            [IO.File]::WriteAllText($Tail, '{ "schemaVersion": 1, "customer": { "identityRules": [' + (' ' * 1000000) + '] } x', (New-Object Text.UTF8Encoding($false)))
+            foreach ($Cust in $Head, $Tail)
+            {
+                $r = Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath $Cust
+                $r.CustomerSource | Should -Be 'Invalid'
+                $r.Errors.Count | Should -BeGreaterThan 0
+                foreach ($Problem in $r.Errors) { $Problem.Length | Should -BeLessOrEqual 400 }
+                ($r.Errors -join ' ') | Should -Match '\(\d+\)'
+            }
+        }
+
+        It 'keeps Errors bounded for a file with a huge value and many bad rules' {
+            $Dir = New-TestDir 'manybad'
+            $Cust = Join-Path $Dir 'customer-mappings.json'
+            $Rules = (1..2000 | ForEach-Object { '{ "id": "c-r' + $_ + '", "type": "ignore", "when": { "exeNmae": "x.exe" } }' }) -join ','
+            $Json = '{ "schemaVersion": 1, "customer": { "identityRules": [ { "id": "c-big", "type": "classification", "when": { "exeName": "a.exe" }, "role": "' + ('x' * 200000) + '" } ], "classificationRules": [' + $Rules + '] } }'
+            [IO.File]::WriteAllText($Cust, $Json, (New-Object Text.UTF8Encoding($false)))
+            $r = Get-AUMappings -Embedded $Ours -BesideDir '' -CustomerPath $Cust
+            $r.CustomerSource | Should -Be 'Invalid'
+            $r.Errors.Count | Should -BeLessOrEqual 52
+            foreach ($Problem in $r.Errors) { $Problem.Length | Should -BeLessOrEqual 400 }
+            $r.Errors[-1] | Should -Match 'more errors'
         }
 
         It 'ignores a file with an invalid rule as Invalid and names the rule in Errors' {
@@ -564,6 +622,14 @@ Describe 'Test-AppUsageMappings.ps1' {
         $After.Hash | Should -Be $Before.Hash
         $After.Written | Should -Be $Before.Written
         $After.Created | Should -Be $Before.Created
+    }
+
+    It 'prints a short error for a large file with a syntax error' {
+        $Cust = Join-Path (New-TestDir 'validator-large') 'customer-mappings.json'
+        [IO.File]::WriteAllText($Cust, '{ "schemaVersion": 1 "customer": ' + (' ' * 1000000) + '}', (New-Object Text.UTF8Encoding($false)))
+        $r = Invoke-Validator @('-Path', $Cust)
+        $r.ExitCode | Should -Be 1
+        $r.Output.Length | Should -BeLessThan 2000
     }
 
     It 'exits 1 for a file that is not there' {

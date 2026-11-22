@@ -2106,6 +2106,7 @@ function Format-AUDate
 # Mapping rules (D3, D38, D41, D45). The rule IDs a D47 candidate step records; no file may define them.
 $script:AUReservedRuleIds = @('ps-resolve-path', 'ps-resolve-msi', 'ps-resolve-publisher', 'ps-resolve-product', 'ps-resolve-version', 'ps-resolve-arch', 'ps-resolve-scope')
 $script:AUMaxCustomerMappingsBytes = 1048576
+$script:AUMaxMappingErrors = 50
 $script:AULocationClasses = @('Windows', 'ProgramFiles', 'UserProfile', 'Temp', 'Download', 'ManagementCache', 'Other')
 $script:AURuleRoles = @('Windows', 'Installer', 'Helper', 'Service', 'CLI')
 
@@ -2133,6 +2134,37 @@ function ConvertTo-AUVersion
         $Parts[$i] = $Part
     }
     return New-Object version($Parts[0], $Parts[1], $Parts[2], $Parts[3])
+}#endfunction
+
+function Format-AUErrorText
+{
+    <#
+.SYNOPSIS
+    Shortens an exception message for an Errors entry or a log line.
+.DESCRIPTION
+    Windows PowerShell's ConvertFrom-Json appends the whole input after a position marker, as in
+    "Invalid object passed in, ':' or '}' expected. (147): {...", so one broken 1 MB file would put
+    1 MB in every message. This keeps the text up to and including the marker's position number,
+    makes it one line, and caps it at MaxLength characters.
+.PARAMETER Message
+    The exception message.
+.PARAMETER MaxLength
+    The most characters to keep before "..." is added.
+#>
+    param (
+        [string]$Message,
+        [int]$MaxLength = 300
+    )
+
+    if ([string]::IsNullOrEmpty($Message)) { return '' }
+    $Text = $Message
+    $Marker = [regex]::Match($Text, '\(\d+\):')
+    if ($Marker.Success) { $Text = $Text.Substring(0, $Marker.Index + $Marker.Length - 1) }
+    $Cut = $Text.Length -gt $MaxLength
+    if ($Cut) { $Text = $Text.Substring(0, $MaxLength) }
+    $Text = ($Text -replace '\s+', ' ').Trim()
+    if ($Cut) { $Text += '...' }
+    return $Text
 }#endfunction
 
 function Test-AUMappings
@@ -2359,9 +2391,19 @@ function Test-AUMappings
     }
     catch
     {
-        $Errors.Add("The mappings couldn't be checked: $($_.Exception.Message)")
+        $Errors.Add("The mappings couldn't be checked: $(Format-AUErrorText $_.Exception.Message)")
     }
-    return , $Errors.ToArray()
+
+    # Bounded output: an error can echo a value from the file, and a broken file can hold many rules.
+    $Limited = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($Problem in $Errors)
+    {
+        if ($Limited.Count -ge $script:AUMaxMappingErrors) { break }
+        if ($Problem.Length -gt 300) { $Problem = $Problem.Substring(0, 300) + '...' }
+        $Limited.Add($Problem)
+    }
+    if ($Errors.Count -gt $Limited.Count) { $Limited.Add("... and $($Errors.Count - $Limited.Count) more errors.") }
+    return , $Limited.ToArray()
 }#endfunction
 
 function Read-AUCustomerMappingsFile
@@ -2429,7 +2471,7 @@ function Read-AUCustomerMappingsFile
     {
         $Result.State = 'Invalid'
         $Result.Data = $null
-        $Result.Errors = @("The customer mappings file couldn't be read as JSON: $($_.Exception.Message)")
+        $Result.Errors = @("The customer mappings file couldn't be read as JSON: $(Format-AUErrorText $_.Exception.Message)")
     }
     return $Result
 }#endfunction
@@ -2514,7 +2556,7 @@ function Get-AUMappings
         }
         catch
         {
-            $Errors.Add("PowerStacks mappings ($Source) couldn't be read: $($_.Exception.Message)")
+            $Errors.Add("PowerStacks mappings ($Source) couldn't be read: $(Format-AUErrorText $_.Exception.Message)")
         }
 
         # The customer's rules: all or nothing.
@@ -2552,7 +2594,7 @@ function Get-AUMappings
     }
     catch
     {
-        $Errors.Add("Mappings couldn't be loaded: $($_.Exception.Message)")
+        $Errors.Add("Mappings couldn't be loaded: $(Format-AUErrorText $_.Exception.Message)")
     }
 
     Write-CMTraceLog -Message "App Usage mappings: ours $Source $($Ours.version), customer $CustomerSource, $($Errors.Count) errors." -Component 'AppUsage'
