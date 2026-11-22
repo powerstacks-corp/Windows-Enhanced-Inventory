@@ -68,6 +68,9 @@ BeforeAll {
     Set-FixtureKey "M\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$script:EpsilonPacked\InstallProperties" @{ DisplayName = 'Contoso Epsilon'; DisplayVersion = '1.0' }
     # SYSTEM's hive stand-in.
     Set-FixtureKey "SYS\$script:Uninstall\SysTool" @{ DisplayName = 'Contoso System Tool'; DisplayVersion = '1.0'; Publisher = 'Contoso Ltd' }
+    # LocalService's and NetworkService's hive stand-ins.
+    Set-FixtureKey "SVC19\$script:Uninstall\SvcTool" @{ DisplayName = 'Contoso LocalService Tool'; DisplayVersion = '1.0'; Publisher = 'Contoso Ltd' }
+    Set-FixtureKey "SVC20\$script:UninstallWow\NetTool" @{ DisplayName = 'Contoso NetworkService Tool'; DisplayVersion = '1.0'; Publisher = 'Contoso Ltd' }
     # Alice, signed in.
     Set-FixtureKey "U1\$script:Uninstall\Gamma" @{ DisplayName = 'Contoso Gamma'; DisplayVersion = '3.1'; Publisher = 'Contoso Ltd'; InstallDate = '20250301'; UninstallString = '"C:\Users\alice\AppData\Local\Programs\Gamma\uninst.exe"' } @{
         InstallLocation = '%LOCALAPPDATA%\Programs\Gamma'; DisplayIcon = '%APPDATA%\Gamma\gamma.exe'
@@ -104,6 +107,8 @@ BeforeAll {
     {
         Mock Open-AURegistryBase -ParameterFilter { $Hive -eq 'Machine' } { [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$script:FixtureKey\M") }
         Mock Open-AURegistryBase -ParameterFilter { $Hive -eq 'Users' -and $Name -eq 'S-1-5-18' } { [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$script:FixtureKey\SYS") }
+        Mock Open-AURegistryBase -ParameterFilter { $Hive -eq 'Users' -and $Name -eq 'S-1-5-19' } { [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$script:FixtureKey\SVC19") }
+        Mock Open-AURegistryBase -ParameterFilter { $Hive -eq 'Users' -and $Name -eq 'S-1-5-20' } { [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$script:FixtureKey\SVC20") }
     }
 
     function Get-TestApp([object[]]$Apps, [string]$Name, [string]$Scope)
@@ -440,6 +445,27 @@ Describe 'Get-AUInstalledApps without reading hives' {
         $Result.ProfilesRead | Should -Be 0
     }
 
+    It 'keeps SYSTEM''s per-user installs but not LocalService''s or NetworkService''s, whose scopes are still read' {
+        $Users = @(
+            (New-TestUser 'S-1-5-18' 'Loaded' 'C:\Windows\system32\config\systemprofile' 'System')
+            (New-TestUser 'S-1-5-19' 'Loaded' 'C:\Windows\ServiceProfiles\LocalService' 'Service')
+            (New-TestUser 'S-1-5-20' 'Loaded' 'C:\Windows\ServiceProfiles\NetworkService' 'Service')
+        )
+        $Result = Get-AUInstalledApps -Users $Users
+        @(Get-TestApp $Result.Apps 'Contoso System Tool').Count | Should -Be 1
+        @(Get-TestApp $Result.Apps 'Contoso LocalService Tool').Count | Should -Be 0
+        @(Get-TestApp $Result.Apps 'Contoso NetworkService Tool').Count | Should -Be 0
+        @($Result.Apps | Where-Object { $_.Scope -in @('S-1-5-19', 'S-1-5-20') -or $_.RegPath -match 'S-1-5-(19|20)\\' }).Count | Should -Be 0
+        $Inventory = @(ConvertTo-AUInventoryApps -Apps $Result.Apps)
+        @($Inventory | Where-Object { $_.AppName -in @('Contoso LocalService Tool', 'Contoso NetworkService Tool') }).Count | Should -Be 0
+        @($Inventory | Where-Object AppName -eq 'Contoso System Tool').Count | Should -Be 1
+        $Result.ScopeRead['S-1-5-19'] | Should -Be 'Read'
+        $Result.ScopeRead['S-1-5-20'] | Should -Be 'Read'
+        $Result.ProfilesFound | Should -Be 3
+        $Result.ProfilesRead | Should -Be 3
+        Should -Invoke Open-AURegistryBase -ParameterFilter { $Name -eq 'S-1-5-20' } -Times 1 -Exactly
+    }
+
     It 'marks Machine Unread, and does not throw, when HKLM cannot be read' {
         Mock Open-AURegistryBase -ParameterFilter { $Hive -eq 'Machine' } { throw 'denied' }
         $Result = Get-AUInstalledApps -Users @()
@@ -458,7 +484,13 @@ Describe 'Get-AUInstalledApps without reading hives' {
                         PackageUserInformation = @(
                             [pscustomobject]@{ UserSecurityId = [pscustomobject]@{ Sid = 'S-1-5-21-9-9-9-1' }; InstallState = 'Installed' }
                             [pscustomobject]@{ UserSecurityId = [pscustomobject]@{ Sid = 'S-1-5-18' }; InstallState = 'Installed' }
+                            [pscustomobject]@{ UserSecurityId = [pscustomobject]@{ Sid = 'S-1-5-19' }; InstallState = 'Installed' }
                         )
+                    }
+                    [pscustomobject]@{
+                        Name = 'Contoso.ServiceOnly'; Version = '2.0.0.0'; PackageFullName = 'Contoso.ServiceOnly_2.0.0.0_x64__abc'; PackageFamilyName = 'Contoso.ServiceOnly_abc'
+                        InstallLocation = 'C:\Program Files\WindowsApps\Contoso.ServiceOnly'; Architecture = 'X64'
+                        PackageUserInformation = @([pscustomobject]@{ UserSecurityId = [pscustomobject]@{ Sid = 'S-1-5-20' }; InstallState = 'Installed' })
                     }
                     [pscustomobject]@{
                         Name = 'Contoso.Staged'; Version = '1.0.0.0'; PackageFullName = 'Contoso.Staged_1.0.0.0_x86__abc'; PackageFamilyName = 'Contoso.Staged_abc'
@@ -491,6 +523,9 @@ Describe 'Get-AUInstalledApps without reading hives' {
             $Carol.InstallLocation | Should -Be 'C:\Program Files\WindowsApps\Contoso.Notes_5.0.1.0_x64__abc'
             ($Notes | Where-Object Scope -eq 'Machine').ProfilePath | Should -BeNullOrEmpty
             @(Get-TestApp $Result.Apps 'Contoso.Staged').Count | Should -Be 0
+            # Installed for LocalService or NetworkService: not anyone's app.
+            @($Notes | Where-Object { $_.Scope -in @('S-1-5-19', 'S-1-5-20') }).Count | Should -Be 0
+            @(Get-TestApp $Result.Apps 'Contoso.ServiceOnly').Count | Should -Be 0
             $Inventory = @(ConvertTo-AUInventoryApps -Apps $Result.Apps | Where-Object AppName -eq 'Contoso.Notes')
             $Inventory.Count | Should -Be 1
             $Inventory[0].AppType | Should -Be 'UWP'

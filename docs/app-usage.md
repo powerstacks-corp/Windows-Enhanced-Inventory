@@ -15,7 +15,7 @@ SRUM keeps only about 30 to 60 days of usage, so the script keeps its own histor
 
 App Usage reads the installed apps of every profile on the device, not only the signed-in user's:
 
-- **Profiles:** every profile Windows lists in `ProfileList` (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`), signed in or not, including the SYSTEM and service accounts.
+- **Profiles:** every profile Windows lists in `ProfileList` (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`), signed in or not. Apps come from signed-in and signed-out users, plus SYSTEM's own per-user installs, which deployment tools often make. Per-user installs under the LocalService and NetworkService accounts aren't listed, because those aren't anyone's profile.
 - **Signed-in users:** their apps are read from their loaded registry hive.
 - **Signed-out users:** the script copies the user's `NTUSER.DAT` from a shadow copy of the system drive into a folder that only SYSTEM and administrators can open, reads the copy, and deletes it. It never opens a user's live hive file, so a user who signs in during the run isn't affected.
 - **Apps:** the uninstall entries (the apps in **Installed apps** or **Programs and Features**) of the device, 64-bit and 32-bit, and of each profile. Store and MSIX apps are included only when `$CollectUWPInventory` is `$true`, the same setting the App Inventory uses. Windows Installer records tell the script which installed app an executable belongs to; they never add an app to the inventory.

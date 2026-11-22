@@ -6930,6 +6930,9 @@ function Read-AUSrum
 # Get-InstalledApplications, mounts and removes that drive.
 $script:AURegPath = [IO.Path]::Combine($env:SystemRoot, 'System32\reg.exe')
 $script:AUSystemSid = 'S-1-5-18'
+# LocalService and NetworkService: their hives are read, so their scope is Read, but their per-user
+# installs aren't anyone's profile and never become app entries. SYSTEM's own per-user installs do.
+$script:AUExcludedProfileSids = @('S-1-5-19', 'S-1-5-20')
 # The two Uninstall views, written as version 19's Get-InstalledApplications writes them, so RegPath
 # matches its AppUninstallRegPath exactly (F31).
 $script:AUUninstallNative = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -7537,7 +7540,8 @@ function Read-AUStoreApps
     A package counts when a user has it in the Installed state, as in version 19's
     Get-AppxInstalledApplications; it gets one entry per such user, with that user's SID as Scope
     (S-1-5-18 is machine scope). DisplayName is the package name and DisplayVersion its version, as in
-    version 19; PackageFamily, InstallLocation, and Architecture come from the package.
+    version 19; PackageFamily, InstallLocation, and Architecture come from the package. Installs for
+    LocalService and NetworkService don't count, so a package installed only for them has no entry.
 .PARAMETER Users
     The Get-AUUsers entries, for ProfilePath.
 .PARAMETER Into
@@ -7573,6 +7577,10 @@ function Read-AUStoreApps
                 if ($Sid -and -not $Sids.Contains($Sid)) { $Sids.Add($Sid) }
             }
             if (-not $AnyInstalled) { continue }
+            # A package installed only for LocalService or NetworkService isn't anyone's app.
+            $HadSid = ($Sids.Count -gt 0)
+            foreach ($Excluded in $script:AUExcludedProfileSids) { [void]$Sids.Remove($Excluded) }
+            if ($HadSid -and $Sids.Count -eq 0) { continue }
             $Publisher = $null
             try { $Publisher = Get-AUAppxPublisher -PackageFullName ([string]$Package.PackageFullName) }
             catch { Write-CMTraceLog -Message "App Usage: couldn't read the manifest of $($Package.PackageFullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
@@ -7631,6 +7639,8 @@ function Get-AUInstalledApps
     Unread. When -IncludeStore is set and the packages can't be read, every user SID is Unread, since a
     Store app could be missing from any of them. A Machine that isn't Read, or a Loaded user who isn't,
     means the list is worse than version 19's read, and the caller falls back to it (D20, D36).
+    Per-user installs of LocalService and NetworkService (S-1-5-19, S-1-5-20) are read for their
+    scope state but never become entries, ARP or Store; SYSTEM's own per-user installs do.
     ProfilesFound is the number of users given; ProfilesRead, how many are Read. Never throws.
 .PARAMETER Users
     The Get-AUUsers entries. A failed hive load changes the entry's ProfileState.
@@ -7673,7 +7683,12 @@ function Get-AUInstalledApps
         $SystemRead = $true
         foreach ($User in $UserList)
         {
-            $UserRead = Read-AUUserApps -User $User -Snapshot $Snapshot -Native $Native -Wow $Wow
+            if ($script:AUExcludedProfileSids -contains [string]$User.Sid)
+            {
+                # Read for the scope state; the entries are dropped.
+                $UserRead = Read-AUUserApps -User $User -Snapshot $Snapshot -Native (New-Object 'System.Collections.Generic.List[object]') -Wow (New-Object 'System.Collections.Generic.List[object]')
+            }
+            else { $UserRead = Read-AUUserApps -User $User -Snapshot $Snapshot -Native $Native -Wow $Wow }
             if ([string]$User.Sid -eq $script:AUSystemSid) { $SystemRead = $UserRead }
             elseif ($UserRead) { $ScopeRead[[string]$User.Sid] = 'Read' }
         }
