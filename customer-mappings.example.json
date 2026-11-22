@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "customer": {
+    "identityRules": [
+      {
+        "id": "c-timesheets-1",
+        "type": "identity",
+        "description": "In-house app whose exe has no publisher in its file info. The empty publisher means: this exe, with no publisher.",
+        "when": { "exeName": "contosotimesheets.exe", "publisher": "" },
+        "target": { "displayName": "Contoso Timesheets*", "publisher": "Contoso*" }
+      },
+      {
+        "id": "c-designer-classic-1",
+        "type": "identity",
+        "description": "Version range: builds 8.x of designer.exe belong to the older product. It comes before c-designer-1 because the first matching rule wins. A range matches only a build whose facts were verified.",
+        "when": { "exeName": "designer.exe", "publisher": "Fabrikam*", "versionMin": "8.0", "versionMax": "8.99" },
+        "target": { "displayName": "Fabrikam Designer Classic*", "publisher": "Fabrikam*" }
+      },
+      {
+        "id": "c-designer-1",
+        "type": "identity",
+        "description": "Fixes a wrong match: credit designer.exe from Fabrikam to Fabrikam Designer, not to the Fabrikam Suite it ships with. Customer rules always win.",
+        "when": { "exeName": "designer.exe", "publisher": "Fabrikam*" },
+        "target": { "displayName": "Fabrikam Designer*", "publisher": "Fabrikam*" }
+      }
+    ],
+    "classificationRules": [
+      {
+        "id": "c-ignore-kiosk-1",
+        "type": "ignore",
+        "description": "Not an app: the kiosk shell that starts at sign-in.",
+        "when": { "exeName": "contosokiosk.exe" }
+      },
+      {
+        "id": "c-class-agent-1",
+        "type": "classification",
+        "description": "Background agent: report it as a helper, not as app use.",
+        "when": { "exeName": "contoso*agent.exe", "companyName": "Contoso*" },
+        "role": "Helper"
+      }
+    ]
+  }
+}

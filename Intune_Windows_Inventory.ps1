@@ -2102,6 +2102,472 @@ function Format-AUDate
     if ($Utc.Kind -ne [DateTimeKind]::Utc) { throw "Format-AUDate needs a Utc date; got Kind $($Utc.Kind)." }
     return $Utc.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
 }#endfunction
+
+# Mapping rules (D3, D38, D41, D45). The rule IDs a D47 candidate step records; no file may define them.
+$script:AUReservedRuleIds = @('ps-resolve-path', 'ps-resolve-msi', 'ps-resolve-publisher', 'ps-resolve-product', 'ps-resolve-version', 'ps-resolve-arch', 'ps-resolve-scope')
+$script:AUMaxCustomerMappingsBytes = 1048576
+$script:AULocationClasses = @('Windows', 'ProgramFiles', 'UserProfile', 'Temp', 'Download', 'ManagementCache', 'Other')
+$script:AURuleRoles = @('Windows', 'Installer', 'Helper', 'Service', 'CLI')
+
+function ConvertTo-AUVersion
+{
+    <#
+.SYNOPSIS
+    Converts a dotted numeric version of one to four parts to a [version] padded with zeros.
+.DESCRIPTION
+    Returns $null when the text isn't one to four dot-separated numbers that each fit an Int32.
+.PARAMETER Text
+    The version text, for example 24.08 or 1.2.3.4.
+#>
+    param (
+        [string]$Text
+    )
+
+    if ($null -eq $Text -or $Text -notmatch '^\d+(\.\d+){0,3}$') { return $null }
+    $Parts = New-Object 'int[]' 4
+    $Pieces = $Text.Split('.')
+    for ($i = 0; $i -lt $Pieces.Count; $i++)
+    {
+        $Part = 0
+        if (-not [int]::TryParse($Pieces[$i], [ref]$Part)) { return $null }
+        $Parts[$i] = $Part
+    }
+    return New-Object version($Parts[0], $Parts[1], $Parts[2], $Parts[3])
+}#endfunction
+
+function Test-AUMappings
+{
+    <#
+.SYNOPSIS
+    Validates parsed mapping rules and returns one error string per problem (none when valid).
+.DESCRIPTION
+    Kind PowerStacks needs a powerStacks section (with a version) and no customer section; Kind
+    Customer needs a customer section and no powerStacks section; Kind Merged needs both. Each
+    section holds identityRules (identity, ownership, arpCompare) and classificationRules
+    (classification, ignore). Customer rule IDs start with c-, PowerStacks rule IDs with ps-, and
+    ps-resolve-* IDs are reserved (F11). IDs are unique across the sections, ignoring case. Unknown
+    keys are rejected, so a misspelled condition can't silently widen a rule. Patterns must be valid
+    -like wildcards. It never throws.
+.PARAMETER Mappings
+    The object ConvertFrom-Json returned for the file (or the Merged object from Get-AUMappings).
+.PARAMETER Kind
+    PowerStacks, Customer, or Merged.
+#>
+    param (
+        [object]$Mappings,
+        [ValidateSet('PowerStacks', 'Customer', 'Merged')][string]$Kind
+    )
+
+    $Errors = New-Object 'System.Collections.Generic.List[string]'
+    try
+    {
+        if ($Mappings -isnot [System.Management.Automation.PSCustomObject])
+        {
+            $Errors.Add('The mappings are not a JSON object.')
+            return , $Errors.ToArray()
+        }
+
+        $Top = @{}
+        foreach ($Property in $Mappings.PSObject.Properties) { $Top[$Property.Name] = $Property.Value }
+        foreach ($Name in $Top.Keys)
+        {
+            if ($Name -notin @('schemaVersion', 'powerStacks', 'customer')) { $Errors.Add("Unknown top-level key '$Name'.") }
+        }
+        $Version = $Top['schemaVersion']
+        if (-not (($Version -is [int] -or $Version -is [long]) -and $Version -eq 1)) { $Errors.Add("schemaVersion must be 1; got '$Version'.") }
+
+        $Sections = @()
+        if ($Kind -in @('PowerStacks', 'Merged')) { $Sections += , @('powerStacks', 'ps-') }
+        if ($Kind -in @('Customer', 'Merged')) { $Sections += , @('customer', 'c-') }
+        if ($Kind -eq 'PowerStacks' -and $Top.ContainsKey('customer')) { $Errors.Add("A PowerStacks file can't have a 'customer' section.") }
+        if ($Kind -eq 'Customer' -and $Top.ContainsKey('powerStacks')) { $Errors.Add("A customer file can't have a 'powerStacks' section; put your rules in 'customer'.") }
+
+        $SeenIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $IdentityTypes = @('identity', 'ownership', 'arpCompare')
+        $ClassificationTypes = @('classification', 'ignore')
+        $ClassificationKeys = @('locationClass', 'companyName', 'fileDescription', 'exeName')
+
+        foreach ($Section in $Sections)
+        {
+            $SectionName = $Section[0]
+            $Prefix = $Section[1]
+            $Body = $Top[$SectionName]
+            if ($Body -isnot [System.Management.Automation.PSCustomObject])
+            {
+                $Errors.Add("The '$SectionName' section is missing or isn't an object.")
+                continue
+            }
+            $AllowedSectionKeys = @('identityRules', 'classificationRules')
+            if ($SectionName -eq 'powerStacks')
+            {
+                $AllowedSectionKeys += 'version'
+                $RulesVersion = $Body.PSObject.Properties['version']
+                if ($Kind -eq 'PowerStacks' -and ($null -eq $RulesVersion -or $RulesVersion.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($RulesVersion.Value)))
+                {
+                    $Errors.Add("powerStacks.version must be a non-empty string.")
+                }
+            }
+            foreach ($Property in $Body.PSObject.Properties)
+            {
+                if ($Property.Name -notin $AllowedSectionKeys) { $Errors.Add("Unknown key '$($Property.Name)' in the '$SectionName' section.") }
+            }
+
+            foreach ($Family in @('identityRules', 'classificationRules'))
+            {
+                $ListProperty = $Body.PSObject.Properties[$Family]
+                if ($null -eq $ListProperty) { continue }
+                if ($ListProperty.Value -isnot [array])
+                {
+                    $Errors.Add("$SectionName.$Family must be an array.")
+                    continue
+                }
+                $FamilyTypes = if ($Family -eq 'identityRules') { $IdentityTypes } else { $ClassificationTypes }
+                $OtherFamily = if ($Family -eq 'identityRules') { 'classificationRules' } else { 'identityRules' }
+                $Index = -1
+                foreach ($Rule in $ListProperty.Value)
+                {
+                    $Index++
+                    $Where = "$SectionName.$Family[$Index]"
+                    if ($Rule -isnot [System.Management.Automation.PSCustomObject])
+                    {
+                        $Errors.Add("${Where}: a rule must be a JSON object.")
+                        continue
+                    }
+                    $R = @{}
+                    foreach ($Property in $Rule.PSObject.Properties) { $R[$Property.Name] = $Property.Value }
+
+                    # The rule ID: present, prefixed for its file, not reserved, unique.
+                    $Id = $R['id']
+                    if ($Id -isnot [string] -or [string]::IsNullOrWhiteSpace($Id))
+                    {
+                        $Errors.Add("${Where}: rule has no id.")
+                    }
+                    else
+                    {
+                        $Where = "Rule '$Id'"
+                        if ($Id -like 'ps-resolve-*') { $Errors.Add("${Where}: IDs starting ps-resolve- are reserved.") }
+                        elseif (-not $Id.StartsWith($Prefix, [StringComparison]::Ordinal)) { $Errors.Add("${Where}: IDs in the '$SectionName' section must start with '$Prefix'.") }
+                        elseif ($Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { $Errors.Add("${Where}: an ID may use only letters, digits, '.', '_', and '-'.") }
+                        if (-not $SeenIds.Add($Id)) { $Errors.Add("${Where}: duplicate rule ID '$Id'.") }
+                    }
+
+                    # The rule type, in its own family (D24).
+                    $Type = $R['type']
+                    if ($Type -isnot [string] -or $Type -cnotin ($IdentityTypes + $ClassificationTypes))
+                    {
+                        $Errors.Add("${Where}: unknown type '$Type'; use identity, ownership, arpCompare, classification, or ignore.")
+                        continue
+                    }
+                    if ($Type -cnotin $FamilyTypes)
+                    {
+                        $Errors.Add("${Where}: a '$Type' rule belongs in $OtherFamily, not $Family.")
+                        continue
+                    }
+
+                    $Allowed = @('id', 'type', 'description')
+                    switch -CaseSensitive ($Type)
+                    {
+                        'identity' { $Allowed += @('when', 'target') }
+                        'ownership' { $Allowed += 'source' }
+                        'classification' { $Allowed += @('when', 'role') }
+                        'ignore' { $Allowed += 'when' }
+                    }
+                    foreach ($Name in $R.Keys)
+                    {
+                        if ($Name -notin $Allowed) { $Errors.Add("${Where}: '$Name' isn't a field of a '$Type' rule.") }
+                    }
+                    if ($R.ContainsKey('description') -and $R['description'] -isnot [string]) { $Errors.Add("${Where}: description must be a string.") }
+
+                    # Checks one object of string patterns: required keys, optional keys, no others.
+                    $CheckPatterns = {
+                        param ($Object, [string]$Label, [string[]]$Required, [string[]]$Optional, [string[]]$MayBeEmpty)
+                        if ($Object -isnot [System.Management.Automation.PSCustomObject])
+                        {
+                            $Errors.Add("${Where}: '$Label' must be an object.")
+                            return
+                        }
+                        $Present = @{}
+                        foreach ($Property in $Object.PSObject.Properties) { $Present[$Property.Name] = $Property.Value }
+                        foreach ($Name in $Present.Keys)
+                        {
+                            if ($Name -notin ($Required + $Optional)) { $Errors.Add("${Where}: '$Label' has an unknown key '$Name'.") }
+                        }
+                        foreach ($Name in $Required)
+                        {
+                            if (-not $Present.ContainsKey($Name)) { $Errors.Add("${Where}: '$Label' needs '$Name'.") }
+                        }
+                        foreach ($Name in $Present.Keys)
+                        {
+                            if ($Name -notin ($Required + $Optional)) { continue }
+                            $Value = $Present[$Name]
+                            if ($Value -isnot [string]) { $Errors.Add("${Where}: '$Label.$Name' must be a string."); continue }
+                            if ($Value -eq '')
+                            {
+                                if ($Name -notin $MayBeEmpty) { $Errors.Add("${Where}: '$Label.$Name' can't be empty.") }
+                                continue
+                            }
+                            if ($Name -in @('versionMin', 'versionMax'))
+                            {
+                                if ($null -eq (ConvertTo-AUVersion $Value)) { $Errors.Add("${Where}: '$Label.$Name' must be a version such as 2.1 or 2.1.0.5; got '$Value'.") }
+                                continue
+                            }
+                            if ($Name -eq 'locationClass')
+                            {
+                                if ($Value -notin $script:AULocationClasses) { $Errors.Add("${Where}: '$Label.locationClass' must be one of $($script:AULocationClasses -join ', '); got '$Value'.") }
+                                continue
+                            }
+                            try { [void]([System.Management.Automation.WildcardPattern]::new($Value, 'IgnoreCase').IsMatch('')) }
+                            catch { $Errors.Add("${Where}: '$Label.$Name' isn't a valid wildcard pattern: '$Value'.") }
+                        }
+                    }
+
+                    switch -CaseSensitive ($Type)
+                    {
+                        'identity'
+                        {
+                            & $CheckPatterns $R['when'] 'when' @('exeName', 'publisher') @('productName', 'fileDescription', 'versionMin', 'versionMax') @('publisher')
+                            & $CheckPatterns $R['target'] 'target' @('displayName', 'publisher') @() @('publisher')
+                            $When = $R['when']
+                            if ($When -is [System.Management.Automation.PSCustomObject])
+                            {
+                                $Min = ConvertTo-AUVersion ([string]$When.PSObject.Properties['versionMin'].Value)
+                                $Max = ConvertTo-AUVersion ([string]$When.PSObject.Properties['versionMax'].Value)
+                                if ($Min -and $Max -and $Min -gt $Max) { $Errors.Add("${Where}: when.versionMin is above when.versionMax.") }
+                            }
+                        }
+                        'ownership'
+                        {
+                            if ($R['source'] -cnotin @('msi', 'store')) { $Errors.Add("${Where}: source must be msi or store; got '$($R['source'])'.") }
+                        }
+                        { $_ -in @('classification', 'ignore') }
+                        {
+                            $When = $R['when']
+                            & $CheckPatterns $When 'when' @() $ClassificationKeys @()
+                            if ($When -is [System.Management.Automation.PSCustomObject] -and @($When.PSObject.Properties).Count -eq 0)
+                            {
+                                $Errors.Add("${Where}: 'when' needs at least one of $($ClassificationKeys -join ', ').")
+                            }
+                        }
+                        'classification'
+                        {
+                            if ($R['role'] -isnot [string] -or $R['role'] -notin $script:AURuleRoles) { $Errors.Add("${Where}: role must be one of $($script:AURuleRoles -join ', '); got '$($R['role'])'.") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    catch
+    {
+        $Errors.Add("The mappings couldn't be checked: $($_.Exception.Message)")
+    }
+    return , $Errors.ToArray()
+}#endfunction
+
+function Read-AUCustomerMappingsFile
+{
+    <#
+.SYNOPSIS
+    Reads and parses the customer mappings file once, with a bounded read, without validating it.
+.DESCRIPTION
+    Returns State (Absent, TooLarge, Invalid, or Parsed), Data (the parsed JSON when Parsed), Hash
+    (SHA-256 hex of the bytes read, when no more than the limit), and Errors. The file is opened
+    read-only and read through one FileStream of at most the limit plus one byte, so the hash and
+    the parse use exactly the same bytes (F59). No owner or permission check (D45). It never throws.
+.PARAMETER Path
+    The customer mappings file path.
+#>
+    param (
+        [string]$Path
+    )
+
+    $Result = [pscustomobject]@{ State = 'Absent'; Data = $null; Hash = ''; Errors = @() }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Result }
+    try
+    {
+        if (-not [IO.File]::Exists($Path)) { return $Result }
+        $Limit = $script:AUMaxCustomerMappingsBytes
+        $Buffer = New-Object 'byte[]' ($Limit + 1)
+        $Count = 0
+        $Stream = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try
+        {
+            while ($Count -lt $Buffer.Length)
+            {
+                $Read = $Stream.Read($Buffer, $Count, $Buffer.Length - $Count)
+                if ($Read -le 0) { break }
+                $Count += $Read
+            }
+        }
+        finally { $Stream.Dispose() }
+
+        if ($Count -gt $Limit)
+        {
+            $Result.State = 'TooLarge'
+            $Result.Errors = @("The customer mappings file is larger than $Limit bytes, so it's ignored: $Path")
+            return $Result
+        }
+
+        $Sha = [Security.Cryptography.SHA256]::Create()
+        try { $Digest = $Sha.ComputeHash($Buffer, 0, $Count) }
+        finally { $Sha.Dispose() }
+        $Result.Hash = ([BitConverter]::ToString($Digest)).Replace('-', '')
+
+        # UTF-8 (with or without a BOM) or UTF-16 with a BOM, which Windows PowerShell's Out-File writes.
+        if ($Count -ge 2 -and $Buffer[0] -eq 0xFF -and $Buffer[1] -eq 0xFE) { $Text = (New-Object Text.UnicodeEncoding($false, $true, $true)).GetString($Buffer, 2, $Count - 2) }
+        elseif ($Count -ge 2 -and $Buffer[0] -eq 0xFE -and $Buffer[1] -eq 0xFF) { $Text = (New-Object Text.UnicodeEncoding($true, $true, $true)).GetString($Buffer, 2, $Count - 2) }
+        else
+        {
+            $Skip = 0
+            if ($Count -ge 3 -and $Buffer[0] -eq 0xEF -and $Buffer[1] -eq 0xBB -and $Buffer[2] -eq 0xBF) { $Skip = 3 }
+            $Text = (New-Object Text.UTF8Encoding($false, $true)).GetString($Buffer, $Skip, $Count - $Skip)
+        }
+        $Result.Data = $Text | ConvertFrom-Json -ErrorAction Stop
+        $Result.State = 'Parsed'
+    }
+    catch
+    {
+        $Result.State = 'Invalid'
+        $Result.Data = $null
+        $Result.Errors = @("The customer mappings file couldn't be read as JSON: $($_.Exception.Message)")
+    }
+    return $Result
+}#endfunction
+
+function Get-AUMappings
+{
+    <#
+.SYNOPSIS
+    Loads and validates our rules and the customer's rules, and returns one mappings object (F18).
+.DESCRIPTION
+    Our rules come from the embedded text (Base64 of GZip-compressed JSON) or, only when nothing is
+    embedded, from powerstacks-mappings.json in BesideDir (D41). The customer's rules come only from
+    CustomerPath, used when the file is at most 1 MB and valid, whoever owns it (D45); it's read as
+    data, never run, and never written. Returns Source (Embedded, Beside, None), CustomerSource
+    (File, Absent, Invalid, TooLarge), Mappings (schemaVersion, powerStacks, customer; a section
+    that isn't used has empty rule arrays), Errors, PowerStacksVersion, CustomerHash (SHA-256 hex,
+    blank unless CustomerSource is File), and RuleIds (every rule ID in use plus the reserved
+    ps-resolve-* IDs, case-insensitive). It never throws.
+.PARAMETER Embedded
+    The embedded PowerStacks rules, or empty.
+.PARAMETER BesideDir
+    The folder to look in for powerstacks-mappings.json when nothing is embedded.
+.PARAMETER CustomerPath
+    The customer mappings file path.
+#>
+    param (
+        [string]$Embedded,
+        [string]$BesideDir,
+        [string]$CustomerPath
+    )
+
+    $Errors = New-Object 'System.Collections.Generic.List[string]'
+    $RuleIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($Id in $script:AUReservedRuleIds) { [void]$RuleIds.Add($Id) }
+    $Source = 'None'
+    $CustomerSource = 'Absent'
+    $CustomerHash = ''
+    $Ours = [pscustomobject]@{ version = ''; identityRules = @(); classificationRules = @() }
+    $Theirs = [pscustomobject]@{ identityRules = @(); classificationRules = @() }
+
+    try
+    {
+        # Our rules.
+        $OursText = $null
+        try
+        {
+            if (-not [string]::IsNullOrWhiteSpace($Embedded))
+            {
+                $Source = 'Embedded'
+                $Compressed = New-Object IO.MemoryStream(, [Convert]::FromBase64String($Embedded.Trim()))
+                $Zip = New-Object IO.Compression.GZipStream($Compressed, [IO.Compression.CompressionMode]::Decompress)
+                $Reader = New-Object IO.StreamReader($Zip, (New-Object Text.UTF8Encoding($false, $true)))
+                try { $OursText = $Reader.ReadToEnd() }
+                finally { $Reader.Dispose() }
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($BesideDir))
+            {
+                $BesidePath = Join-Path $BesideDir 'powerstacks-mappings.json'
+                if ([IO.File]::Exists($BesidePath))
+                {
+                    $Source = 'Beside'
+                    $OursText = [IO.File]::ReadAllText($BesidePath, (New-Object Text.UTF8Encoding($false, $true)))
+                }
+            }
+            if ($Source -ne 'None')
+            {
+                $Parsed = $OursText | ConvertFrom-Json -ErrorAction Stop
+                $Problems = Test-AUMappings $Parsed -Kind PowerStacks
+                if ($Problems.Count -gt 0)
+                {
+                    foreach ($Problem in $Problems) { $Errors.Add("PowerStacks mappings ($Source): $Problem") }
+                }
+                else
+                {
+                    $Ours = [pscustomobject]@{
+                        version             = $Parsed.powerStacks.version
+                        identityRules       = @($Parsed.powerStacks.identityRules | Where-Object { $null -ne $_ })
+                        classificationRules = @($Parsed.powerStacks.classificationRules | Where-Object { $null -ne $_ })
+                    }
+                }
+            }
+        }
+        catch
+        {
+            $Errors.Add("PowerStacks mappings ($Source) couldn't be read: $($_.Exception.Message)")
+        }
+
+        # The customer's rules: all or nothing.
+        $File = Read-AUCustomerMappingsFile -Path $CustomerPath
+        foreach ($Problem in $File.Errors) { $Errors.Add($Problem) }
+        switch ($File.State)
+        {
+            'Absent' { $CustomerSource = 'Absent' }
+            'TooLarge' { $CustomerSource = 'TooLarge' }
+            'Invalid' { $CustomerSource = 'Invalid' }
+            'Parsed'
+            {
+                $Problems = Test-AUMappings $File.Data -Kind Customer
+                if ($Problems.Count -gt 0)
+                {
+                    $CustomerSource = 'Invalid'
+                    foreach ($Problem in $Problems) { $Errors.Add("Customer mappings: $Problem") }
+                }
+                else
+                {
+                    $CustomerSource = 'File'
+                    $CustomerHash = $File.Hash
+                    $Theirs = [pscustomobject]@{
+                        identityRules       = @($File.Data.customer.identityRules | Where-Object { $null -ne $_ })
+                        classificationRules = @($File.Data.customer.classificationRules | Where-Object { $null -ne $_ })
+                    }
+                }
+            }
+        }
+
+        foreach ($Rule in @($Ours.identityRules) + @($Ours.classificationRules) + @($Theirs.identityRules) + @($Theirs.classificationRules))
+        {
+            [void]$RuleIds.Add($Rule.id)
+        }
+    }
+    catch
+    {
+        $Errors.Add("Mappings couldn't be loaded: $($_.Exception.Message)")
+    }
+
+    Write-CMTraceLog -Message "App Usage mappings: ours $Source $($Ours.version), customer $CustomerSource, $($Errors.Count) errors." -Component 'AppUsage'
+    foreach ($Problem in $Errors) { Write-CMTraceLog -Message "App Usage mappings: $Problem" -Component 'AppUsage' -Type 2 }
+
+    return [pscustomobject]@{
+        Source             = $Source
+        CustomerSource     = $CustomerSource
+        Mappings           = [pscustomobject]@{ schemaVersion = 1; powerStacks = $Ours; customer = $Theirs }
+        Errors             = $Errors.ToArray()
+        PowerStacksVersion = [string]$Ours.version
+        CustomerHash       = $CustomerHash
+        RuleIds            = $RuleIds
+    }
+}#endfunction
 #endregion APPUSAGE
 
 #region script

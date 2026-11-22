@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "powerStacks": {
+    "version": "2026.11.23.1",
+    "identityRules": [
+      { "id": "ps-arp-compare", "type": "arpCompare" }
+    ],
+    "classificationRules": []
+  }
+}
