@@ -1923,6 +1923,60 @@ function Start-PowerShellSysNative
 #region APPUSAGE
 # App Usage (software metering). Function definitions and $script: constants only, so tests can load
 # this region without running the inventory. Keep this region ASCII.
+
+function Get-AUUserType
+{
+    <#
+.SYNOPSIS
+    Classifies a user SID as CloudOnly, Domain, Local, System, Service, or Unknown.
+.DESCRIPTION
+    S-1-12-1-* is an Entra ID (CloudOnly) account. An S-1-5-21-* SID whose domain portion (every
+    part but the final RID) equals the machine account-domain SID is Local; any other S-1-5-21-*
+    SID is Domain. The domain portion is compared whole, never as a string prefix.
+.PARAMETER Sid
+    The user SID in S-1-... string form.
+.PARAMETER MachineDomainSid
+    The local machine account-domain SID (S-1-5-21-x-y-z).
+#>
+    param (
+        [string]$Sid,
+        [string]$MachineDomainSid
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Sid)) { return 'Unknown' }
+    $Value = $Sid.Trim().ToUpperInvariant()
+    if ($Value -notmatch '^S-1-\d+(-\d+)+$') { return 'Unknown' }
+
+    if ($Value -eq 'S-1-5-18') { return 'System' }
+    if ($Value -match '^S-1-12-1-') { return 'CloudOnly' }
+    if ($Value -match '^S-1-5-21-')
+    {
+        $DomainPortion = $Value.Substring(0, $Value.LastIndexOf('-'))
+        $MachineDomain = ''
+        if ($MachineDomainSid) { $MachineDomain = $MachineDomainSid.Trim().ToUpperInvariant() }
+        if ($DomainPortion -eq $MachineDomain) { return 'Local' }
+        return 'Domain'
+    }
+    # LocalService, NetworkService, and the service, IIS app pool, virtual machine, Window Manager,
+    # and font driver host account SIDs.
+    if ($Value -match '^S-1-5-(19|20)$' -or $Value -match '^S-1-5-(80|82|83|90|96)-') { return 'Service' }
+    return 'Unknown'
+}#endfunction
+
+function Test-AUInteractiveUserType
+{
+    <#
+.SYNOPSIS
+    Returns true only for the interactive user types CloudOnly, Domain, and Local.
+.PARAMETER UserType
+    A value returned by Get-AUUserType.
+#>
+    param (
+        [string]$UserType
+    )
+
+    return ($UserType -in @('CloudOnly', 'Domain', 'Local'))
+}#endfunction
 #endregion APPUSAGE
 
 #region script

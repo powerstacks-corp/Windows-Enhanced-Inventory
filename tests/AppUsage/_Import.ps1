@@ -6,4 +6,9 @@ $AUScriptText = [IO.File]::ReadAllText((Resolve-Path $AUScriptPath).Path, [Text.
 $AURegionMatch = [regex]::Match($AUScriptText, '(?ms)^#region APPUSAGE\r?\n(.*?)^#endregion APPUSAGE')
 if (-not $AURegionMatch.Success) { throw "APPUSAGE region not found in $AUScriptPath" }
 $AURegionText = $AURegionMatch.Groups[1].Value
+# Region functions log with Write-CMTraceLog, which lives outside the region. Stand in a silent
+# no-op that accepts any arguments, unless a test has already defined one.
+if (-not (Get-Command Write-CMTraceLog -ErrorAction SilentlyContinue)) {
+    function Write-CMTraceLog { }
+}
 . ([scriptblock]::Create($AURegionText))
