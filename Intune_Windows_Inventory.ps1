@@ -262,7 +262,7 @@ function Write-CMTraceLog
       Log message text.
 
     .PARAMETER Path
-      Log file path. Defaults to $script:logPath.
+      Log file path. Defaults to $script:CMLog.
 
     .PARAMETER Component
       Component name displayed in CMTrace.
@@ -335,7 +335,7 @@ function Write-CMTraceLog
     {
         if ([string]::IsNullOrWhiteSpace($Path))
         {
-            throw "Log path is empty. `$logPath must be set before logging."
+            throw "Log path is empty. `$CMLog must be set before logging."
         }
 
         $dir = Split-Path -Path $Path -Parent
@@ -2395,8 +2395,6 @@ if ($CollectDeviceInventory)
                     $null
                 }
             }
-
-            $Warranty | Format-List
 
         }
     }
