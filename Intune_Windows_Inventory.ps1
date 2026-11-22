@@ -6930,8 +6930,9 @@ function Read-AUSrum
 # Get-InstalledApplications, mounts and removes that drive.
 $script:AURegPath = [IO.Path]::Combine($env:SystemRoot, 'System32\reg.exe')
 $script:AUSystemSid = 'S-1-5-18'
-# LocalService and NetworkService: their hives are read, so their scope is Read, but their per-user
-# installs aren't anyone's profile and never become app entries. SYSTEM's own per-user installs do.
+# LocalService and NetworkService: their per-user installs are discovered with their own SID as
+# Scope (install status needs them), but they aren't anyone's profile, so ConvertTo-AUInventoryApps
+# leaves them out of the inventory. SYSTEM's own per-user installs are in it.
 $script:AUExcludedProfileSids = @('S-1-5-19', 'S-1-5-20')
 # The two Uninstall views, written as version 19's Get-InstalledApplications writes them, so RegPath
 # matches its AppUninstallRegPath exactly (F31).
@@ -7540,8 +7541,7 @@ function Read-AUStoreApps
     A package counts when a user has it in the Installed state, as in version 19's
     Get-AppxInstalledApplications; it gets one entry per such user, with that user's SID as Scope
     (S-1-5-18 is machine scope). DisplayName is the package name and DisplayVersion its version, as in
-    version 19; PackageFamily, InstallLocation, and Architecture come from the package. Installs for
-    LocalService and NetworkService don't count, so a package installed only for them has no entry.
+    version 19; PackageFamily, InstallLocation, and Architecture come from the package.
 .PARAMETER Users
     The Get-AUUsers entries, for ProfilePath.
 .PARAMETER Into
@@ -7577,10 +7577,6 @@ function Read-AUStoreApps
                 if ($Sid -and -not $Sids.Contains($Sid)) { $Sids.Add($Sid) }
             }
             if (-not $AnyInstalled) { continue }
-            # A package installed only for LocalService or NetworkService isn't anyone's app.
-            $HadSid = ($Sids.Count -gt 0)
-            foreach ($Excluded in $script:AUExcludedProfileSids) { [void]$Sids.Remove($Excluded) }
-            if ($HadSid -and $Sids.Count -eq 0) { continue }
             $Publisher = $null
             try { $Publisher = Get-AUAppxPublisher -PackageFullName ([string]$Package.PackageFullName) }
             catch { Write-CMTraceLog -Message "App Usage: couldn't read the manifest of $($Package.PackageFullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
@@ -7633,14 +7629,16 @@ function Get-AUInstalledApps
     user's native key, HKLM Wow6432Node, each user's Wow6432Node key, then Store packages), so
     ConvertTo-AUInventoryApps gives version 19's result for the same data.
     ScopeRead (Task 7's shape) holds Machine and every user's SID, each Read or Unread. Machine is Read
-    when both HKLM views and SYSTEM's hive were read; S-1-5-18 always has Machine's state, because
-    SYSTEM's entries are machine scope. A user is Read when both views of their hive were read; a user
-    who is CopyFailed or Missing, or whose copy won't load (ProfileState becomes CopyFailed), is
-    Unread. When -IncludeStore is set and the packages can't be read, every user SID is Unread, since a
-    Store app could be missing from any of them. A Machine that isn't Read, or a Loaded user who isn't,
-    means the list is worse than version 19's read, and the caller falls back to it (D20, D36).
-    Per-user installs of LocalService and NetworkService (S-1-5-19, S-1-5-20) are read for their
-    scope state but never become entries, ARP or Store; SYSTEM's own per-user installs do.
+    when both HKLM views and SYSTEM's hive (S-1-5-18 among the users) were read, so with no SYSTEM
+    user, Machine stays Unread. S-1-5-18 takes Machine's state, because SYSTEM's entries are machine
+    scope. A user is Read when both views of their hive were read; a user who is CopyFailed or
+    Missing, or whose copy won't load (ProfileState becomes CopyFailed), is Unread. When -IncludeStore
+    is set and the packages can't be read, every user SID, S-1-5-18 included, is Unread while Machine
+    keeps its state, since a Store app could be missing from any of them. A Machine that isn't Read,
+    or a Loaded user who isn't, means the list is worse than version 19's read, and the caller falls
+    back to it (D20, D36). Per-user installs of LocalService and NetworkService (S-1-5-19, S-1-5-20)
+    are in Apps with their SID as Scope, ARP and Store alike; ConvertTo-AUInventoryApps leaves them
+    out of the inventory.
     ProfilesFound is the number of users given; ProfilesRead, how many are Read. Never throws.
 .PARAMETER Users
     The Get-AUUsers entries. A failed hive load changes the entry's ProfileState.
@@ -7680,15 +7678,11 @@ function Get-AUInstalledApps
         catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine's apps: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         finally { if ($null -ne $Machine) { $Machine.Close() } }
 
-        $SystemRead = $true
+        # Only an actual read of SYSTEM's hive counts (ruling 4).
+        $SystemRead = $false
         foreach ($User in $UserList)
         {
-            if ($script:AUExcludedProfileSids -contains [string]$User.Sid)
-            {
-                # Read for the scope state; the entries are dropped.
-                $UserRead = Read-AUUserApps -User $User -Snapshot $Snapshot -Native (New-Object 'System.Collections.Generic.List[object]') -Wow (New-Object 'System.Collections.Generic.List[object]')
-            }
-            else { $UserRead = Read-AUUserApps -User $User -Snapshot $Snapshot -Native $Native -Wow $Wow }
+            $UserRead = Read-AUUserApps -User $User -Snapshot $Snapshot -Native $Native -Wow $Wow
             if ([string]$User.Sid -eq $script:AUSystemSid) { $SystemRead = $UserRead }
             elseif ($UserRead) { $ScopeRead[[string]$User.Sid] = 'Read' }
         }
@@ -7732,7 +7726,9 @@ function ConvertTo-AUInventoryApps
     UninstallString, InstallDate, PSPath from RegPath, AppType), in version 19's order: ARP entries
     sorted by DisplayName, then Store packages sorted and made unique by DisplayName and
     DisplayVersion. Then ConvertTo-AUAppArray, the inventory's own de-duplication, builds the entries.
-    For HKLM and the signed-in user's data this gives exactly version 19's result (F31).
+    For HKLM and the signed-in user's data this gives exactly version 19's result (F31). Entries
+    whose Scope is LocalService or NetworkService (S-1-5-19, S-1-5-20) are left out: those accounts
+    aren't anyone's profile.
 .PARAMETER Apps
     The Get-AUInstalledApps Apps.
 #>
@@ -7744,7 +7740,7 @@ function ConvertTo-AUInventoryApps
     $Store = New-Object 'System.Collections.Generic.List[object]'
     foreach ($App in @($Apps))
     {
-        if ($null -eq $App) { continue }
+        if ($null -eq $App -or $script:AUExcludedProfileSids -contains ([string]$App.Scope).Trim()) { continue }
         if ($App.AppType -eq 'UWP')
         {
             $Store.Add([pscustomobject]@{

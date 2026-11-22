@@ -333,10 +333,24 @@ Describe 'Get-AUInstalledApps' -Skip:(-not $script:IsAdmin) {
             $Gamma.PSObject.Properties.Name | Should -Contain $Field
         }
         @($Apps | Where-Object { $_.RegPath -match '\\(NoName|EmptyName)$' -or -not $_.DisplayName }).Count | Should -Be 0
-        $Result.ScopeRead['Machine'] | Should -Be 'Read'
+        # No SYSTEM user, so SYSTEM's hive wasn't read and Machine can't be Read (ruling 4).
+        $Result.ScopeRead['Machine'] | Should -Be 'Unread'
+        $Result.ScopeRead['S-1-5-18'] | Should -Be 'Unread'
         $Result.ScopeRead[$script:LoadedSid] | Should -Be 'Read'
         $Result.ProfilesFound | Should -Be 1
         $Result.ProfilesRead | Should -Be 1
+    }
+
+    It 'marks Machine Read only when SYSTEM''s hive was read too' {
+        $System = New-TestUser 'S-1-5-18' 'Loaded' 'C:\Windows\system32\config\systemprofile' 'System'
+        $Result = Get-AUInstalledApps -Users @((New-TestUser $script:LoadedSid 'Loaded' $script:AlicePath), $System)
+        $Result.ScopeRead['Machine'] | Should -Be 'Read'
+        $Result.ScopeRead['S-1-5-18'] | Should -Be 'Read'
+        Mock Open-AURegistryBase -ParameterFilter { $Hive -eq 'Users' -and $Name -eq 'S-1-5-18' } { $null }
+        $Unread = Get-AUInstalledApps -Users @((New-TestUser $script:LoadedSid 'Loaded' $script:AlicePath), $System)
+        $Unread.ScopeRead['Machine'] | Should -Be 'Unread'
+        $Unread.ScopeRead['S-1-5-18'] | Should -Be 'Unread'
+        $Unread.ScopeRead[$script:LoadedSid] | Should -Be 'Read'
     }
 
     It 'reads a signed-out user from the hive copy: RegPath under HKEY_USERS\<SID>, a ProfilePath, and the mount unloaded (F13, F31, F34)' {
@@ -366,11 +380,12 @@ Describe 'Get-AUInstalledApps' -Skip:(-not $script:IsAdmin) {
 
     It 'gives CopyFailed and Unread when a hive copy will not load' {
         $Bob = New-TestUser $script:CopiedSid 'Copied' $script:BobPath
-        $Result = Get-AUInstalledApps -Users @($Bob) -Snapshot (New-TestSnapshot @{ $script:CopiedSid = $script:BadCopy })
+        $System = New-TestUser 'S-1-5-18' 'Loaded' 'C:\Windows\system32\config\systemprofile' 'System'
+        $Result = Get-AUInstalledApps -Users @($Bob, $System) -Snapshot (New-TestSnapshot @{ $script:CopiedSid = $script:BadCopy })
         $Bob.ProfileState | Should -Be 'CopyFailed'
         $Result.ScopeRead[$script:CopiedSid] | Should -Be 'Unread'
         $Result.ScopeRead['Machine'] | Should -Be 'Read'
-        $Result.ProfilesRead | Should -Be 0
+        $Result.ProfilesRead | Should -Be 1
         @($Result.Apps | Where-Object Scope -eq $script:CopiedSid).Count | Should -Be 0
         Test-AUHiveLoaded -Sid (Get-AUHiveMountName $script:CopiedSid) | Should -BeFalse
     }
@@ -445,7 +460,7 @@ Describe 'Get-AUInstalledApps without reading hives' {
         $Result.ProfilesRead | Should -Be 0
     }
 
-    It 'keeps SYSTEM''s per-user installs but not LocalService''s or NetworkService''s, whose scopes are still read' {
+    It 'discovers LocalService''s and NetworkService''s per-user installs in their own scope but keeps them out of the inventory; SYSTEM''s stay in' {
         $Users = @(
             (New-TestUser 'S-1-5-18' 'Loaded' 'C:\Windows\system32\config\systemprofile' 'System')
             (New-TestUser 'S-1-5-19' 'Loaded' 'C:\Windows\ServiceProfiles\LocalService' 'Service')
@@ -453,9 +468,14 @@ Describe 'Get-AUInstalledApps without reading hives' {
         )
         $Result = Get-AUInstalledApps -Users $Users
         @(Get-TestApp $Result.Apps 'Contoso System Tool').Count | Should -Be 1
-        @(Get-TestApp $Result.Apps 'Contoso LocalService Tool').Count | Should -Be 0
-        @(Get-TestApp $Result.Apps 'Contoso NetworkService Tool').Count | Should -Be 0
-        @($Result.Apps | Where-Object { $_.Scope -in @('S-1-5-19', 'S-1-5-20') -or $_.RegPath -match 'S-1-5-(19|20)\\' }).Count | Should -Be 0
+        $LocalTool = @(Get-TestApp $Result.Apps 'Contoso LocalService Tool')
+        $LocalTool.Count | Should -Be 1
+        $LocalTool[0].Scope | Should -Be 'S-1-5-19'
+        $LocalTool[0].RegPath | Should -BeExactly "HKEY_USERS\S-1-5-19\$script:Uninstall\SvcTool"
+        $NetTool = @(Get-TestApp $Result.Apps 'Contoso NetworkService Tool')
+        $NetTool.Count | Should -Be 1
+        $NetTool[0].Scope | Should -Be 'S-1-5-20'
+        $NetTool[0].Architecture | Should -Be 32
         $Inventory = @(ConvertTo-AUInventoryApps -Apps $Result.Apps)
         @($Inventory | Where-Object { $_.AppName -in @('Contoso LocalService Tool', 'Contoso NetworkService Tool') }).Count | Should -Be 0
         @($Inventory | Where-Object AppName -eq 'Contoso System Tool').Count | Should -Be 1
@@ -464,6 +484,20 @@ Describe 'Get-AUInstalledApps without reading hives' {
         $Result.ProfilesFound | Should -Be 3
         $Result.ProfilesRead | Should -Be 3
         Should -Invoke Open-AURegistryBase -ParameterFilter { $Name -eq 'S-1-5-20' } -Times 1 -Exactly
+    }
+
+    It 'gives Installed, not a false NotInstalled, for a LocalService-run exe whose target is installed only in LocalService''s hive' {
+        $Users = @(
+            (New-TestUser 'S-1-5-18' 'Loaded' 'C:\Windows\system32\config\systemprofile' 'System')
+            (New-TestUser 'S-1-5-19' 'Loaded' 'C:\Windows\ServiceProfiles\LocalService' 'Service')
+        )
+        $Result = Get-AUInstalledApps -Users $Users
+        $Result.ScopeRead['Machine'] | Should -Be 'Read'
+        $Result.ScopeRead['S-1-5-19'] | Should -Be 'Read'
+        $Target = [pscustomobject]@{ MatchSection = 'PowerStacks'; MatchRuleId = 'ps-svc'; TargetPattern = 'Contoso LocalService Tool'; TargetPublisher = 'Contoso*'; ProductCode = $null; PackageFamily = $null }
+        Get-AUInstallStatus $Target $Result.Apps $Result.ScopeRead 'S-1-5-19' | Should -BeExactly 'Installed'
+        # Another user's per-user install still doesn't count, and an absent target in a read scope is NotInstalled.
+        Get-AUInstallStatus $Target $Result.Apps $Result.ScopeRead 'S-1-5-18' | Should -BeExactly 'NotInstalled'
     }
 
     It 'marks Machine Unread, and does not throw, when HKLM cannot be read' {
@@ -512,7 +546,7 @@ Describe 'Get-AUInstalledApps without reading hives' {
         It 'returns installed packages with -IncludeStore, one entry per user, and puts them in the inventory' {
             $Result = Get-AUInstalledApps -Users $script:StoreUsers -IncludeStore
             $Notes = @(Get-TestApp $Result.Apps 'Contoso.Notes')
-            $Notes.Count | Should -Be 2
+            $Notes.Count | Should -Be 3
             $Carol = $Notes | Where-Object Scope -eq 'S-1-5-21-9-9-9-1'
             $Carol.PackageFamily | Should -Be 'Contoso.Notes_abc'
             $Carol.DisplayVersion | Should -Be '5.0.1.0'
@@ -523,14 +557,26 @@ Describe 'Get-AUInstalledApps without reading hives' {
             $Carol.InstallLocation | Should -Be 'C:\Program Files\WindowsApps\Contoso.Notes_5.0.1.0_x64__abc'
             ($Notes | Where-Object Scope -eq 'Machine').ProfilePath | Should -BeNullOrEmpty
             @(Get-TestApp $Result.Apps 'Contoso.Staged').Count | Should -Be 0
-            # Installed for LocalService or NetworkService: not anyone's app.
-            @($Notes | Where-Object { $_.Scope -in @('S-1-5-19', 'S-1-5-20') }).Count | Should -Be 0
-            @(Get-TestApp $Result.Apps 'Contoso.ServiceOnly').Count | Should -Be 0
-            $Inventory = @(ConvertTo-AUInventoryApps -Apps $Result.Apps | Where-Object AppName -eq 'Contoso.Notes')
+            # Installed for LocalService or NetworkService: discovered in that scope, but not anyone's app.
+            @($Notes | Where-Object Scope -eq 'S-1-5-19').Count | Should -Be 1
+            $ServiceOnly = @(Get-TestApp $Result.Apps 'Contoso.ServiceOnly')
+            $ServiceOnly.Count | Should -Be 1
+            $ServiceOnly[0].Scope | Should -Be 'S-1-5-20'
+            $All = @(ConvertTo-AUInventoryApps -Apps $Result.Apps)
+            $Inventory = @($All | Where-Object AppName -eq 'Contoso.Notes')
             $Inventory.Count | Should -Be 1
             $Inventory[0].AppType | Should -Be 'UWP'
             $Inventory[0].AppPublisher | Should -Be 'Contoso Ltd'
             $Inventory[0].AppUninstallRegPath | Should -BeNullOrEmpty
+            @($All | Where-Object AppName -eq 'Contoso.ServiceOnly').Count | Should -Be 0
+        }
+
+        It 'gives Installed for a NetworkService-run package registered only for NetworkService' {
+            $Users = @((New-TestUser 'S-1-5-18' 'Loaded' 'C:\Windows\system32\config\systemprofile' 'System'), (New-TestUser 'S-1-5-20' 'Loaded' 'C:\Windows\ServiceProfiles\NetworkService' 'Service'))
+            $Result = Get-AUInstalledApps -Users $Users -IncludeStore
+            $Result.ScopeRead['S-1-5-20'] | Should -Be 'Read'
+            $Target = [pscustomobject]@{ MatchSection = 'PowerStacks'; MatchRuleId = 'ps-pkg'; TargetPattern = $null; TargetPublisher = $null; ProductCode = $null; PackageFamily = 'Contoso.ServiceOnly_abc' }
+            Get-AUInstallStatus $Target $Result.Apps $Result.ScopeRead 'S-1-5-20' | Should -BeExactly 'Installed'
         }
 
         It 'marks every user Unread when the packages cannot be read with -IncludeStore' {
