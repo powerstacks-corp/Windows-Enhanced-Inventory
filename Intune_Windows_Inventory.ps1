@@ -119,6 +119,9 @@
 
 Bugfix in HP warranty
 
+20 - unreleased
+- Added App Usage (software metering), off by default ($CollectAppMetering).
+
 ########### LEGAL DISCLAIMER ###########
     This script is provided "as is" without warranty of any kind, either express or implied.
     Use at your own risk. Test thoroughly before deploying in production environments.
@@ -206,6 +209,9 @@ $CollectWarranty = $false # Set to true to collect warranty data
 
 #Sub-Control under App Inventory
 $CollectUWPInventory = $false # Set to true to collect UWP (modern app) inventory.
+$CollectAppMetering = $false # Set to true to collect App Usage (software metering): which installed apps are used, from SRUM. Windows 11 25H2 and later. Store app usage follows $CollectUWPInventory.
+$MinFocusSecondsForUse = 1 # App Usage: seconds of focus that count as a use.
+$AppUsageCustomerMappingsPath = 'C:\ProgramData\PowerStacks\AppUsage\customer-mappings.json' # App Usage: your own mapping rules, if you deliver this file. Your rules win over ours.
 
 #Warranty keys
 $WarrantyDellClientID = "<ENTER YOUR DELL WARRANTY CLIENT ID HERE>"
@@ -1913,6 +1919,11 @@ function Start-PowerShellSysNative
     }
 }#endfunction
 #endregion functions
+
+#region APPUSAGE
+# App Usage (software metering). Function definitions and $script: constants only, so tests can load
+# this region without running the inventory. Keep this region ASCII.
+#endregion APPUSAGE
 
 #region script
 
