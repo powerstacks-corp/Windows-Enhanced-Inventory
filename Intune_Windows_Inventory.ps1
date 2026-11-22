@@ -2610,6 +2610,711 @@ function Get-AUMappings
         RuleIds            = $RuleIds
     }
 }#endfunction
+
+# Identity resolution and classification (D24, D30, D38, D47). The D47 steps in order; each step that
+# leaves one candidate records ps-resolve-<step> (reserved in $script:AUReservedRuleIds).
+$script:AUResolveSteps = @('path', 'msi', 'publisher', 'product', 'version', 'arch', 'scope')
+$script:AULegalSuffixes = @('inc', 'incorporated', 'corp', 'corporation', 'co', 'company', 'llc', 'llp', 'lp', 'ltd', 'limited', 'gmbh', 'ag', 'sa', 'sarl', 'srl', 'bv', 'nv', 'plc', 'pty', 'oy', 'ab', 'as', 'kk')
+$script:AUArchTokens = @('x64', 'x86', 'x86_64', 'amd64', 'arm64', '64-bit', '32-bit', '64bit', '32bit', 'win64', 'win32')
+# Normalized app names and publishers, so arpCompare doesn't repeat the work for every exe in a run.
+$script:AUNormalizedText = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+
+function Get-AULocationClass
+{
+    <#
+.SYNOPSIS
+    Classifies a run path as Windows, ProgramFiles, UserProfile, Temp, Download, ManagementCache, or Other.
+.DESCRIPTION
+    Checked in this order, so the more specific folder wins: ManagementCache (\Windows\IMECache\,
+    \Windows\ccmcache\, and the Intune Management Extension Content folder), Temp (a \Temp\ or
+    \SystemTemp\ folder), Download (a \Downloads\ folder), Windows (<drive>:\Windows\), ProgramFiles
+    (<drive>:\Program Files\ or Program Files (x86)\), UserProfile (<drive>:\Users\<name>\), then Other.
+    Case-insensitive. A blank path is Other.
+.PARAMETER Path
+    The executable's run path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'Other' }
+    $P = $Path.Trim().Replace('/', '\')
+    if ($P.StartsWith('\\?\')) { $P = $P.Substring(4) }
+    if ($P -match '\\Windows\\(IMECache|ccmcache)\\' -or $P -match '\\Microsoft Intune Management Extension\\Content\\') { return 'ManagementCache' }
+    if ($P -match '\\(Temp|SystemTemp)\\') { return 'Temp' }
+    if ($P -match '\\Downloads\\') { return 'Download' }
+    if ($P -match '^[A-Za-z]:\\Windows\\') { return 'Windows' }
+    if ($P -match '^[A-Za-z]:\\Program Files( \(x86\))?\\') { return 'ProgramFiles' }
+    if ($P -match '^[A-Za-z]:\\Users\\[^\\]+\\') { return 'UserProfile' }
+    return 'Other'
+}#endfunction
+
+function Test-AUTextPattern
+{
+    <#
+.SYNOPSIS
+    Tests one mapping pattern against a fact, treating an unknown ($null) fact as never matching.
+.DESCRIPTION
+    An empty pattern matches only a known, empty (or blank) value (F14). Any other pattern is a
+    case-insensitive -like wildcard against the trimmed value.
+.PARAMETER Value
+    The fact, or $null when it isn't known.
+.PARAMETER Pattern
+    The rule's pattern.
+#>
+    param (
+        [AllowNull()][object]$Value,
+        [AllowNull()][object]$Pattern
+    )
+
+    if ($null -eq $Value -or $null -eq $Pattern) { return $false }
+    # -like '' is true only for '', so an empty pattern needs no special case once the value is known.
+    return (([string]$Value).Trim() -like [string]$Pattern)
+}#endfunction
+
+function Get-AUNormalizedText
+{
+    <#
+.SYNOPSIS
+    Normalizes an app name or a publisher for comparison (arpCompare and the D47 steps).
+.DESCRIPTION
+    Name: lowercase, with bracketed tags such as (64-bit) or [x64], version tokens such as 24.08 or
+    v2.1, and architecture tokens such as x64 removed; punctuation becomes spaces. So "7-Zip 24.08
+    (x64)" and "7-Zip" both become "7 zip".
+    Publisher: lowercase, dots removed, other punctuation becomes spaces, and trailing legal
+    suffixes such as Inc., Corporation, LLC, and Co., Ltd. removed. So "Zoom Communications, Inc."
+    becomes "zoom communications".
+    Returns '' for a blank value. Results are cached for the run.
+.PARAMETER Text
+    The name or publisher.
+.PARAMETER Kind
+    Name or Publisher.
+#>
+    param (
+        [AllowNull()][string]$Text,
+        [ValidateSet('Name', 'Publisher')][string]$Kind
+    )
+
+    $Key = $Kind + '|' + $Text
+    $Cached = $null
+    if ($script:AUNormalizedText.TryGetValue($Key, [ref]$Cached)) { return $Cached }
+
+    $Value = $Text.ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($Value)) { $Value = '' }
+    elseif ($Kind -eq 'Name')
+    {
+        $Value = [regex]::Replace($Value, '\([^)]*\)|\[[^\]]*\]', ' ')
+        $Kept = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($Token in ($Value -split '\s+'))
+        {
+            $Token = $Token.Trim(',', ';', ':')
+            if (-not $Token -or $Token -eq '-') { continue }
+            if ($Token -match '^v?\d+([.,_]\d+)+[a-z]?$') { continue }
+            if ($Token -in $script:AUArchTokens) { continue }
+            $Kept.Add($Token)
+        }
+        $Value = [regex]::Replace(($Kept -join ' '), '[^a-z0-9+#]+', ' ').Trim()
+    }
+    else
+    {
+        $Value = [regex]::Replace($Value.Replace('.', ''), '[^a-z0-9]+', ' ').Trim()
+        $Tokens = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($Token in ($Value -split ' ')) { if ($Token) { $Tokens.Add($Token) } }
+        while ($Tokens.Count -gt 1 -and $Tokens[$Tokens.Count - 1] -in $script:AULegalSuffixes) { $Tokens.RemoveAt($Tokens.Count - 1) }
+        $Value = $Tokens -join ' '
+    }
+    $script:AUNormalizedText[$Key] = $Value
+    return $Value
+}#endfunction
+
+function ConvertTo-AUVersionParts
+{
+    <#
+.SYNOPSIS
+    Reads the leading numeric version from version-info text, as one to four integers.
+.DESCRIPTION
+    Accepts forms such as 24.08, 8.0.1.5, "8, 5, 0, 1", and "2.1.0 (build 5)". Returns $null when the
+    text doesn't start with a number.
+.PARAMETER Text
+    The version text.
+#>
+    param (
+        [AllowNull()][string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $Match = [regex]::Match($Text, '^\s*v?(\d+(?:\s*[.,]\s*\d+){0,3})')
+    if (-not $Match.Success) { return $null }
+    $Parts = New-Object 'System.Collections.Generic.List[int]'
+    foreach ($Piece in ($Match.Groups[1].Value -split '[.,]'))
+    {
+        $Number = 0
+        if (-not [int]::TryParse($Piece.Trim(), [ref]$Number)) { return $null }
+        $Parts.Add($Number)
+    }
+    return , $Parts.ToArray()
+}#endfunction
+
+function Compare-AUVersionPrefix
+{
+    <#
+.SYNOPSIS
+    Compares a version with a bound on only as many parts as the bound gives: -1, 0, or 1.
+.DESCRIPTION
+    So a bound of 8.99 equals 8.99.1, and a bound of 8 equals 8.0.0. Missing version parts count as 0.
+.PARAMETER Version
+    The version parts.
+.PARAMETER Bound
+    The bound parts.
+#>
+    param (
+        [int[]]$Version,
+        [int[]]$Bound
+    )
+
+    for ($i = 0; $i -lt $Bound.Count; $i++)
+    {
+        $Part = 0
+        if ($i -lt $Version.Count) { $Part = $Version[$i] }
+        if ($Part -lt $Bound[$i]) { return -1 }
+        if ($Part -gt $Bound[$i]) { return 1 }
+    }
+    return 0
+}#endfunction
+
+function Get-AUIdentityEvidence
+{
+    <#
+.SYNOPSIS
+    Returns the publisher, product name, description, and versions that identity rules may use.
+.DESCRIPTION
+    Verified facts always come first: when FactsVerified is true, PathEvidence is never used, and a
+    missing CompanyName counts as known and empty. Otherwise the current file's CompanyName and
+    ProductName at the same path (PathEvidence) are used, labelled CurrentFileAtPath, with no
+    FileDescription and no versions (D30). With neither, everything is unknown ($null) and Kind is None.
+.PARAMETER Facts
+    The executable facts.
+#>
+    param (
+        [pscustomobject]$Facts
+    )
+
+    if ($Facts.FactsVerified -eq $true)
+    {
+        return [pscustomobject]@{
+            Kind            = 'Verified'
+            Publisher       = [string]$Facts.FileCompanyName
+            ProductName     = [string]$Facts.FileProductName
+            FileDescription = [string]$Facts.FileDescription
+            Versions        = @([string]$Facts.FileVersion, [string]$Facts.ProductVersion)
+        }
+    }
+    if ($null -ne $Facts.PathEvidence)
+    {
+        return [pscustomobject]@{
+            Kind            = 'CurrentFileAtPath'
+            Publisher       = [string]$Facts.PathEvidence.CompanyName
+            ProductName     = [string]$Facts.PathEvidence.ProductName
+            FileDescription = $null
+            Versions        = @()
+        }
+    }
+    return [pscustomobject]@{ Kind = 'None'; Publisher = $null; ProductName = $null; FileDescription = $null; Versions = @() }
+}#endfunction
+
+function Test-AUIdentityWhen
+{
+    <#
+.SYNOPSIS
+    Tests an identity rule's when conditions against the executable and its evidence.
+.DESCRIPTION
+    exeName is a path-level fact. publisher, productName, and fileDescription use the evidence from
+    Get-AUIdentityEvidence. A versionMin or versionMax condition needs verified facts (D30); it's met
+    when the FileVersion or the ProductVersion is within the bounds, compared on as many parts as each
+    bound gives.
+.PARAMETER When
+    The rule's when object.
+.PARAMETER Facts
+    The executable facts.
+.PARAMETER Evidence
+    The Get-AUIdentityEvidence result.
+#>
+    param (
+        [pscustomobject]$When,
+        [pscustomobject]$Facts,
+        [pscustomobject]$Evidence
+    )
+
+    if ($null -eq $When) { return $false }
+    if (-not (Test-AUTextPattern $Facts.ExeName $When.exeName)) { return $false }
+    if (-not (Test-AUTextPattern $Evidence.Publisher $When.publisher)) { return $false }
+    if ($null -ne $When.productName -and -not (Test-AUTextPattern $Evidence.ProductName $When.productName)) { return $false }
+    if ($null -ne $When.fileDescription -and -not (Test-AUTextPattern $Evidence.FileDescription $When.fileDescription)) { return $false }
+
+    $Min = ConvertTo-AUVersionParts ([string]$When.versionMin)
+    $Max = ConvertTo-AUVersionParts ([string]$When.versionMax)
+    if ($null -eq $Min -and $null -eq $Max) { return $true }
+    if ($Evidence.Kind -ne 'Verified') { return $false }
+    foreach ($Text in $Evidence.Versions)
+    {
+        $Parts = ConvertTo-AUVersionParts $Text
+        if ($null -eq $Parts) { continue }
+        if ($null -ne $Min -and (Compare-AUVersionPrefix $Parts $Min) -lt 0) { continue }
+        if ($null -ne $Max -and (Compare-AUVersionPrefix $Parts $Max) -gt 0) { continue }
+        return $true
+    }
+    return $false
+}#endfunction
+
+function Get-AUIdentityRuleHit
+{
+    <#
+.SYNOPSIS
+    Tests one identity rule and returns its candidate installed apps, or $null when it doesn't match.
+.DESCRIPTION
+    identity: matches on its when conditions alone, whether or not the app is installed; the
+    candidates are the installed apps its target matches (none is fine). ownership msi: the build's
+    MsiProductCode (verified builds only) equals an installed app's ProductCode. ownership store: the
+    PackageFamily equals an installed app's. arpCompare: the evidence publisher and ProductName or
+    FileDescription equal an installed app's Publisher and DisplayName after normalizing. The
+    ownership and arpCompare rules match only when at least one installed app does.
+.PARAMETER Rule
+    The identity rule.
+.PARAMETER Facts
+    The executable facts.
+.PARAMETER Evidence
+    The Get-AUIdentityEvidence result.
+.PARAMETER InstalledApps
+    The installed-app entries.
+#>
+    param (
+        [pscustomobject]$Rule,
+        [pscustomobject]$Facts,
+        [pscustomobject]$Evidence,
+        [object[]]$InstalledApps
+    )
+
+    $Candidates = New-Object 'System.Collections.Generic.List[object]'
+    switch -CaseSensitive ([string]$Rule.type)
+    {
+        'identity'
+        {
+            if (-not (Test-AUIdentityWhen $Rule.when $Facts $Evidence)) { return $null }
+            foreach ($App in $InstalledApps)
+            {
+                if ([string]::IsNullOrWhiteSpace([string]$App.DisplayName)) { continue }
+                if ((Test-AUTextPattern ([string]$App.DisplayName) $Rule.target.displayName) -and (Test-AUTextPattern ([string]$App.Publisher) $Rule.target.publisher)) { $Candidates.Add($App) }
+            }
+            return [pscustomobject]@{ Candidates = $Candidates.ToArray(); TargetPattern = [string]$Rule.target.displayName; TargetPublisher = [string]$Rule.target.publisher }
+        }
+        'ownership'
+        {
+            if ($Rule.source -ceq 'msi')
+            {
+                # The Installer owner is a build-specific fact, attached only to a verified build (D24).
+                $Code = ([string]$Facts.MsiProductCode).Trim()
+                if ($Evidence.Kind -ne 'Verified' -or -not $Code) { return $null }
+                foreach ($App in $InstalledApps)
+                {
+                    if ([string]::Equals(([string]$App.ProductCode).Trim(), $Code, [StringComparison]::OrdinalIgnoreCase)) { $Candidates.Add($App) }
+                }
+            }
+            elseif ($Rule.source -ceq 'store')
+            {
+                $Family = ([string]$Facts.PackageFamily).Trim()
+                if (-not $Family) { return $null }
+                foreach ($App in $InstalledApps)
+                {
+                    if ([string]::Equals(([string]$App.PackageFamily).Trim(), $Family, [StringComparison]::OrdinalIgnoreCase)) { $Candidates.Add($App) }
+                }
+            }
+        }
+        'arpCompare'
+        {
+            $Publisher = Get-AUNormalizedText $Evidence.Publisher -Kind Publisher
+            if (-not $Publisher) { return $null }
+            $Names = @((Get-AUNormalizedText $Evidence.ProductName -Kind Name), (Get-AUNormalizedText $Evidence.FileDescription -Kind Name)) | Where-Object { $_ }
+            if (-not $Names) { return $null }
+            # This loop runs for most exes, so it reads the cache directly and calls the function only on a miss.
+            $Cache = $script:AUNormalizedText
+            $Key = $null
+            foreach ($App in $InstalledApps)
+            {
+                $AppPublisher = [string]$App.Publisher
+                if (-not $Cache.TryGetValue('Publisher|' + $AppPublisher, [ref]$Key)) { $Key = Get-AUNormalizedText $AppPublisher -Kind Publisher }
+                if ($Key -cne $Publisher) { continue }
+                $AppName = [string]$App.DisplayName
+                if (-not $Cache.TryGetValue('Name|' + $AppName, [ref]$Key)) { $Key = Get-AUNormalizedText $AppName -Kind Name }
+                if ($Key -cin $Names) { $Candidates.Add($App) }
+            }
+        }
+    }
+    if ($Candidates.Count -eq 0) { return $null }
+    return [pscustomobject]@{ Candidates = $Candidates.ToArray(); TargetPattern = $null; TargetPublisher = $null }
+}#endfunction
+
+function Get-AUAppFolders
+{
+    <#
+.SYNOPSIS
+    Returns an installed app's install folders: InstallLocation and the folders of DisplayIcon and UninstallString.
+.DESCRIPTION
+    Only rooted paths count. A drive root never counts, and neither does a DisplayIcon or
+    UninstallString folder in the Windows folder (MsiExec.exe, for example). Each folder ends with \.
+.PARAMETER App
+    The installed-app entry.
+#>
+    param (
+        [pscustomobject]$App
+    )
+
+    $Folders = New-Object 'System.Collections.Generic.List[string]'
+    $Add = {
+        param ([string]$Folder, [bool]$FromFile)
+        if ([string]::IsNullOrWhiteSpace($Folder)) { return }
+        $Folder = $Folder.Trim().Trim('"').TrimEnd('\')
+        if ($Folder -notmatch '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)\\[^\\]') { return }
+        if ($FromFile -and (Get-AULocationClass ($Folder + '\x')) -eq 'Windows') { return }
+        $Folders.Add($Folder + '\')
+    }
+    $FileFolder = {
+        param ([string]$File)
+        try { return [IO.Path]::GetDirectoryName($File) }
+        catch { return $null }
+    }
+
+    & $Add ([string]$App.InstallLocation) $false
+    foreach ($Command in @([string]$App.DisplayIcon, [string]$App.UninstallString))
+    {
+        if ([string]::IsNullOrWhiteSpace($Command)) { continue }
+        $Command = $Command.Trim()
+        $File = $null
+        if ($Command.StartsWith('"'))
+        {
+            $End = $Command.IndexOf('"', 1)
+            if ($End -gt 1) { $File = $Command.Substring(1, $End - 1) }
+        }
+        else
+        {
+            $Match = [regex]::Match($Command, '^(.+?\.(exe|dll|ico|cmd|bat))(?=[\s,]|$)', 'IgnoreCase')
+            if ($Match.Success) { $File = $Match.Groups[1].Value }
+            else { $File = [regex]::Replace($Command, ',\s*-?\d+$', '') }
+        }
+        if ($File) { & $Add (& $FileFolder $File) $true }
+    }
+    return , $Folders.ToArray()
+}#endfunction
+
+function Select-AUCandidate
+{
+    <#
+.SYNOPSIS
+    Narrows candidate installed apps with the D47 steps, in order.
+.DESCRIPTION
+    Steps: path (the run path is inside the candidate's install folder; the deepest folder wins),
+    msi (Windows Installer owns the file; verified builds only), publisher (normalized CompanyName
+    equals the Publisher), product (normalized ProductName or FileDescription equals the
+    DisplayName), version (the FileVersion or ProductVersion shares the DisplayVersion's major and
+    minor parts; verified builds only), arch (Program Files (x86) means a 32-bit entry, Program Files
+    a 64-bit one), and scope (the user's own per-user install whose ProfilePath holds the run path).
+    A step with no data, or that would remove every candidate, is skipped. Returns Candidates (those
+    left) and Step (the step that left exactly one, else $null).
+.PARAMETER Facts
+    The executable facts.
+.PARAMETER Evidence
+    The Get-AUIdentityEvidence result.
+.PARAMETER Candidates
+    The candidate installed-app entries.
+#>
+    param (
+        [pscustomobject]$Facts,
+        [pscustomobject]$Evidence,
+        [object[]]$Candidates
+    )
+
+    $Left = @($Candidates)
+    $RunPath = ([string]$Facts.RunPath).Trim()
+    $Verified = ($Evidence.Kind -eq 'Verified')
+    foreach ($Step in $script:AUResolveSteps)
+    {
+        if ($Left.Count -le 1) { break }
+        $Kept = @()
+        switch ($Step)
+        {
+            'path'
+            {
+                if (-not $RunPath) { break }
+                $Depths = New-Object 'int[]' $Left.Count
+                for ($i = 0; $i -lt $Left.Count; $i++)
+                {
+                    foreach ($Folder in (Get-AUAppFolders $Left[$i]))
+                    {
+                        if ($RunPath.StartsWith($Folder, [StringComparison]::OrdinalIgnoreCase))
+                        {
+                            $Segments = $Folder.Split('\').Count
+                            if ($Segments -gt $Depths[$i]) { $Depths[$i] = $Segments }
+                        }
+                    }
+                }
+                $Best = ($Depths | Measure-Object -Maximum).Maximum
+                if ($Best -gt 0)
+                {
+                    $Kept = @(for ($i = 0; $i -lt $Left.Count; $i++) { if ($Depths[$i] -eq $Best) { $Left[$i] } })
+                }
+            }
+            'msi'
+            {
+                $Code = ([string]$Facts.MsiProductCode).Trim()
+                if (-not $Verified -or -not $Code) { break }
+                $Kept = @($Left | Where-Object { [string]::Equals(([string]$_.ProductCode).Trim(), $Code, [StringComparison]::OrdinalIgnoreCase) })
+            }
+            'publisher'
+            {
+                $Publisher = Get-AUNormalizedText $Evidence.Publisher -Kind Publisher
+                if (-not $Publisher) { break }
+                $Kept = @($Left | Where-Object { (Get-AUNormalizedText ([string]$_.Publisher) -Kind Publisher) -ceq $Publisher })
+            }
+            'product'
+            {
+                $Names = @((Get-AUNormalizedText $Evidence.ProductName -Kind Name), (Get-AUNormalizedText $Evidence.FileDescription -Kind Name)) | Where-Object { $_ }
+                if (-not $Names) { break }
+                $Kept = @($Left | Where-Object { (Get-AUNormalizedText ([string]$_.DisplayName) -Kind Name) -cin $Names })
+            }
+            'version'
+            {
+                if (-not $Verified) { break }
+                $Versions = New-Object 'System.Collections.Generic.List[object]'
+                foreach ($Text in $Evidence.Versions)
+                {
+                    $Parts = ConvertTo-AUVersionParts $Text
+                    if ($null -ne $Parts) { $Versions.Add($Parts) }
+                }
+                if ($Versions.Count -eq 0) { break }
+                $Kept = @(foreach ($App in $Left)
+                    {
+                        $Shown = ConvertTo-AUVersionParts ([string]$App.DisplayVersion)
+                        if ($null -eq $Shown) { continue }
+                        # Equal, or the same major and minor parts: compare on the first two parts only.
+                        $MajorMinor = [int[]]@(($Shown + @(0, 0))[0..1])
+                        foreach ($Version in $Versions)
+                        {
+                            if ((Compare-AUVersionPrefix $Version $MajorMinor) -eq 0) { $App; break }
+                        }
+                    })
+            }
+            'arch'
+            {
+                $Want = 0
+                if ($RunPath -match '^[A-Za-z]:\\Program Files \(x86\)\\') { $Want = 32 }
+                elseif ($RunPath -match '^[A-Za-z]:\\Program Files\\') { $Want = 64 }
+                if ($Want -eq 0) { break }
+                $Kept = @($Left | Where-Object {
+                        $Arch = [string]$_.Architecture
+                        $Bits = 0
+                        if ($Arch -match '32|x86') { $Bits = 32 } elseif ($Arch -match '64') { $Bits = 64 }
+                        return ($Bits -eq $Want)
+                    })
+            }
+            'scope'
+            {
+                $Sid = ([string]$Facts.UserSid).Trim()
+                if (-not $RunPath -or -not $Sid) { break }
+                $Kept = @($Left | Where-Object {
+                        $ProfileRoot = ([string]$_.ProfilePath).Trim().TrimEnd('\')
+                        return ($ProfileRoot -and [string]::Equals(([string]$_.Scope).Trim(), $Sid, [StringComparison]::OrdinalIgnoreCase) -and $RunPath.StartsWith($ProfileRoot + '\', [StringComparison]::OrdinalIgnoreCase))
+                    })
+            }
+        }
+        if ($Kept.Count -eq 0 -or $Kept.Count -eq $Left.Count) { continue }
+        $Left = $Kept
+        if ($Left.Count -eq 1) { return [pscustomobject]@{ Candidates = $Left; Step = $Step } }
+    }
+    return [pscustomobject]@{ Candidates = $Left; Step = $null }
+}#endfunction
+
+function Resolve-AUIdentity
+{
+    <#
+.SYNOPSIS
+    Decides which installed app (ARP entry) an executable belongs to, from the mapping rules.
+.DESCRIPTION
+    Identity rules run customer first, then PowerStacks, each in file order; the first rule that
+    matches wins (D38, F12). Its candidates are the installed apps its target matches, or the
+    ownership or arpCompare hits. With several candidates, the D47 steps narrow them; a step that
+    leaves one records MatchRuleId ps-resolve-<step>. When candidates with two or more DisplayNames
+    survive, the exe stays unresolved: MatchSection None, with CandidateTargets (F26). An identity
+    rule with no installed candidate still matches: TargetPattern is set and ResolvedAppName is $null.
+    Verified facts come first; an unverified build may match on the current file's CompanyName and
+    ProductName (EvidenceUsed CurrentFileAtPath), never on a version condition (D30).
+    Returns TargetPattern, TargetPublisher (wildcard patterns; escaped DisplayName and Publisher for
+    ownership and arpCompare matches), ResolvedAppName, ProductCode, PackageFamily, MatchSection
+    (Customer, PowerStacks, or None), MatchRuleId, RuleType, InstalledStateDependent (ownership and
+    arpCompare), EvidenceUsed (Verified, CurrentFileAtPath, or None), and CandidateTargets.
+.PARAMETER Facts
+    The executable facts (Task 14 shape).
+.PARAMETER Mappings
+    The whole Get-AUMappings result (F18).
+.PARAMETER InstalledApps
+    The installed-app entries (Task 13 shape).
+#>
+    param (
+        [pscustomobject]$Facts,
+        [pscustomobject]$Mappings,
+        [object[]]$InstalledApps
+    )
+
+    $Result = [pscustomobject]@{
+        TargetPattern           = $null
+        TargetPublisher         = $null
+        ResolvedAppName         = $null
+        ProductCode             = $null
+        PackageFamily           = $null
+        MatchSection            = 'None'
+        MatchRuleId             = $null
+        RuleType                = $null
+        InstalledStateDependent = $false
+        EvidenceUsed            = 'None'
+        CandidateTargets        = $null
+    }
+    # A $null entry never matches: it has no DisplayName, ProductCode, PackageFamily, or Publisher.
+    $Apps = @($InstalledApps)
+    $Evidence = Get-AUIdentityEvidence $Facts
+
+    $Hit = $null
+    $Rule = $null
+    $Section = $null
+    foreach ($Pair in @(@('Customer', $Mappings.Mappings.customer), @('PowerStacks', $Mappings.Mappings.powerStacks)))
+    {
+        foreach ($Candidate in @($Pair[1].identityRules))
+        {
+            if ($null -eq $Candidate) { continue }
+            $Hit = Get-AUIdentityRuleHit $Candidate $Facts $Evidence $Apps
+            if ($Hit) { $Rule = $Candidate; $Section = $Pair[0]; break }
+        }
+        if ($Hit) { break }
+    }
+    if (-not $Hit) { return $Result }
+
+    $RuleType = [string]$Rule.type
+    # The package identity and the Installer owner of a verified build are both verified evidence.
+    $EvidenceUsed = $Evidence.Kind
+    if ($RuleType -ceq 'ownership') { $EvidenceUsed = 'Verified' }
+    $Result.EvidenceUsed = $EvidenceUsed
+
+    $RuleId = [string]$Rule.id
+    $Candidates = @($Hit.Candidates)
+    if ($Candidates.Count -gt 1)
+    {
+        $Narrowed = Select-AUCandidate $Facts $Evidence $Candidates
+        $Candidates = @($Narrowed.Candidates)
+        if ($Narrowed.Step) { $RuleId = 'ps-resolve-' + $Narrowed.Step }
+        $Names = New-Object 'System.Collections.Generic.List[string]'
+        $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($App in $Candidates) { if ($Seen.Add(([string]$App.DisplayName).Trim())) { $Names.Add(([string]$App.DisplayName).Trim()) } }
+        if ($Names.Count -gt 1)
+        {
+            $Result.CandidateTargets = $Names.ToArray()
+            $Exe = $Facts.ExeName
+            if (-not $Exe) { $Exe = $Facts.PackageFamily }
+            Write-CMTraceLog -Message "App Usage: rule $($Rule.id) left $($Names.Count) candidate apps for $Exe after the D47 steps; identity unresolved." -Component 'AppUsage'
+            return $Result
+        }
+    }
+
+    $Chosen = $null
+    if ($Candidates.Count -gt 0) { $Chosen = $Candidates[0] }
+    $Result.MatchSection = $Section
+    $Result.MatchRuleId = $RuleId
+    $Result.RuleType = $RuleType
+    $Result.InstalledStateDependent = ($RuleType -cin @('ownership', 'arpCompare'))
+    if ($RuleType -ceq 'identity')
+    {
+        $Result.TargetPattern = $Hit.TargetPattern
+        $Result.TargetPublisher = $Hit.TargetPublisher
+    }
+    else
+    {
+        $Result.TargetPattern = [Management.Automation.WildcardPattern]::Escape(([string]$Chosen.DisplayName).Trim())
+        $Result.TargetPublisher = [Management.Automation.WildcardPattern]::Escape(([string]$Chosen.Publisher).Trim())
+    }
+    if ($Chosen)
+    {
+        $Result.ResolvedAppName = ([string]$Chosen.DisplayName).Trim()
+        if ($Chosen.ProductCode) { $Result.ProductCode = [string]$Chosen.ProductCode }
+        if ($Chosen.PackageFamily) { $Result.PackageFamily = [string]$Chosen.PackageFamily }
+    }
+    return $Result
+}#endfunction
+
+function Get-AUClassification
+{
+    <#
+.SYNOPSIS
+    Evaluates classification and ignore rules for an executable: RuleRole, ClassificationRuleId, Ignored, IgnoreRuleId.
+.DESCRIPTION
+    Runs for every executable, matched or not. Customer rules come first, then PowerStacks rules, each
+    in file order; the first classification rule that matches sets RuleRole, and the first ignore
+    rule that matches sets Ignored. When MatchSection is Customer (including a retained customer
+    target), PowerStacks rules are skipped (D38). Every condition a rule gives must match: exeName and
+    locationClass are path-level facts; companyName and fileDescription use verified facts only, never
+    PathEvidence (D30).
+.PARAMETER Facts
+    The executable facts.
+.PARAMETER Mappings
+    The whole Get-AUMappings result (F18).
+.PARAMETER MatchSection
+    The section that matched the executable's identity: Customer, PowerStacks, Retained, or None.
+#>
+    param (
+        [pscustomobject]$Facts,
+        [pscustomobject]$Mappings,
+        [string]$MatchSection
+    )
+
+    $Result = [pscustomobject]@{ RuleRole = $null; ClassificationRuleId = $null; Ignored = $false; IgnoreRuleId = $null }
+    $Verified = ($Facts.FactsVerified -eq $true)
+    $Sections = @($Mappings.Mappings.customer)
+    if ($MatchSection -ne 'Customer') { $Sections += $Mappings.Mappings.powerStacks }
+
+    foreach ($Section in $Sections)
+    {
+        foreach ($Rule in @($Section.classificationRules))
+        {
+            if ($null -eq $Rule -or $null -eq $Rule.when) { continue }
+            $IsIgnore = ($Rule.type -ceq 'ignore')
+            if ($IsIgnore -and $Result.Ignored) { continue }
+            if (-not $IsIgnore -and ($Rule.type -cne 'classification' -or $Result.ClassificationRuleId)) { continue }
+
+            $Matched = $true
+            foreach ($Condition in $Rule.when.PSObject.Properties)
+            {
+                $Pattern = [string]$Condition.Value
+                switch -CaseSensitive ($Condition.Name)
+                {
+                    'exeName' { $Matched = Test-AUTextPattern $Facts.ExeName $Pattern }
+                    'locationClass' { $Matched = [string]::Equals([string]$Facts.LocationClass, $Pattern, [StringComparison]::OrdinalIgnoreCase) }
+                    'companyName' { $Matched = $Verified -and (Test-AUTextPattern ([string]$Facts.FileCompanyName) $Pattern) }
+                    'fileDescription' { $Matched = $Verified -and (Test-AUTextPattern ([string]$Facts.FileDescription) $Pattern) }
+                    default { $Matched = $false }
+                }
+                if (-not $Matched) { break }
+            }
+            if (-not $Matched) { continue }
+
+            if ($IsIgnore)
+            {
+                $Result.Ignored = $true
+                $Result.IgnoreRuleId = [string]$Rule.id
+            }
+            else
+            {
+                $Result.RuleRole = [string]$Rule.role
+                $Result.ClassificationRuleId = [string]$Rule.id
+            }
+        }
+    }
+    return $Result
+}#endfunction
 #endregion APPUSAGE
 
 #region script

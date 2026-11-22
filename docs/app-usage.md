@@ -31,6 +31,24 @@ Classification and ignore rules then run on every executable, matched or not, ag
 
 One limit applies to every rule: it has to match. A rule with a version range (`versionMin` or `versionMax`) matches only a build whose file facts the script verified. When the script can't verify the build that ran, a version-range rule doesn't match it, and matching moves on to the next rule.
 
+### When a Rule Matches Several Installed Apps
+
+The rule that wins sets the app's name pattern, and the installed apps that pattern matches are the candidates. Usually there's one, and the executable is matched to it. When there are several, for example a `Contoso*` target on a device with Contoso Alpha and Contoso Beta installed, the script narrows the list with what it knows about the executable. It applies these checks in order and stops as soon as one app is left:
+
+| Check | Keeps the app whose | Reported rule ID |
+|---|---|---|
+| Install path | Install folder holds the executable. When several do, the deepest folder wins. | `ps-resolve-path` |
+| Windows Installer | Windows Installer product owns the executable. Verified builds only. | `ps-resolve-msi` |
+| Publisher | Publisher equals the executable's publisher, ignoring case, spaces, and suffixes such as Inc. and Corporation. | `ps-resolve-publisher` |
+| Product name | Name equals the executable's ProductName or FileDescription, ignoring versions and tags such as (64-bit). | `ps-resolve-product` |
+| Version | Version shares its first two parts with the executable's FileVersion or ProductVersion. Verified builds only. | `ps-resolve-version` |
+| Architecture | Entry is 32-bit, for an executable under `Program Files (x86)`, or 64-bit, for one under `Program Files`. | `ps-resolve-arch` |
+| Install scope | Per-user install belongs to the user who ran the executable from their own profile. | `ps-resolve-scope` |
+
+A check that has nothing to go on, or that would rule out every app, is skipped. When a check leaves one app, the executable is matched to it and the check's ID is reported as the rule ID, in place of the rule that found the candidates. The match still belongs to that rule's file, so a match from your rules still wins.
+
+When two or more apps are left after every check, the executable is reported as unmatched, and `CandidateTargets` lists the apps it could belong to. Those apps aren't reported as unused because of it. To settle it yourself, give your rule a narrower `target.displayName`.
+
 ### File Format
 
 ```json
@@ -69,11 +87,13 @@ Text conditions are wildcard patterns, the same as the PowerShell `-like` operat
 | `when.publisher` | Yes | The file's publisher (CompanyName in its file info). Use `""` for an executable with no publisher, which is common for in-house apps. |
 | `when.productName` | No | The file's ProductName. |
 | `when.fileDescription` | No | The file's FileDescription. |
-| `when.versionMin`, `when.versionMax` | No | A version range for the build, for example `8.0` to `8.99`. Matches verified builds only. |
+| `when.versionMin`, `when.versionMax` | No | A version range for the build, for example `8.0` to `8.99`. Each bound compares only as many parts as it has, so `8.99` includes 8.99.1 and `8` includes 8.0.0. The build matches when its FileVersion or its ProductVersion is in the range. Matches verified builds only. |
 | `target.displayName` | Yes | The installed app's name in **Installed apps** (its uninstall entry DisplayName). |
 | `target.publisher` | Yes | The installed app's publisher. `""` is allowed. |
 
 A rule matches only when every condition it has matches. An identity rule still matches when the app isn't installed, so usage of an app that was removed stays credited to it.
+
+When the script can't verify the build that ran, it uses the publisher and product name of the file at the same path now, and reports the match as unverified. That can satisfy `exeName`, `publisher`, and `productName`, but never `fileDescription`, `versionMin`, or `versionMax`. When the publisher isn't known at all, no identity rule matches, including one with `"publisher": ""`.
 
 #### Classification Rules
 
@@ -82,7 +102,9 @@ A rule matches only when every condition it has matches. An identity rule still 
 | `when` | Yes | One or more of `exeName`, `companyName`, `fileDescription`, and `locationClass`. Every condition you give must match. |
 | `role` | Yes | `Windows`, `Installer`, `Helper`, `Service`, or `CLI`. |
 
-`locationClass` is where the executable ran from: `Windows`, `ProgramFiles`, `UserProfile`, `Temp`, `Download`, `ManagementCache` (the Intune and Configuration Manager cache folders), or `Other`.
+`locationClass` is where the executable ran from: `Windows`, `ProgramFiles`, `UserProfile`, `Temp`, `Download`, `ManagementCache` (the Intune and Configuration Manager cache folders), or `Other`. A `Temp` or `Downloads` folder counts as `Temp` or `Download` wherever it is, including under the Windows folder or a user profile.
+
+`exeName` and `locationClass` always apply. `companyName` and `fileDescription` match only a build whose file facts the script verified.
 
 #### Ignore Rules
 
