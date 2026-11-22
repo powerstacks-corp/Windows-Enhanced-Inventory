@@ -5453,6 +5453,12 @@ $script:AUInputColumn = 'UserInputS'
 # Time budgets, in seconds, for each external step. A step that runs out is stopped and counts as failed.
 $script:AUToolTimeoutSeconds = 60
 $script:AURepairTimeoutSeconds = 900
+# A killed run's folder and shadow copy are removed by the next run once they're this old (F28).
+$script:AUStaleRunHours = 24
+# The marker file in a run folder that names its shadow copy, so a later run can delete it.
+$script:AUShadowMarker = 'shadow.id'
+# The status when the work root can't be made safe, so App Usage skips the run.
+$script:AUWorkDirUntrustedStatus = 'SrumReadFailed:WorkDirUntrusted'
 
 function New-AUProtectedSecurity
 {
@@ -5495,11 +5501,13 @@ function Remove-AUFolderTree
 {
     <#
 .SYNOPSIS
-    Deletes a folder and everything in it, never following a junction or symbolic link.
+    Deletes a folder SYSTEM created under the protected work root, and everything in it, never following a link.
 .DESCRIPTION
-    A link is deleted itself, never its target. [IO.Directory]::Delete with recursion can't be used:
-    on .NET Framework it fails on a junction inside the tree. Read-only files are made writable first.
-    Throws on failure.
+    Only for trees no standard user can write to (a run folder inside the protected root): a folder
+    someone else controls could be swapped for a junction mid-delete, so an untrusted folder is
+    moved aside, never passed here (Initialize-AUProtectedFolder). A link is deleted itself, never
+    its target. [IO.Directory]::Delete with recursion can't be used: on .NET Framework it fails on
+    a junction inside the tree. Read-only files are made writable first. Throws on failure.
 .PARAMETER Path
     The folder.
 #>
@@ -5521,19 +5529,15 @@ function Remove-AUFolderTree
     $Folder.Delete()
 }#endfunction
 
-function Initialize-AUProtectedFolder
+function Test-AUTrustedFolder
 {
     <#
 .SYNOPSIS
-    Makes Path a real folder, owned by SYSTEM or Administrators, with the protected DACL.
+    Returns true when Path is a real folder that only SYSTEM or an administrator could have made the way it is.
 .DESCRIPTION
-    Standard users can create folders in C:\Windows\Temp, so an existing folder isn't trusted as
-    found. A junction or symbolic link is removed (the link only, never its target), and a folder
-    owned by anyone but SYSTEM or Administrators is deleted with everything in it
-    (Remove-AUFolderTree, which doesn't follow links inside it). A folder this function creates gets
-    the protected DACL at creation, so it's never readable by others; a trusted existing folder
-    gets the DACL set again. Throws on failure, or when the folder ends up a link or owned by
-    someone else (a folder made between the check and the create).
+    True only for a folder that isn't a link, is owned by SYSTEM or Administrators, and has a
+    protected DACL whose every entry is SYSTEM or Administrators. Its contents were then written by
+    SYSTEM or an administrator only, so it's safe to look inside. Never throws.
 .PARAMETER Path
     The folder.
 #>
@@ -5541,35 +5545,157 @@ function Initialize-AUProtectedFolder
         [string]$Path
     )
 
-    if ([IO.Directory]::Exists($Path))
+    try
     {
-        if (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $Attributes = [IO.File]::GetAttributes($Path)
+        if (($Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or ($Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        $Acl = [IO.Directory]::GetAccessControl($Path, [Security.AccessControl.AccessControlSections]'Owner, Access')
+        if ($script:AULedgerAclSids -notcontains $Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { return $false }
+        if (-not $Acl.AreAccessRulesProtected) { return $false }
+        $Rules = @($Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        if ($Rules.Count -eq 0) { return $false }
+        foreach ($Rule in $Rules)
         {
-            Remove-AUFolderTree -Path $Path
-            Write-CMTraceLog -Message "App Usage: removed the link at $Path; the work folder must be a real folder." -Component 'AppUsage' -Type 2
+            if ($script:AULedgerAclSids -notcontains $Rule.IdentityReference.Value) { return $false }
         }
-        else
-        {
-            $Owner = ([IO.Directory]::GetAccessControl($Path, [Security.AccessControl.AccessControlSections]::Owner)).GetOwner([Security.Principal.SecurityIdentifier]).Value
-            if ($script:AULedgerAclSids -notcontains $Owner)
-            {
-                Remove-AUFolderTree -Path $Path
-                Write-CMTraceLog -Message "App Usage: removed $Path, which $Owner owned; the work folder must be owned by SYSTEM or Administrators." -Component 'AppUsage' -Type 2
-            }
-        }
+        return $true
     }
-    elseif ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }
+    catch { return $false }
+}#endfunction
+
+function Move-AUUntrustedItem
+{
+    <#
+.SYNOPSIS
+    Renames an untrusted file, folder, or link aside to <Path>.untrusted-<guid> and returns the new path.
+.DESCRIPTION
+    A rename changes only the directory entry: nothing inside is opened, followed, or deleted, so a
+    junction swapped in by its owner can't turn it into a delete as SYSTEM. Throws on failure.
+.PARAMETER Path
+    The item to move aside.
+#>
+    param (
+        [string]$Path
+    )
+
+    $Aside = "$Path.untrusted-$([guid]::NewGuid().ToString('N'))"
+    if ([IO.Directory]::Exists($Path)) { [IO.Directory]::Move($Path, $Aside) }
+    else { [IO.File]::Move($Path, $Aside) }
+    return $Aside
+}#endfunction
+
+function Initialize-AUProtectedFolder
+{
+    <#
+.SYNOPSIS
+    Makes Path a real folder, owned by Administrators, with the protected DACL.
+.DESCRIPTION
+    Standard users can create folders in C:\Windows\Temp, so an existing item isn't trusted as
+    found. Anything at Path that Test-AUTrustedFolder doesn't trust (a link, a file, a folder owned
+    by someone else, or one with other entries) is renamed aside (Move-AUUntrustedItem), never
+    opened or deleted, and a fresh folder is made. A folder this function creates gets the
+    protected DACL at creation, so it's never readable by others; a trusted existing folder gets
+    the DACL set again. The result is checked again afterwards, because CreateDirectory accepts a
+    folder someone made in the meantime.
+    Throws when the untrusted item can't be moved aside, or the result isn't trusted; the message
+    starts with $script:AUWorkDirUntrustedStatus, the status Invoke-AppUsage reports when it skips
+    App Usage for the run. Other failures throw as they are.
+.PARAMETER Path
+    The folder.
+#>
+    param (
+        [string]$Path
+    )
+
+    if (([IO.Directory]::Exists($Path) -or [IO.File]::Exists($Path)) -and -not (Test-AUTrustedFolder -Path $Path))
+    {
+        try { $Aside = Move-AUUntrustedItem -Path $Path }
+        catch { throw "$($script:AUWorkDirUntrustedStatus): $Path isn't trusted and couldn't be moved aside: $($_.Exception.Message)" }
+        Write-CMTraceLog -Message "App Usage: moved $Path aside to $Aside, because the work folder must be a real folder only SYSTEM and Administrators control." -Component 'AppUsage' -Type 2
+    }
 
     if ([IO.Directory]::Exists($Path)) { Set-AUProtectedAcl -Folder $Path }
     else { [void][IO.Directory]::CreateDirectory($Path, (New-AUProtectedSecurity -Folder)) }
 
-    # CreateDirectory accepts a folder someone made in the meantime without applying the DACL, so
-    # check the result again.
-    $Owner = ([IO.Directory]::GetAccessControl($Path, [Security.AccessControl.AccessControlSections]::Owner)).GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $script:AULedgerAclSids -notcontains $Owner)
+    if (-not (Test-AUTrustedFolder -Path $Path)) { throw "$($script:AUWorkDirUntrustedStatus): $Path changed while it was being created." }
+}#endfunction
+
+function Remove-AUShadowCopy
+{
+    <#
+.SYNOPSIS
+    Deletes a shadow copy by ID. Returns true when it's gone (or was already gone). Never throws.
+.PARAMETER ShadowId
+    The shadow copy ID, a GUID in braces.
+#>
+    param (
+        [string]$ShadowId
+    )
+
+    try
     {
-        throw "the work folder $Path changed while it was being created."
+        if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { throw "'$ShadowId' isn't a shadow copy ID." }
+        $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -ErrorAction Stop
+        if ($Shadow) { $Shadow | Remove-CimInstance -ErrorAction Stop }
+        return $true
     }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't remove shadow copy $ShadowId`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $false
+    }
+}#endfunction
+
+function Clear-AUStaleRuns
+{
+    <#
+.SYNOPSIS
+    Removes run folders, and the shadow copies their markers name, that a killed run left in the protected root.
+.DESCRIPTION
+    Only call it on a root Test-AUTrustedFolder trusts, so everything inside was made by SYSTEM or
+    an administrator. A run folder created more than MaxAgeHours ago is stale: the shadow copy in
+    its marker file (New-AUSnapshot writes <run>\$script:AUShadowMarker) is deleted, then the folder
+    (Remove-AUFolderTree). A link in the root is never followed or removed, and the current run's
+    folder is skipped. Never throws.
+.PARAMETER Root
+    The protected work root.
+.PARAMETER Except
+    The current RunId.
+.PARAMETER MaxAgeHours
+    How old a run folder must be to count as stale.
+#>
+    param (
+        [string]$Root,
+        [string]$Except,
+        [int]$MaxAgeHours = 24
+    )
+
+    try
+    {
+        $Cutoff = [datetime]::UtcNow.AddHours(-$MaxAgeHours)
+        foreach ($Folder in (New-Object IO.DirectoryInfo $Root).GetDirectories())
+        {
+            try
+            {
+                if (($Folder.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+                {
+                    Write-CMTraceLog -Message "App Usage: left the link $($Folder.FullName) in the work root alone." -Component 'AppUsage' -Type 2
+                    continue
+                }
+                if ([string]::Equals($Folder.Name, $Except, [StringComparison]::OrdinalIgnoreCase) -or $Folder.CreationTimeUtc -gt $Cutoff) { continue }
+                $Marker = [IO.Path]::Combine($Folder.FullName, $script:AUShadowMarker)
+                if ([IO.File]::Exists($Marker) -and ([IO.File]::GetAttributes($Marker) -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+                {
+                    $ShadowId = ([IO.File]::ReadAllText($Marker)).Trim()
+                    if ($ShadowId) { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+                }
+                Remove-AUFolderTree -Path $Folder.FullName
+                Write-CMTraceLog -Message "App Usage: removed the stale run folder $($Folder.FullName), created $($Folder.CreationTimeUtc.ToString('o'))." -Component 'AppUsage' -Type 2
+            }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the stale run folder $($Folder.FullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't check $Root for stale run folders: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
 }#endfunction
 
 function New-AUWorkDir
@@ -5580,8 +5706,11 @@ function New-AUWorkDir
 .DESCRIPTION
     The root and the run folder both get the protected DACL (SYSTEM and Administrators full control
     only, inheritance off), and copies made inside inherit it, so no standard user can read another
-    user's hive copy or anyone's SRUM activity (D18). Throws when RunId isn't a plain folder name or
-    a folder can't be made safe.
+    user's hive copy or anyone's SRUM activity (D18). An untrusted root is moved aside, never
+    deleted (Initialize-AUProtectedFolder). Run folders a killed run left behind more than 24 hours
+    ago are removed, with their shadow copies (Clear-AUStaleRuns). Throws when RunId isn't a plain
+    folder name or a folder can't be made safe; for an untrusted root that can't be moved aside, the
+    message starts with $script:AUWorkDirUntrustedStatus.
 .PARAMETER RunId
     This run's ID: letters, digits, '.', '_', and '-', starting with a letter or digit.
 .PARAMETER Root
@@ -5594,6 +5723,7 @@ function New-AUWorkDir
 
     if ($RunId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "New-AUWorkDir needs a plain folder name for RunId; got '$RunId'." }
     Initialize-AUProtectedFolder -Path $Root
+    Clear-AUStaleRuns -Root $Root -Except $RunId -MaxAgeHours $script:AUStaleRunHours
     $Path = [IO.Path]::Combine($Root, $RunId)
     Initialize-AUProtectedFolder -Path $Path
     return $Path
@@ -5838,13 +5968,15 @@ function New-AUSnapshot
     or to $null when it couldn't be copied (no shadow copy, a profile off the system drive, or a
     failed copy). Signed-in users aren't in HiveCopies; their hives are read in place. Copies come
     only from the shadow copy, never from a live file, through a link at <WorkDir>\shadow
-    (Mount-AUShadow) that's removed once the copies are made. ShadowRoot is the shadow copy's device
-    path.
+    (Mount-AUShadow) that's removed once the copies are made. ShadowRoot is the device path the
+    copies came from; nothing after this function reads it.
+    The shadow copy is released before this function returns, and ShadowId is then $null. While the
+    shadow copy exists, its ID is in <WorkDir>\shadow.id, so a run killed mid-snapshot leaves it for
+    the next run's New-AUWorkDir to delete. When the release fails, ShadowId and the marker stay,
+    and Remove-AUSnapshot tries again.
     Status is OK, ShadowCopyFailed (no shadow copy, or it couldn't be linked; SrumDbPath and every
-    hive copy $null), or
-    SrumReadFailed:CopyFailed (the shadow copy worked but SRUDB.dat didn't copy). ShadowId is set as
-    soon as the shadow copy exists, so Remove-AUSnapshot removes it whatever fails later. Never
-    throws; call Remove-AUSnapshot in finally.
+    hive copy $null), or SrumReadFailed:CopyFailed (the shadow copy worked but SRUDB.dat didn't
+    copy). Never throws; call Remove-AUSnapshot in finally.
 .PARAMETER WorkDir
     The run's work folder, from New-AUWorkDir.
 #>
@@ -5872,6 +6004,9 @@ function New-AUSnapshot
             $Created = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = "$($env:SystemDrive)\"; Context = 'ClientAccessible' } -ErrorAction Stop
             if ($Created.ReturnValue -ne 0 -or -not $Created.ShadowID) { throw "Win32_ShadowCopy.Create returned $($Created.ReturnValue)." }
             $Snapshot.ShadowId = [string]$Created.ShadowID
+            # A run killed from here on leaves this marker, so a later run deletes the shadow copy.
+            try { [IO.File]::WriteAllText([IO.Path]::Combine($WorkDir, $script:AUShadowMarker), $Snapshot.ShadowId) }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't write the shadow marker in $WorkDir`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
             $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($Snapshot.ShadowId)'" -ErrorAction Stop
             if (-not $Shadow -or -not $Shadow.DeviceObject) { throw "shadow copy $($Snapshot.ShadowId) has no device path." }
             $Snapshot.ShadowRoot = ([string]$Shadow.DeviceObject).TrimEnd('\')
@@ -5940,6 +6075,17 @@ function New-AUSnapshot
         elseif ($null -eq $Snapshot.SrumDbPath) { $Snapshot.Status = 'SrumReadFailed:CopyFailed' }
         Write-CMTraceLog -Message "App Usage: the snapshot failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
     }
+    finally
+    {
+        # Every copy is made (or failed), and nothing later reads the shadow copy, so release it now.
+        # When this fails, ShadowId and the marker stay for Remove-AUSnapshot and the next run.
+        if ($Snapshot.ShadowId -and (Remove-AUShadowCopy -ShadowId $Snapshot.ShadowId))
+        {
+            $Snapshot.ShadowId = $null
+            try { [IO.File]::Delete([IO.Path]::Combine($WorkDir, $script:AUShadowMarker)) }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the shadow marker in $WorkDir`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        }
+    }
     return $Snapshot
 }#endfunction
 
@@ -5949,14 +6095,19 @@ function Remove-AUSnapshot
 .SYNOPSIS
     Removes the snapshot's shadow copy and its whole run work folder. Never throws.
 .DESCRIPTION
-    Runs in Invoke-AppUsage's finally block. Each part is attempted whatever happens to the other,
-    and every failure is logged. The folder delete (Remove-AUFolderTree) is retried briefly, because
-    a hive or database handle can take a moment to close.
+    Runs in Invoke-AppUsage's finally block, as the backstop: New-AUSnapshot normally releases the
+    shadow copy itself. Each part is attempted whatever happens to the other, and every failure is
+    logged. WorkDir is deleted only when it's a direct child of Root and not a link; otherwise it's
+    logged and left alone. The folder delete (Remove-AUFolderTree) is retried briefly, because a hive
+    or database handle can take a moment to close.
 .PARAMETER Snapshot
     The object from New-AUSnapshot, or $null.
+.PARAMETER Root
+    The protected work root, C:\Windows\Temp\PowerStacksAppUsage by default. Tests pass a TestDrive path.
 #>
     param (
-        $Snapshot
+        $Snapshot,
+        [string]$Root = $script:AUWorkRoot
     )
 
     if ($null -eq $Snapshot) { return }
@@ -5969,24 +6120,32 @@ function Remove-AUSnapshot
     }
     catch { }
 
-    if ($ShadowId)
-    {
-        try
-        {
-            if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { throw "'$ShadowId' isn't a shadow copy ID." }
-            $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -ErrorAction Stop
-            if ($Shadow) { $Shadow | Remove-CimInstance -ErrorAction Stop }
-        }
-        catch { Write-CMTraceLog -Message "App Usage: couldn't remove shadow copy $ShadowId`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
-    }
+    if ($ShadowId) { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
 
     if ($WorkDir)
     {
+        try
+        {
+            $Full = [IO.Path]::GetFullPath($WorkDir).TrimEnd('\')
+            $Parent = [IO.Path]::GetDirectoryName($Full)
+            $Inside = $Parent -and [string]::Equals($Parent.TrimEnd('\'), [IO.Path]::GetFullPath($Root).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+            $IsLink = [IO.Directory]::Exists($Full) -and ([IO.File]::GetAttributes($Full) -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        }
+        catch
+        {
+            $Inside = $false
+            $IsLink = $false
+        }
+        if (-not $Inside -or $IsLink)
+        {
+            Write-CMTraceLog -Message "App Usage: left $WorkDir alone, because it isn't a run folder directly inside $Root (or it's a link)." -Component 'AppUsage' -Type 3
+            return
+        }
         for ($Attempt = 1; $Attempt -le 3; $Attempt++)
         {
             try
             {
-                Remove-AUFolderTree -Path $WorkDir
+                Remove-AUFolderTree -Path $Full
                 break
             }
             catch
@@ -6051,6 +6210,78 @@ function Get-AUEseHeader
     return $Header
 }#endfunction
 
+function Add-AUIdMapEntry
+{
+    <#
+.SYNOPSIS
+    Adds one SruDbIdMapTable row to the id map: Apps, Sids, and KnownIds.
+.DESCRIPTION
+    IdType 3 is a binary user SID; 0 to 2 are UTF-16 app identifiers. An entry with an empty blob is
+    still known: the kernel's System and IsrDpc rows use one for "no user". A SID blob that doesn't
+    parse is removed from KnownIds and counted in BadSids, so its rows count as unresolved and the
+    read as incomplete (Task 15 then archives nothing).
+.PARAMETER IdMap
+    A hashtable with Apps, Sids, and KnownIds (hashtables keyed by IdIndex) and BadSids (a count).
+.PARAMETER IdType
+    The row's IdType.
+.PARAMETER IdIndex
+    The row's IdIndex; a null one is skipped.
+.PARAMETER Blob
+    The row's IdBlob.
+#>
+    param (
+        [hashtable]$IdMap,
+        $IdType,
+        $IdIndex,
+        [byte[]]$Blob
+    )
+
+    if ($null -eq $IdIndex) { return }
+    $Index = [int]$IdIndex
+    $IdMap.KnownIds[$Index] = $true
+    if ($null -eq $Blob -or $Blob.Length -eq 0) { return }
+    if ($IdType -eq 3)
+    {
+        try { $IdMap.Sids[$Index] = (New-Object Security.Principal.SecurityIdentifier($Blob, 0)).Value }
+        catch
+        {
+            $IdMap.KnownIds.Remove($Index)
+            $IdMap.BadSids++
+        }
+        return
+    }
+    $Text = [Text.Encoding]::Unicode.GetString($Blob).TrimEnd([char]0)
+    if ($Text) { $IdMap.Apps[$Index] = $Text }
+}#endfunction
+
+function Test-AUTimelineRowResolved
+{
+    <#
+.SYNOPSIS
+    Returns true when a timeline row has an AutoIncId and its AppId and UserId are known in the id map.
+.DESCRIPTION
+    A row that fails this can't be keyed reliably in the ledger, so the read counts as incomplete
+    and Task 15 merges with -NoArchive.
+.PARAMETER AppId
+    The row's AppId.
+.PARAMETER UserId
+    The row's UserId.
+.PARAMETER AutoIncId
+    The row's AutoIncId.
+.PARAMETER KnownIds
+    The id map's KnownIds.
+#>
+    param (
+        $AppId,
+        $UserId,
+        $AutoIncId,
+        [hashtable]$KnownIds
+    )
+
+    if ($null -eq $AutoIncId -or $null -eq $AppId -or $null -eq $UserId) { return $false }
+    return ($KnownIds.ContainsKey([int]$AppId) -and $KnownIds.ContainsKey([int]$UserId))
+}#endfunction
+
 function Read-AUSrumTables
 {
     <#
@@ -6063,9 +6294,10 @@ function Read-AUSrumTables
     IdMapFailed, NoTimeline, or TimelineFailed).
     Timeline holds every row, unfiltered by time, because the ledger archives a missing key only by
     its AutoIncId (Task 9). A row whose AppId or UserId is null or isn't in the id map is still
-    returned, with a $null ExeInfo or UserSid, and makes Complete false. An id map entry with an
-    empty value (the kernel's System and IsrDpc rows have no user) is known, so its $null UserSid
-    doesn't. EndTimeUtc is the EndTime FILETIME, or the row's TimeStamp when EndTime is unset. Focus
+    returned, with a $null ExeInfo or UserSid, and makes Complete false, as does a row with no
+    AutoIncId or a user id whose SID doesn't parse (Test-AUTimelineRowResolved, Add-AUIdMapEntry).
+    An id map entry with an empty value (the kernel's System and IsrDpc rows have no user) is known,
+    so its $null UserSid doesn't. EndTimeUtc is the EndTime FILETIME, or the row's TimeStamp when EndTime is unset. Focus
     and input are seconds, with null read as 0.
     Resource holds one row per user and kernel path (identifiers containing a backslash), with the
     newest TimeStamp. A resource read failure is logged and leaves Resource empty; usage still counts.
@@ -6110,12 +6342,11 @@ function Read-AUSrumTables
         $Opened = $true
         $Tables = @($Api::GetTableNames($Session, $DbId))
 
-        # SruDbIdMapTable: IdType 3 is a binary user SID; 0 to 2 are UTF-16 app identifiers. An entry
-        # with an empty blob is still known: the kernel's System and IsrDpc rows use one for "no user".
         $Stage = 'IdMapFailed'
-        $Apps = @{}
-        $Sids = @{}
-        $KnownIds = @{}
+        $IdMap = @{ Apps = @{}; Sids = @{}; KnownIds = @{}; BadSids = 0 }
+        $Apps = $IdMap.Apps
+        $Sids = $IdMap.Sids
+        $KnownIds = $IdMap.KnownIds
         $Table = New-Object Microsoft.Isam.Esent.Interop.Table($Session, $DbId, 'SruDbIdMapTable', [Microsoft.Isam.Esent.Interop.OpenTableGrbit]::ReadOnly)
         try
         {
@@ -6128,22 +6359,12 @@ function Read-AUSrumTables
                     $IdType = $Api::RetrieveColumnAsByte($Session, $Table.JetTableid, $Columns['IdType'])
                     $IdIndex = $Api::RetrieveColumnAsInt32($Session, $Table.JetTableid, $Columns['IdIndex'])
                     $Blob = $Api::RetrieveColumn($Session, $Table.JetTableid, $Columns['IdBlob'])
-                    if ($null -eq $IdIndex) { continue }
-                    $KnownIds[[int]$IdIndex] = $true
-                    if ($null -eq $Blob -or $Blob.Length -eq 0) { continue }
-                    if ($IdType -eq 3)
-                    {
-                        try { $Sids[[int]$IdIndex] = (New-Object Security.Principal.SecurityIdentifier($Blob, 0)).Value } catch { }
-                    }
-                    else
-                    {
-                        $Text = [Text.Encoding]::Unicode.GetString($Blob).TrimEnd([char]0)
-                        if ($Text) { $Apps[[int]$IdIndex] = $Text }
-                    }
+                    Add-AUIdMapEntry -IdMap $IdMap -IdType $IdType -IdIndex $IdIndex -Blob $Blob
                 } while ($Api::TryMoveNext($Session, $Table.JetTableid))
             }
         }
         finally { $Table.Dispose() }
+        if ($IdMap.BadSids -gt 0) { Write-CMTraceLog -Message "App Usage: $($IdMap.BadSids) SRUM user ids hold a SID that doesn't parse, so their rows count as unresolved." -Component 'AppUsage' -Type 2 }
 
         $Stage = 'NoTimeline'
         if ($Tables -notcontains $script:AUTimelineTable) { throw "table $($script:AUTimelineTable) isn't in the database." }
@@ -6169,11 +6390,12 @@ function Read-AUSrumTables
                     $Focus = $Api::RetrieveColumnAsInt32($Session, $Tid, $Columns[$script:AUFocusColumn])
                     $InputSeconds = $Api::RetrieveColumnAsInt32($Session, $Tid, $Columns[$script:AUInputColumn])
                     $EndTime = $Api::RetrieveColumnAsInt64($Session, $Tid, $Columns['EndTime'])
+                    $AutoIncId = $Api::RetrieveColumnAsInt32($Session, $Tid, $Columns['AutoIncId'])
                     $ExeInfo = $null
                     if ($null -ne $AppId) { $ExeInfo = $Apps[[int]$AppId] }
                     $UserSid = $null
                     if ($null -ne $UserId) { $UserSid = $Sids[[int]$UserId] }
-                    if ($null -eq $AppId -or $null -eq $UserId -or -not $KnownIds.ContainsKey([int]$AppId) -or -not $KnownIds.ContainsKey([int]$UserId)) { $Unresolved++ }
+                    if (-not (Test-AUTimelineRowResolved -AppId $AppId -UserId $UserId -AutoIncId $AutoIncId -KnownIds $KnownIds)) { $Unresolved++ }
                     $EndTimeUtc = $null
                     if ($null -ne $EndTime) { $EndTimeUtc = ConvertFrom-AUFileTime -FileTime $EndTime }
                     if ($null -eq $EndTimeUtc)
@@ -6186,7 +6408,7 @@ function Read-AUSrumTables
                     $Timeline.Add([pscustomobject]@{
                             UserSid      = $UserSid
                             ExeInfo      = $ExeInfo
-                            AutoIncId    = $Api::RetrieveColumnAsInt32($Session, $Tid, $Columns['AutoIncId'])
+                            AutoIncId    = $AutoIncId
                             EndTimeUtc   = $EndTimeUtc
                             FocusSeconds = [long]$Focus
                             InputSeconds = [long]$InputSeconds
@@ -6197,7 +6419,7 @@ function Read-AUSrumTables
         finally { $Table.Dispose() }
         $Result.Timeline = $Timeline.ToArray()
         $Result.Complete = ($Unresolved -eq 0)
-        if ($Unresolved -gt 0) { Write-CMTraceLog -Message "App Usage: $Unresolved SRUM timeline rows have an AppId or UserId that isn't in the id map, so this read counts as incomplete." -Component 'AppUsage' -Type 2 }
+        if ($Unresolved -gt 0) { Write-CMTraceLog -Message "App Usage: $Unresolved SRUM timeline rows have no AutoIncId, or an AppId or UserId that isn't resolved in the id map, so this read counts as incomplete." -Component 'AppUsage' -Type 2 }
 
         $Stage = $null
         try
@@ -6252,17 +6474,32 @@ function Read-AUSrumTables
     }
     finally
     {
-        try
+        # Each step on its own, so one failure doesn't skip the rest; an instance that won't stop
+        # cleanly is stopped abruptly, so the copy's handle is released before cleanup.
+        if ($Opened)
         {
-            if ($Opened) { [void]$Api::JetCloseDatabase($Session, $DbId, [Microsoft.Isam.Esent.Interop.CloseDatabaseGrbit]::None) }
-            if ($Attached) { [void]$Api::JetDetachDatabase($Session, $DbPath) }
-            if ($InSession) { [void]$Api::JetEndSession($Session, [Microsoft.Isam.Esent.Interop.EndSessionGrbit]::None) }
+            try { [void]$Api::JetCloseDatabase($Session, $DbId, [Microsoft.Isam.Esent.Interop.CloseDatabaseGrbit]::None) }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't close the SRUM database: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
-        catch { Write-CMTraceLog -Message "App Usage: couldn't close the SRUM database cleanly: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        if ($Attached)
+        {
+            try { [void]$Api::JetDetachDatabase($Session, $DbPath) }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't detach the SRUM database: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        }
+        if ($InSession)
+        {
+            try { [void]$Api::JetEndSession($Session, [Microsoft.Isam.Esent.Interop.EndSessionGrbit]::None) }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't end the ESE session: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        }
         if ($Created)
         {
             try { [void]$Api::JetTerm($Instance) }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't stop the ESE instance: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch
+            {
+                Write-CMTraceLog -Message "App Usage: couldn't stop the ESE instance, so stopping it abruptly: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+                try { [void]$Api::JetTerm2($Instance, [Microsoft.Isam.Esent.Interop.TermGrbit]::Abrupt) }
+                catch { Write-CMTraceLog -Message "App Usage: couldn't stop the ESE instance abruptly: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            }
         }
     }
     return $Result

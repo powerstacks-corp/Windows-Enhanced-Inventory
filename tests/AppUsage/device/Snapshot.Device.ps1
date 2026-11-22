@@ -70,9 +70,25 @@ $Out.ShadowsBefore = @(Get-CimInstance -ClassName Win32_ShadowCopy).Count
 $RunId = "devcheck-$([guid]::NewGuid().ToString('N'))"
 $WorkDir = $null
 $Snapshot = $null
+$Stale = $null
+$StaleShadowId = $null
 try
 {
+    # A run killed 25 hours ago: its folder and a real shadow copy named in its marker. This run's
+    # New-AUWorkDir must remove both.
+    $Created = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = "$($env:SystemDrive)\"; Context = 'ClientAccessible' }
+    $StaleShadowId = [string]$Created.ShadowID
+    $Stale = New-AUWorkDir -RunId "devcheck-stale-$([guid]::NewGuid().ToString('N'))"
+    [IO.File]::WriteAllText((Join-Path $Stale 'shadow.id'), $StaleShadowId)
+    [IO.File]::WriteAllText((Join-Path $Stale 'SRUDB.dat'), 'left by a killed run')
+    [IO.Directory]::SetCreationTimeUtc($Stale, [DateTime]::UtcNow.AddHours(-25))
+    $Out.StaleShadowCreated = [bool]@(Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $StaleShadowId }).Count
+
     $WorkDir = New-AUWorkDir -RunId $RunId
+    $Out.StaleSweep = [ordered]@{
+        FolderGone = -not (Test-Path -LiteralPath $Stale)
+        ShadowGone = -not @(Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $StaleShadowId }).Count
+    }
     $Out.WorkDir = $WorkDir
     $Out.RootAcl = Get-AclSummary ([IO.Path]::GetDirectoryName($WorkDir))
     $Out.RunAcl = Get-AclSummary $WorkDir
@@ -89,7 +105,9 @@ try
         SignedOutHives   = $Snapshot.HiveCopies.Count
         HivesCopied      = @($Snapshot.HiveCopies.Values | Where-Object { $_ }).Count
     }
-    $Out.ShadowsDuring = @(Get-CimInstance -ClassName Win32_ShadowCopy).Count
+    # New-AUSnapshot releases its shadow copy once the copies are made.
+    $Out.ShadowsAfterSnapshot = @(Get-CimInstance -ClassName Win32_ShadowCopy).Count
+    $Out.MarkerAfterSnapshot = Test-Path -LiteralPath (Join-Path $WorkDir 'shadow.id')
     if ($Snapshot.SrumDbPath) { $Out.SrumCopyAcl = Get-AclSummary $Snapshot.SrumDbPath }
     $Hive = @($Snapshot.HiveCopies.Values | Where-Object { $_ }) | Select-Object -First 1
     if ($Hive) { $Out.HiveCopyAcl = Get-AclSummary $Hive }
@@ -125,6 +143,9 @@ finally
 {
     if ($null -eq $Snapshot -and $WorkDir) { $Snapshot = [pscustomobject]@{ WorkDir = $WorkDir; ShadowId = $null } }
     Remove-AUSnapshot -Snapshot $Snapshot
+    # If the sweep didn't remove the planted stale run, remove it here so the check leaves nothing.
+    if ($Stale -and (Test-Path -LiteralPath $Stale)) { Remove-AUSnapshot -Snapshot ([pscustomobject]@{ WorkDir = $Stale; ShadowId = $StaleShadowId }) }
+    elseif ($StaleShadowId) { [void](Remove-AUShadowCopy -ShadowId $StaleShadowId) }
 }
 
 $Out.After = [ordered]@{

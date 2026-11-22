@@ -49,45 +49,118 @@ Describe 'New-AUWorkDir (F28, D18)' {
         @($Rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object) | Should -Be @('S-1-5-18', 'S-1-5-32-544')
     }
 
-    It 'replaces a root that is a junction, and leaves the junction target alone' {
+    It 'moves a root that is a junction aside, and leaves the junction target alone' {
         $Target = Join-Path $TestDrive 'elsewhere'
         $null = New-Item -ItemType Directory -Path $Target
         [IO.File]::WriteAllText((Join-Path $Target 'keep.txt'), 'keep')
         $Root = Join-Path $TestDrive 'JunctionRoot'
         $null = & cmd.exe /d /c mklink /j "$Root" "$Target"
         ([IO.File]::GetAttributes($Root) -band [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
+        Mock Remove-AUFolderTree { }
 
         $Path = New-AUWorkDir -RunId 'run-2' -Root $Root
         ([IO.File]::GetAttributes($Root) -band [IO.FileAttributes]::ReparsePoint) | Should -Be 0
         Assert-ProtectedFolderAcl $Root
         Test-Path -LiteralPath $Path | Should -BeTrue
+        $Aside = @(Get-Item -Path "$Root.untrusted-*" -Force)
+        $Aside.Count | Should -Be 1
+        ($Aside[0].Attributes -band [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
         Test-Path -LiteralPath (Join-Path $Target 'keep.txt') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $Target 'run-2') | Should -BeFalse
+        Should -Invoke Remove-AUFolderTree -Times 0
     }
 
-    It 'replaces a root that someone other than SYSTEM or Administrators owns, without following a junction inside it' {
-        $Target = Join-Path $TestDrive 'outside'
-        $null = New-Item -ItemType Directory -Path $Target
-        [IO.File]::WriteAllText((Join-Path $Target 'keep.txt'), 'keep')
-        $Root = Join-Path $TestDrive 'PlantedRoot'
-        $null = New-Item -ItemType Directory -Path $Root
-        [IO.File]::WriteAllText((Join-Path $Root 'planted.txt'), 'planted')
-        $null = & cmd.exe /d /c mklink /j "$(Join-Path $Root 'link')" "$Target"
-        $Acl = Get-Acl -LiteralPath $Root
-        $Acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
-        Set-Acl -LiteralPath $Root -AclObject $Acl
-        (Get-Acl -LiteralPath $Root).GetOwner([Security.Principal.SecurityIdentifier]).Value | Should -Be ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    Context 'a root someone else controls (squatted in C:\Windows\Temp)' {
+        BeforeEach {
+            $script:Target = Join-Path $TestDrive "outside-$([guid]::NewGuid().ToString('N'))"
+            $null = New-Item -ItemType Directory -Path $script:Target
+            [IO.File]::WriteAllText((Join-Path $script:Target 'keep.txt'), 'keep')
+            $script:Root = Join-Path $TestDrive "PlantedRoot-$([guid]::NewGuid().ToString('N'))"
+            $null = New-Item -ItemType Directory -Path $script:Root
+            [IO.File]::WriteAllText((Join-Path $script:Root 'planted.txt'), 'planted')
+            $null = & cmd.exe /d /c mklink /j "$(Join-Path $script:Root 'sub')" "$script:Target"
+            # The current user stands in for the standard user who squatted the root.
+            $Acl = Get-Acl -LiteralPath $script:Root
+            $Acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+            Set-Acl -LiteralPath $script:Root -AclObject $Acl
+            (Get-Acl -LiteralPath $script:Root).GetOwner([Security.Principal.SecurityIdentifier]).Value | Should -Be ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+            Test-AUTrustedFolder -Path $script:Root | Should -BeFalse
+            Mock Remove-AUFolderTree { }
+        }
 
-        $null = New-AUWorkDir -RunId 'run-3' -Root $Root
-        (Get-Acl -LiteralPath $Root).GetOwner([Security.Principal.SecurityIdentifier]).Value | Should -BeIn @('S-1-5-18', 'S-1-5-32-544')
-        Test-Path -LiteralPath (Join-Path $Root 'planted.txt') | Should -BeFalse
+        It 'moves it aside whole, never looking inside or deleting, and makes a fresh root' {
+            $null = New-AUWorkDir -RunId 'run-3' -Root $script:Root
+            Assert-ProtectedFolderAcl $script:Root
+            Test-Path -LiteralPath (Join-Path $script:Root 'planted.txt') | Should -BeFalse
+            $Aside = @(Get-Item -Path "$($script:Root).untrusted-*" -Force)
+            $Aside.Count | Should -Be 1
+            Test-Path -LiteralPath (Join-Path $Aside[0].FullName 'planted.txt') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $script:Target 'keep.txt') | Should -BeTrue
+            Should -Invoke Remove-AUFolderTree -Times 0
+        }
+
+        It 'skips with SrumReadFailed:WorkDirUntrusted, deleting nothing, when it cannot be moved aside' {
+            Mock Move-AUUntrustedItem { throw 'the folder is in use' }
+            { New-AUWorkDir -RunId 'run-4' -Root $script:Root } | Should -Throw -ExpectedMessage 'SrumReadFailed:WorkDirUntrusted*'
+            Test-Path -LiteralPath (Join-Path $script:Root 'planted.txt') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $script:Root 'run-4') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $script:Target 'keep.txt') | Should -BeTrue
+            Should -Invoke Remove-AUFolderTree -Times 0
+        }
+    }
+
+    It 'moves aside a root an administrator owns whose DACL lets others in' {
+        $Root = Join-Path $TestDrive 'LooseRoot'
+        $null = New-AUWorkDir -RunId 'run-5' -Root $Root
+        $Acl = Get-Acl -LiteralPath $Root
+        $Acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+        Set-Acl -LiteralPath $Root -AclObject $Acl
+        Test-AUTrustedFolder -Path $Root | Should -BeFalse
+
+        $null = New-AUWorkDir -RunId 'run-6' -Root $Root
         Assert-ProtectedFolderAcl $Root
-        Test-Path -LiteralPath (Join-Path $Target 'keep.txt') | Should -BeTrue
+        @(Get-Item -Path "$Root.untrusted-*" -Force).Count | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $Root 'run-5') | Should -BeFalse
     }
 
     It 'rejects a RunId that is not a plain folder name' {
         { New-AUWorkDir -RunId '..\escape' -Root (Join-Path $TestDrive 'R') } | Should -Throw
         { New-AUWorkDir -RunId '' -Root (Join-Path $TestDrive 'R') } | Should -Throw
+    }
+}
+
+Describe 'Stale run cleanup (F28)' {
+    It 'removes run folders a killed run left more than 24 hours ago, and the shadow copies their markers name' {
+        Mock Remove-AUShadowCopy { $true }
+        $Root = Join-Path $TestDrive 'SweepRoot'
+        $Recent = New-AUWorkDir -RunId 'recent-run' -Root $Root
+        [IO.Directory]::SetCreationTimeUtc($Recent, [datetime]::UtcNow.AddHours(-23))
+        $Old = New-AUWorkDir -RunId 'old-run' -Root $Root
+        [IO.File]::WriteAllText((Join-Path $Old 'shadow.id'), '{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}')
+        $null = New-Item -ItemType Directory -Path (Join-Path $Old 'sru')
+        [IO.File]::WriteAllText((Join-Path $Old 'sru\SRUDB.dat'), 'copy')
+        [IO.Directory]::SetCreationTimeUtc($Old, [datetime]::UtcNow.AddHours(-25))
+
+        $Current = New-AUWorkDir -RunId 'current-run' -Root $Root
+        Test-Path -LiteralPath $Old | Should -BeFalse
+        Test-Path -LiteralPath $Recent | Should -BeTrue
+        Test-Path -LiteralPath $Current | Should -BeTrue
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq '{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}' }
+    }
+
+    It 'never follows or removes a link in the work root' {
+        $Root = Join-Path $TestDrive 'SweepLinkRoot'
+        $null = New-AUWorkDir -RunId 'first' -Root $Root
+        $Target = Join-Path $TestDrive 'sweep-target'
+        $null = New-Item -ItemType Directory -Path $Target
+        [IO.File]::WriteAllText((Join-Path $Target 'keep.txt'), 'keep')
+        [IO.Directory]::SetCreationTimeUtc($Target, [datetime]::UtcNow.AddHours(-48))
+        $Link = Join-Path $Root 'link'
+        $null = & cmd.exe /d /c mklink /j "$Link" "$Target"
+
+        $null = New-AUWorkDir -RunId 'second' -Root $Root
+        Test-Path -LiteralPath $Link | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $Target 'keep.txt') | Should -BeTrue
     }
 }
 
@@ -111,6 +184,9 @@ Describe 'New-AUSnapshot' {
             [IO.File]::WriteAllText($File, 'copy')
             return $true
         }
+        # Records how many copies were made when the shadow copy was released.
+        $script:CopiesAtRelease = $null
+        Mock Remove-AUShadowCopy { $script:CopiesAtRelease = $script:Copied.Count; $true }
     }
 
     It 'gives ShadowCopyFailed, a null SrumDbPath, and no copies when the shadow copy fails' {
@@ -124,6 +200,7 @@ Describe 'New-AUSnapshot' {
         $S.HiveCopies.ContainsKey($script:SignedOutSid) | Should -BeTrue
         $S.HiveCopies[$script:SignedOutSid] | Should -BeNullOrEmpty
         Should -Invoke Copy-AUShadowFile -Times 0
+        Should -Invoke Remove-AUShadowCopy -Times 0
     }
 
     It 'copies SRUM and signed-out hives only from the shadow root, into the work folder' {
@@ -133,7 +210,6 @@ Describe 'New-AUSnapshot' {
         $Output.Count | Should -Be 1
         $S = $Output[0]
         $S.Status | Should -Be 'OK'
-        $S.ShadowId | Should -Be $script:ShadowId
         $S.ShadowRoot | Should -Be $script:ShadowRoot
         $S.SrumDbPath | Should -Be (Join-Path $script:WorkDir 'sru\SRUDB.dat')
         $S.HiveCopies[$script:SignedOutSid] | Should -Be (Join-Path $script:WorkDir "hives\$($script:SignedOutSid)\NTUSER.DAT")
@@ -149,17 +225,33 @@ Describe 'New-AUSnapshot' {
         $script:Copied | Should -Contain "$Link\Windows\System32\sru\*"
         $script:Copied | Should -Contain "$Link\Users\signedout\NTUSER.DAT"
         Test-Path -LiteralPath $Link | Should -BeFalse
+        # The shadow copy is released once, after every copy, and its marker goes with it.
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:ShadowId }
+        $script:CopiesAtRelease | Should -Be $script:Copied.Count
+        $S.ShadowId | Should -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $script:WorkDir 'shadow.id') | Should -BeFalse
     }
 
-    It 'gives ShadowCopyFailed, keeping the ShadowId for cleanup, when the shadow copy cannot be linked' {
+    It 'gives ShadowCopyFailed when the shadow copy cannot be linked, and still releases it' {
         Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
         Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
         Mock Mount-AUShadow { $false }
         $S = New-AUSnapshot -WorkDir $script:WorkDir
         $S.Status | Should -Be 'ShadowCopyFailed'
-        $S.ShadowId | Should -Be $script:ShadowId
         $S.SrumDbPath | Should -BeNullOrEmpty
+        $S.ShadowId | Should -BeNullOrEmpty
         Should -Invoke Copy-AUShadowFile -Times 0
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:ShadowId }
+    }
+
+    It 'keeps ShadowId and the shadow.id marker for later cleanup when the release fails' {
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Mock Remove-AUShadowCopy { $false }
+        $S = New-AUSnapshot -WorkDir $script:WorkDir
+        $S.Status | Should -Be 'OK'
+        $S.ShadowId | Should -Be $script:ShadowId
+        [IO.File]::ReadAllText((Join-Path $script:WorkDir 'shadow.id')) | Should -Be $script:ShadowId
     }
 
     It 'records a hive that does not copy as $null and a SRUM copy failure in Status' {
@@ -169,7 +261,7 @@ Describe 'New-AUSnapshot' {
         $S = New-AUSnapshot -WorkDir $script:WorkDir
         $S.Status | Should -Be 'SrumReadFailed:CopyFailed'
         $S.SrumDbPath | Should -BeNullOrEmpty
-        $S.ShadowId | Should -Be $script:ShadowId
+        $S.ShadowId | Should -BeNullOrEmpty
         $S.HiveCopies[$script:SignedOutSid] | Should -BeNullOrEmpty
     }
 }
@@ -200,6 +292,7 @@ Describe 'Copy-AUShadowFile' {
 
 Describe 'Remove-AUSnapshot' {
     BeforeEach {
+        $script:Root = Join-Path $TestDrive 'PowerStacksAppUsage'
         $script:WorkDir = New-TestWorkDir
         $null = New-Item -ItemType Directory -Path (Join-Path $script:WorkDir 'sru')
         [IO.File]::WriteAllText((Join-Path $script:WorkDir 'sru\SRUDB.dat'), 'copy')
@@ -211,19 +304,84 @@ Describe 'Remove-AUSnapshot' {
         # A client-only CimInstance, so it binds to Remove-CimInstance like the real one.
         Mock Get-CimInstance { New-CimInstance -ClassName Win32_ShadowCopy -Namespace 'root/cimv2' -ClientOnly -Property @{ ID = $script:ShadowId } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
         Mock Remove-CimInstance { }
-        @(Remove-AUSnapshot -Snapshot $script:Snapshot).Count | Should -Be 0
+        @(Remove-AUSnapshot -Snapshot $script:Snapshot -Root $script:Root).Count | Should -Be 0
         Should -Invoke Remove-CimInstance -Times 1
         Test-Path -LiteralPath $script:WorkDir | Should -BeFalse
     }
 
     It 'never throws, and still removes the run folder, when the shadow copy cannot be removed' {
         Mock Get-CimInstance { throw 'WMI is broken' } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
-        { Remove-AUSnapshot -Snapshot $script:Snapshot } | Should -Not -Throw
+        { Remove-AUSnapshot -Snapshot $script:Snapshot -Root $script:Root } | Should -Not -Throw
         Test-Path -LiteralPath $script:WorkDir | Should -BeFalse
     }
 
     It 'does nothing and never throws for a null snapshot' {
-        { Remove-AUSnapshot -Snapshot $null } | Should -Not -Throw
+        { Remove-AUSnapshot -Snapshot $null -Root $script:Root } | Should -Not -Throw
+    }
+
+    It 'leaves a WorkDir alone that is not directly inside the work root' {
+        Mock Remove-AUFolderTree { }
+        $Elsewhere = Join-Path $TestDrive 'elsewhere-run'
+        $null = New-Item -ItemType Directory -Path $Elsewhere
+        $Nested = Join-Path $script:WorkDir 'nested'
+        $null = New-Item -ItemType Directory -Path $Nested
+        foreach ($Path in @($Elsewhere, $Nested, $script:Root))
+        {
+            { Remove-AUSnapshot -Snapshot ([pscustomobject]@{ WorkDir = $Path; ShadowId = $null }) -Root $script:Root } | Should -Not -Throw
+            Test-Path -LiteralPath $Path | Should -BeTrue
+        }
+        Should -Invoke Remove-AUFolderTree -Times 0
+    }
+
+    It 'leaves a WorkDir alone that is a link, and its target' {
+        $Target = Join-Path $TestDrive 'link-target'
+        $null = New-Item -ItemType Directory -Path $Target
+        [IO.File]::WriteAllText((Join-Path $Target 'keep.txt'), 'keep')
+        $Link = Join-Path $script:Root 'linked-run'
+        $null = & cmd.exe /d /c mklink /j "$Link" "$Target"
+        Remove-AUSnapshot -Snapshot ([pscustomobject]@{ WorkDir = $Link; ShadowId = $null }) -Root $script:Root
+        Test-Path -LiteralPath $Link | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $Target 'keep.txt') | Should -BeTrue
+    }
+
+    It 'matches the work root case-insensitively' {
+        Remove-AUSnapshot -Snapshot ([pscustomobject]@{ WorkDir = $script:WorkDir.ToUpperInvariant(); ShadowId = $null }) -Root $script:Root.ToLowerInvariant()
+        Test-Path -LiteralPath $script:WorkDir | Should -BeFalse
+    }
+}
+
+Describe 'SRUM id map and row resolution (archive safety)' {
+    BeforeEach {
+        $script:Map = @{ Apps = @{}; Sids = @{}; KnownIds = @{}; BadSids = 0 }
+    }
+
+    It 'maps a user SID, an app identifier, and a known entry with no value' {
+        Add-AUIdMapEntry -IdMap $script:Map -IdType 3 -IdIndex 4 -Blob ([byte[]](1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0))
+        Add-AUIdMapEntry -IdMap $script:Map -IdType 0 -IdIndex 7 -Blob ([Text.Encoding]::Unicode.GetBytes("!!a.exe!2026/01/01:00:00:00!0!`0"))
+        Add-AUIdMapEntry -IdMap $script:Map -IdType 3 -IdIndex 2 -Blob $null
+        $script:Map.Sids[4] | Should -Be 'S-1-5-18'
+        $script:Map.Apps[7] | Should -Be '!!a.exe!2026/01/01:00:00:00!0!'
+        $script:Map.KnownIds.ContainsKey(2) | Should -BeTrue
+        $script:Map.Sids.ContainsKey(2) | Should -BeFalse
+        $script:Map.BadSids | Should -Be 0
+    }
+
+    It 'drops a user id whose SID does not parse from the known ids, so its rows are unresolved' {
+        Add-AUIdMapEntry -IdMap $script:Map -IdType 3 -IdIndex 9 -Blob ([byte[]](1, 9))
+        Add-AUIdMapEntry -IdMap $script:Map -IdType 0 -IdIndex 7 -Blob ([Text.Encoding]::Unicode.GetBytes('x.exe'))
+        $script:Map.KnownIds.ContainsKey(9) | Should -BeFalse
+        $script:Map.Sids.ContainsKey(9) | Should -BeFalse
+        $script:Map.BadSids | Should -Be 1
+        Test-AUTimelineRowResolved -AppId 7 -UserId 9 -AutoIncId 100 -KnownIds $script:Map.KnownIds | Should -BeFalse
+    }
+
+    It 'counts a row as resolved only with an AutoIncId and known AppId and UserId' {
+        $Known = @{ 2 = $true; 7 = $true }
+        Test-AUTimelineRowResolved -AppId 7 -UserId 2 -AutoIncId 100 -KnownIds $Known | Should -BeTrue
+        Test-AUTimelineRowResolved -AppId 7 -UserId 2 -AutoIncId $null -KnownIds $Known | Should -BeFalse
+        Test-AUTimelineRowResolved -AppId $null -UserId 2 -AutoIncId 100 -KnownIds $Known | Should -BeFalse
+        Test-AUTimelineRowResolved -AppId 7 -UserId $null -AutoIncId 100 -KnownIds $Known | Should -BeFalse
+        Test-AUTimelineRowResolved -AppId 8 -UserId 2 -AutoIncId 100 -KnownIds $Known | Should -BeFalse
     }
 }
 
