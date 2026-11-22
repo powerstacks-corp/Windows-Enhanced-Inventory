@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "customer": {
+    "identityRules": [
+      { "id": "c-no-publisher", "type": "identity", "when": { "exeName": "contoso.exe" }, "target": { "displayName": "Contoso*", "publisher": "Contoso" } }
+    ],
+    "classificationRules": []
+  }
+}

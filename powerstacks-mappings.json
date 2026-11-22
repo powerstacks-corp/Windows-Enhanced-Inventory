@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "powerStacks": {
+    "version": "2026.11.22.1",
+    "identityRules": [
+      { "id": "ps-own-msi", "type": "ownership", "source": "msi", "description": "A file that Windows Installer records as a component of an installed product maps to that product." },
+      { "id": "ps-own-store", "type": "ownership", "source": "store", "description": "A Store package maps to the installed package." },
+      { "id": "ps-arp-compare", "type": "arpCompare", "description": "A file whose ProductName or FileDescription and CompanyName agree with an installed app's DisplayName and Publisher maps to that app." }
+    ],
+    "classificationRules": [
+      { "id": "ps-class-windows", "type": "classification", "description": "Part of Windows: runs from the Windows folder and Microsoft is its publisher.", "when": { "locationClass": "Windows", "companyName": "Microsoft Corporation" }, "role": "Windows" },
+      { "id": "ps-class-windows-whoami", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "whoami.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-where", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "where.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-ping", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "ping.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-ipconfig", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "ipconfig.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-tasklist", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "tasklist.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-netstat", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "netstat.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-nslookup", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "nslookup.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-cmd", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "cmd.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-powershell", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "powershell.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-conhost", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "conhost.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-wscript", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "wscript.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-cscript", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "cscript.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-mshta", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "mshta.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-reg", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "reg.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-net", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "net.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-net1", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "net1.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-sc", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "sc.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-rundll32", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "rundll32.exe" }, "role": "Windows" },
+      { "id": "ps-class-windows-regsvr32", "type": "classification", "description": "Windows tool in the Windows folder, even when its file info isn't known.", "when": { "locationClass": "Windows", "exeName": "regsvr32.exe" }, "role": "Windows" },
+      { "id": "ps-class-cli-node", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "node.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-python", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "python.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-pythonw", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "pythonw.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-dotnet", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "dotnet.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-java", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "java.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-javaw", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "javaw.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-ruby", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "ruby.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-perl", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "perl.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-php", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "php.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-pwsh", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "pwsh.exe" }, "role": "CLI" },
+      { "id": "ps-class-cli-msbuild", "type": "classification", "description": "Language runtime or build tool: CLI wherever it runs.", "when": { "exeName": "msbuild.exe" }, "role": "CLI" }
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "customer": {
+    "identityRules": [
+      {
+        "id": "c-timesheets-1",
+        "type": "identity",
+        "description": "In-house app with no publisher in its file info.",
+        "when": { "exeName": "contosotime*.exe", "publisher": "", "productName": "Contoso Time*", "versionMin": "2.0", "versionMax": "2.9.9" },
+        "target": { "displayName": "Contoso Timesheets*", "publisher": "Contoso" }
+      }
+    ],
+    "classificationRules": [
+      { "id": "c-class-updater", "type": "classification", "when": { "exeName": "contosoupd.exe" }, "role": "Helper" },
+      { "id": "c-ignore-kiosk", "type": "ignore", "when": { "exeName": "kiosk.exe", "locationClass": "ProgramFiles" } }
+    ]
+  }
+}

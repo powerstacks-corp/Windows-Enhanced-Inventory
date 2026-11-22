@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "powerStacks": {
+    "version": "2026.11.22.1",
+    "identityRules": [
+      { "id": "ps-own-msi", "type": "ownership", "source": "msi" },
+      { "id": "ps-7zip-1", "type": "identity", "when": { "exeName": "7zfm.exe", "publisher": "Igor Pavlov" }, "target": { "displayName": "7-Zip*", "publisher": "Igor Pavlov" } },
+      { "id": "ps-arp-compare", "type": "arpCompare" }
+    ],
+    "classificationRules": [
+      { "id": "ps-class-windows", "type": "classification", "when": { "locationClass": "Windows", "companyName": "Microsoft Corporation" }, "role": "Windows" },
+      { "id": "ps-ignore-noise", "type": "ignore", "when": { "exeName": "noise*.exe" } }
+    ]
+  }
+}
