@@ -2780,6 +2780,8 @@ function Get-AUNormalizedText
     Publisher: lowercase, dots removed, other punctuation becomes spaces, and trailing legal
     suffixes such as Inc., Corporation, LLC, and Co., Ltd. removed. So "Zoom Communications, Inc."
     becomes "zoom communications".
+    Letters and digits in any script count (Unicode letter and decimal digit classes), so "Mueller"
+    with an umlaut and "Moeller" with an umlaut stay distinct and a CJK name isn't blank.
     Returns '' for a blank value. Results are cached for the run.
 .PARAMETER Text
     The name or publisher.
@@ -2809,11 +2811,11 @@ function Get-AUNormalizedText
             if ($Token -in $script:AUArchTokens) { continue }
             $Kept.Add($Token)
         }
-        $Value = [regex]::Replace(($Kept -join ' '), '[^a-z0-9+#]+', ' ').Trim()
+        $Value = [regex]::Replace(($Kept -join ' '), '[^\p{L}\p{Nd}+#]+', ' ').Trim()
     }
     else
     {
-        $Value = [regex]::Replace($Value.Replace('.', ''), '[^a-z0-9]+', ' ').Trim()
+        $Value = [regex]::Replace($Value.Replace('.', ''), '[^\p{L}\p{Nd}]+', ' ').Trim()
         $Tokens = New-Object 'System.Collections.Generic.List[string]'
         foreach ($Token in ($Value -split ' ')) { if ($Token) { $Tokens.Add($Token) } }
         while ($Tokens.Count -gt 1 -and $Tokens[$Tokens.Count - 1] -in $script:AULegalSuffixes) { $Tokens.RemoveAt($Tokens.Count - 1) }

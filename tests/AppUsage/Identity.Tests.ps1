@@ -311,6 +311,38 @@ Describe 'Resolve-AUIdentity' {
             $r.ResolvedAppName | Should -BeExactly 'Contoso Viewer 2.4.1 x64'
         }
 
+        It 'keeps non-ASCII letters when normalizing, so distinct vendors stay distinct and non-Latin names aren''t blank' {
+            # Built from character codes so this file stays ASCII.
+            $Mueller = 'M' + [char]0x00FC + 'ller GmbH'
+            $Moeller = 'M' + [char]0x00F6 + 'ller GmbH'
+            (Get-AUNormalizedText $Mueller -Kind Publisher) | Should -BeExactly ('m' + [char]0x00FC + 'ller')
+            (Get-AUNormalizedText $Moeller -Kind Publisher) | Should -BeExactly ('m' + [char]0x00F6 + 'ller')
+            $Cyrillic = [string]::new([char[]]@(0x042F, 0x043D, 0x0434, 0x0435, 0x043A, 0x0441))
+            (Get-AUNormalizedText $Cyrillic -Kind Publisher) | Should -BeExactly $Cyrillic.ToLowerInvariant()
+            $Cjk = [string]::new([char[]]@(0x5FAE, 0x4FE1))
+            (Get-AUNormalizedText ($Cjk + ' 3.9 (x64)') -Kind Name) | Should -BeExactly $Cjk
+            (Get-AUNormalizedText ('Contoso ' + $Cjk + '-Tool') -Kind Name) | Should -BeExactly ('contoso ' + $Cjk + ' tool')
+        }
+
+        It 'matches the right one of two vendors whose names differ only in a non-ASCII letter' {
+            $m = New-TestMappings -PowerStacks @($script:RuleArp)
+            $Mu = 'M' + [char]0x00FC + 'ller'
+            $Mo = 'M' + [char]0x00F6 + 'ller'
+            $apps = @((New-TestApp "$Mu Tool" "$Mu GmbH"), (New-TestApp "$Mo Tool" "$Mo GmbH"))
+            $r = Resolve-AUIdentity (New-TestFacts @{ FileProductName = "$Mo Tool"; FileCompanyName = "$Mo GmbH" }) $m $apps
+            $r.MatchRuleId | Should -BeExactly 'ps-arp-compare'
+            $r.ResolvedAppName | Should -BeExactly "$Mo Tool"
+        }
+
+        It 'matches a vendor whose publisher and product are written only in CJK characters' {
+            $m = New-TestMappings -PowerStacks @($script:RuleArp)
+            $Publisher = [string]::new([char[]]@(0x817E, 0x8BAF))
+            $Product = [string]::new([char[]]@(0x5FAE, 0x4FE1))
+            $r = Resolve-AUIdentity (New-TestFacts @{ FileProductName = $Product; FileCompanyName = $Publisher }) $m @((New-TestApp $Product $Publisher), (New-TestApp 'Contoso Alpha' 'Contoso'))
+            $r.MatchRuleId | Should -BeExactly 'ps-arp-compare'
+            $r.ResolvedAppName | Should -BeExactly $Product
+        }
+
         It 'does not match when the publishers disagree' {
             $m = New-TestMappings -PowerStacks @($script:RuleArp)
             $r = Resolve-AUIdentity (New-TestFacts @{ ExeName = 'zoom.exe'; FileProductName = 'Zoom Workplace'; FileCompanyName = 'Fabrikam Ltd.' }) $m @((New-TestApp 'Zoom Workplace (64-bit)' 'Zoom Communications, Inc.'))
