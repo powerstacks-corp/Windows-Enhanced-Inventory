@@ -2401,12 +2401,12 @@ function Test-AUMappings
     }
 
     # Bounded output: an error can echo a value from the file, and a broken file can hold many rules.
+    # Format-AUErrorText makes each one line, so text from the file can't add lines to the log.
     $Limited = New-Object 'System.Collections.Generic.List[string]'
     foreach ($Problem in $Errors)
     {
         if ($Limited.Count -ge $script:AUMaxMappingErrors) { break }
-        if ($Problem.Length -gt 300) { $Problem = $Problem.Substring(0, 300) + '...' }
-        $Limited.Add($Problem)
+        $Limited.Add((Format-AUErrorText $Problem))
     }
     if ($Errors.Count -gt $Limited.Count) { $Limited.Add("... and $($Errors.Count - $Limited.Count) more errors.") }
     return , $Limited.ToArray()

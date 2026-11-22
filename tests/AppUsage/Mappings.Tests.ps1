@@ -285,6 +285,21 @@ Describe 'Test-AUMappings' {
         }
     }
 
+    It 'puts customer text into errors as one capped line, so it can''t add lines to the log' {
+        $m = Read-TestJson 'mappings-customer-valid.json'
+        $m.customer.classificationRules[0].role = "Helper`r`n<![LOG[forged line]LOG]!>`n" + ('x' * 400)
+        $m.customer.classificationRules[1].id = "c-split`r`nforged"
+        $e = Test-AUMappings $m -Kind Customer
+        $e.Count | Should -BeGreaterThan 1
+        foreach ($Problem in $e)
+        {
+            $Problem | Should -Not -Match "[`r`n]"
+            $Problem.Length | Should -BeLessOrEqual 303
+        }
+        ($e -join ' ') | Should -Match 'forged line'
+        ($e -join ' ') | Should -Match 'c-split forged'
+    }
+
     It 'rejects a non-string condition value' {
         $m = Read-TestJson 'mappings-customer-valid.json'
         $m.customer.identityRules[0].when.exeName = 5
