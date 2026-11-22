@@ -6924,6 +6924,943 @@ function Read-AUSrum
     }
     return $Read
 }#endfunction
+
+# All-profile discovery and the inventory list (Task 13). App Usage reads HKEY_USERS through .NET
+# registry keys and its own AU_<SID> mount names, never a PSDrive named HKU (F34): the D36 fallback,
+# Get-InstalledApplications, mounts and removes that drive.
+$script:AURegPath = [IO.Path]::Combine($env:SystemRoot, 'System32\reg.exe')
+$script:AUSystemSid = 'S-1-5-18'
+# The two Uninstall views, written as version 19's Get-InstalledApplications writes them, so RegPath
+# matches its AppUninstallRegPath exactly (F31).
+$script:AUUninstallNative = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+$script:AUUninstallWow = 'Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+$script:AUInstallerUserData = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData'
+# Variables whose value belongs to one user. SYSTEM's own values for them are never used.
+$script:AUPerUserVariables = @('USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'HOMEDRIVE', 'HOMEPATH', 'HOMESHARE', 'USERNAME', 'USERDOMAIN', 'USERDNSDOMAIN',
+    'USERDOMAIN_ROAMINGPROFILE', 'LOGONSERVER', 'TEMP', 'TMP', 'OneDrive', 'OneDriveCommercial', 'OneDriveConsumer', 'SESSIONNAME', 'CLIENTNAME')
+
+function Get-AUUsers
+{
+    <#
+.SYNOPSIS
+    Returns every profile in ProfileList with Sid, UserType, ProfilePath, and ProfileState.
+.DESCRIPTION
+    ProfileState is Loaded (the hive is loaded, so it's read in place), Copied (the snapshot holds a
+    copy of the signed-out user's hive), CopyFailed (signed out, and there's no copy: the copy failed,
+    the profile is off the system drive, or the copy file is gone), or Missing (signed out, and the
+    profile folder isn't on the device, for example a profile container that isn't attached). A user
+    signed out at the snapshot is read from the copy even when signed in now. ProfileList can't show a
+    deleted profile; Invoke-AppUsage marks those Deleted (F29). UserType comes from Get-AUUserType
+    with the snapshot's MachineDomainSid. Never throws; returns nothing when ProfileList can't be read.
+.PARAMETER Snapshot
+    The New-AUSnapshot result, or $null (no copies: every signed-out user is CopyFailed or Missing).
+#>
+    param (
+        $Snapshot
+    )
+
+    try
+    {
+        $Copies = $null
+        if ($null -ne $Snapshot)
+        {
+            $DomainSid = [string]$Snapshot.MachineDomainSid
+            $Copies = $Snapshot.HiveCopies
+        }
+        else { $DomainSid = [string](Get-AUMachineDomainSid) }
+
+        $Users = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($Entry in @(Get-AUProfileList))
+        {
+            if ($null -eq $Entry -or -not $Entry.Sid) { continue }
+            $Sid = [string]$Entry.Sid
+            $ProfilePath = [string]$Entry.ProfilePath
+            $FolderMissing = (-not $ProfilePath -or -not [IO.Directory]::Exists($ProfilePath))
+            if ($null -ne $Copies -and $Copies.ContainsKey($Sid))
+            {
+                $Copy = [string]$Copies[$Sid]
+                if ($Copy -and [IO.File]::Exists($Copy)) { $State = 'Copied' }
+                elseif ($FolderMissing) { $State = 'Missing' }
+                else { $State = 'CopyFailed' }
+            }
+            elseif (Test-AUHiveLoaded -Sid $Sid) { $State = 'Loaded' }
+            elseif ($FolderMissing) { $State = 'Missing' }
+            else { $State = 'CopyFailed' }
+            $Users.Add([pscustomobject]@{
+                    Sid          = $Sid
+                    UserType     = Get-AUUserType -Sid $Sid -MachineDomainSid $DomainSid
+                    ProfilePath  = $ProfilePath
+                    ProfileState = $State
+                })
+        }
+        $Counts = @($Users | Group-Object ProfileState | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', '
+        Write-CMTraceLog -Message "App Usage: $($Users.Count) profiles in ProfileList ($Counts)." -Component 'AppUsage'
+        return $Users.ToArray()
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the users: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+}#endfunction
+
+function Expand-AUEnvironmentText
+{
+    <#
+.SYNOPSIS
+    Expands the %VARIABLE% references in a REG_EXPAND_SZ value without using SYSTEM's per-user values.
+.DESCRIPTION
+    Machine variables (ProgramFiles, ProgramFiles(x86), SystemRoot, windir, ProgramData,
+    CommonProgramFiles, and the rest) expand from the environment, as Windows does. Per-user variables
+    never take SYSTEM's values: for a per-user entry, USERPROFILE is the user's ProfilePath and
+    LOCALAPPDATA its AppData\Local; every other per-user variable (APPDATA, which can be redirected,
+    TEMP, USERNAME, and so on) stays unexpanded, as does any variable that isn't defined.
+.PARAMETER Text
+    The raw value.
+.PARAMETER ProfilePath
+    The owning user's profile folder, or blank for a machine entry.
+#>
+    param (
+        [string]$Text,
+        [string]$ProfilePath
+    )
+
+    if ([string]::IsNullOrEmpty($Text) -or $Text.IndexOf('%') -lt 0) { return $Text }
+    $UserRoot = ([string]$ProfilePath).Trim().TrimEnd('\')
+    $Builder = New-Object Text.StringBuilder
+    $Last = 0
+    foreach ($Match in [regex]::Matches($Text, '%([^%\r\n]+)%'))
+    {
+        [void]$Builder.Append($Text, $Last, $Match.Index - $Last)
+        $Last = $Match.Index + $Match.Length
+        $Name = $Match.Groups[1].Value
+        $Value = $null
+        if ($script:AUPerUserVariables -contains $Name)
+        {
+            if ($UserRoot -and $Name -eq 'USERPROFILE') { $Value = $UserRoot }
+            elseif ($UserRoot -and $Name -eq 'LOCALAPPDATA') { $Value = $UserRoot + '\AppData\Local' }
+        }
+        else { $Value = [Environment]::GetEnvironmentVariable($Name) }
+        if ($null -eq $Value) { $Value = $Match.Value }
+        [void]$Builder.Append($Value)
+    }
+    [void]$Builder.Append($Text, $Last, $Text.Length - $Last)
+    return $Builder.ToString()
+}#endfunction
+
+function Get-AURegistryValue
+{
+    <#
+.SYNOPSIS
+    Returns a registry value as stored, with a REG_EXPAND_SZ value expanded by Expand-AUEnvironmentText.
+.DESCRIPTION
+    Other types come back as Get-ItemProperty gives them (a string array for REG_MULTI_SZ, a number for
+    a DWORD), so the inventory fields match version 19. $null when the value is absent.
+.PARAMETER Key
+    The open registry key.
+.PARAMETER Name
+    The value name.
+.PARAMETER ProfilePath
+    The owning user's profile folder, or blank for a machine entry.
+#>
+    param (
+        [Microsoft.Win32.RegistryKey]$Key,
+        [string]$Name,
+        [string]$ProfilePath
+    )
+
+    $Value = $Key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if ($Value -is [string] -and $Key.GetValueKind($Name) -eq [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    {
+        $Value = Expand-AUEnvironmentText -Text $Value -ProfilePath $ProfilePath
+    }
+    # The comma keeps a REG_MULTI_SZ array whole.
+    return , $Value
+}#endfunction
+
+function ConvertTo-AUInstallDate
+{
+    <#
+.SYNOPSIS
+    Converts an ARP InstallDate exactly as version 19 does: yyyyMMdd becomes dd-MM-yyyy, anything else $null.
+.PARAMETER Value
+    The raw InstallDate value.
+#>
+    param (
+        $Value
+    )
+
+    if (![string]::IsNullOrWhiteSpace($Value))
+    {
+        $parsedDate = [DateTime]::MinValue
+        if ([DateTime]::TryParseExact($Value, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsedDate))
+        {
+            return $parsedDate.ToString('dd-MM-yyyy')
+        }
+    }
+    return $null
+}#endfunction
+
+function Open-AURegistryBase
+{
+    <#
+.SYNOPSIS
+    Opens HKEY_LOCAL_MACHINE (64-bit view) or one key directly under HKEY_USERS. The caller closes it.
+.DESCRIPTION
+    Returns $null when the HKEY_USERS key isn't there (the hive isn't loaded). Throws on other
+    failures. A separate function so tests can point it at a fixture key.
+.PARAMETER Hive
+    Machine or Users.
+.PARAMETER Name
+    For Users, the key name: a SID, or an AU_ mount name.
+#>
+    param (
+        [ValidateSet('Machine', 'Users')][string]$Hive,
+        [string]$Name
+    )
+
+    if ($Hive -eq 'Machine') { return [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64) }
+    $UsersKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Registry64)
+    try { return $UsersKey.OpenSubKey($Name) }
+    finally { $UsersKey.Close() }
+}#endfunction
+
+function Get-AUHiveMountName
+{
+    <#
+.SYNOPSIS
+    Returns the HKEY_USERS name App Usage loads a user's hive copy under: AU_ and the SID, with any
+    character other than a letter, digit, or hyphen replaced by _.
+.PARAMETER Sid
+    The user SID.
+#>
+    param (
+        [string]$Sid
+    )
+
+    return 'AU_' + [regex]::Replace([string]$Sid, '[^A-Za-z0-9-]', '_')
+}#endfunction
+
+function Dismount-AUHive
+{
+    <#
+.SYNOPSIS
+    Unloads HKEY_USERS\<MountName> with reg unload, after a garbage collection releases any open key
+    handles. Tries three times. Returns true when it's unloaded. Never throws.
+.PARAMETER MountName
+    The AU_ mount name.
+#>
+    param (
+        [string]$MountName
+    )
+
+    for ($Attempt = 1; $Attempt -le 3; $Attempt++)
+    {
+        try
+        {
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+            $Result = Invoke-AUProcess -FilePath $script:AURegPath -Arguments "unload `"HKU\$MountName`"" -WorkingDirectory ([IO.Path]::GetDirectoryName($script:AURegPath)) -TimeoutSeconds $script:AUToolTimeoutSeconds
+            if ($Result.ExitCode -eq 0 -or -not (Test-AUHiveLoaded -Sid $MountName)) { return $true }
+            $Detail = "exit $($Result.ExitCode), timed out $($Result.TimedOut): $(([string]$Result.Output).Trim())"
+        }
+        catch { $Detail = $_.Exception.Message }
+        if ($Attempt -lt 3) { Start-Sleep -Milliseconds 500 }
+    }
+    Write-CMTraceLog -Message "App Usage: couldn't unload HKU\$MountName ($Detail)." -Component 'AppUsage' -Type 3
+    return $false
+}#endfunction
+
+function Mount-AUHive
+{
+    <#
+.SYNOPSIS
+    Loads a hive copy at HKEY_USERS\<MountName> with reg load. Returns true when it's loaded. Never throws.
+.DESCRIPTION
+    Only ever given a copy in the run work folder, never a user's live NTUSER.DAT. A mount of the same
+    name left by a killed run is unloaded first.
+.PARAMETER MountName
+    The AU_ mount name (Get-AUHiveMountName).
+.PARAMETER Path
+    The hive copy.
+#>
+    param (
+        [string]$MountName,
+        [string]$Path
+    )
+
+    try
+    {
+        if (-not $Path -or -not [IO.File]::Exists($Path))
+        {
+            Write-CMTraceLog -Message "App Usage: the hive copy '$Path' isn't there, so HKU\$MountName wasn't loaded." -Component 'AppUsage' -Type 2
+            return $false
+        }
+        if (Test-AUHiveLoaded -Sid $MountName)
+        {
+            Write-CMTraceLog -Message "App Usage: HKU\$MountName was still loaded (an earlier run stopped), so it's unloaded first." -Component 'AppUsage' -Type 2
+            [void](Dismount-AUHive -MountName $MountName)
+        }
+        $Result = Invoke-AUProcess -FilePath $script:AURegPath -Arguments "load `"HKU\$MountName`" `"$Path`"" -WorkingDirectory ([IO.Path]::GetDirectoryName($Path)) -TimeoutSeconds $script:AUToolTimeoutSeconds
+        if ($Result.ExitCode -eq 0) { return $true }
+        Write-CMTraceLog -Message "App Usage: couldn't load the hive copy '$Path' at HKU\$MountName (exit $($Result.ExitCode), timed out $($Result.TimedOut)): $(([string]$Result.Output).Trim())" -Component 'AppUsage' -Type 3
+        # A load that timed out may still finish.
+        if ($Result.TimedOut) { [void](Dismount-AUHive -MountName $MountName) }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't load the hive copy '$Path' at HKU\$MountName`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    return $false
+}#endfunction
+
+function Read-AUArpEntries
+{
+    <#
+.SYNOPSIS
+    Adds an entry for each ARP Uninstall subkey with a DisplayName to a list. Returns true when the
+    whole key was read (a key that doesn't exist counts as read, with no entries).
+.DESCRIPTION
+    Each entry has Task 5's fields (DisplayName, Publisher, DisplayVersion, ProductCode, PackageFamily,
+    InstallLocation, DisplayIcon, UninstallString, Architecture, Scope, ProfilePath) and version 19's
+    inventory fields (InstallDate converted as version 19 does, AppType Win32, and RegPath, the key's
+    full path under ShownBase). ProductCode is the key name when it's a {GUID}. DisplayName, Publisher,
+    and DisplayVersion are kept as stored; only REG_EXPAND_SZ values are expanded
+    (Expand-AUEnvironmentText). An entry needs a DisplayName that's true in PowerShell, as in version 19.
+.PARAMETER Base
+    The open hive root: HKEY_LOCAL_MACHINE, or a user's hive.
+.PARAMETER ShownBase
+    The root as RegPath shows it: HKEY_LOCAL_MACHINE or HKEY_USERS\<SID>, never the AU_ mount name.
+.PARAMETER SubPath
+    The Uninstall key path under Base.
+.PARAMETER Scope
+    Machine, or the owning user's SID.
+.PARAMETER ProfilePath
+    The profile folder used to expand per-user variables, or blank.
+.PARAMETER EntryProfilePath
+    The ProfilePath put on each entry: the user's folder for per-user entries, else blank.
+.PARAMETER Architecture
+    32 or 64, from the registry view, or $null when the view doesn't say.
+.PARAMETER Into
+    The list the entries are added to.
+#>
+    param (
+        [Microsoft.Win32.RegistryKey]$Base,
+        [string]$ShownBase,
+        [string]$SubPath,
+        [string]$Scope,
+        [string]$ProfilePath,
+        [string]$EntryProfilePath,
+        $Architecture,
+        [System.Collections.Generic.List[object]]$Into
+    )
+
+    $Complete = $true
+    $Key = $null
+    try
+    {
+        $Key = $Base.OpenSubKey($SubPath)
+        if ($null -eq $Key) { return $true }
+        foreach ($Name in $Key.GetSubKeyNames())
+        {
+            $Sub = $null
+            try
+            {
+                $Sub = $Key.OpenSubKey($Name)
+                if ($null -eq $Sub) { continue }
+                $DisplayName = Get-AURegistryValue -Key $Sub -Name 'DisplayName' -ProfilePath $ProfilePath
+                if (-not $DisplayName) { continue }
+                $ProductCode = $null
+                if ($Name -match '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$') { $ProductCode = $Name }
+                $EntryPath = $null
+                if ($EntryProfilePath) { $EntryPath = $EntryProfilePath }
+                $Into.Add([pscustomobject]@{
+                        DisplayName     = $DisplayName
+                        DisplayVersion  = Get-AURegistryValue -Key $Sub -Name 'DisplayVersion' -ProfilePath $ProfilePath
+                        Publisher       = Get-AURegistryValue -Key $Sub -Name 'Publisher' -ProfilePath $ProfilePath
+                        ProductCode     = $ProductCode
+                        PackageFamily   = $null
+                        InstallLocation = Get-AURegistryValue -Key $Sub -Name 'InstallLocation' -ProfilePath $ProfilePath
+                        DisplayIcon     = Get-AURegistryValue -Key $Sub -Name 'DisplayIcon' -ProfilePath $ProfilePath
+                        UninstallString = Get-AURegistryValue -Key $Sub -Name 'UninstallString' -ProfilePath $ProfilePath
+                        Architecture    = $Architecture
+                        Scope           = $Scope
+                        ProfilePath     = $EntryPath
+                        InstallDate     = ConvertTo-AUInstallDate (Get-AURegistryValue -Key $Sub -Name 'InstallDate' -ProfilePath $ProfilePath)
+                        AppType         = 'Win32'
+                        RegPath         = "$ShownBase\$SubPath\$Name"
+                    })
+            }
+            catch
+            {
+                $Complete = $false
+                Write-CMTraceLog -Message "App Usage: couldn't read $ShownBase\$SubPath\$Name`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+            }
+            finally { if ($null -ne $Sub) { $Sub.Close() } }
+        }
+    }
+    catch
+    {
+        $Complete = $false
+        Write-CMTraceLog -Message "App Usage: couldn't read $ShownBase\$SubPath`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+    }
+    finally { if ($null -ne $Key) { $Key.Close() } }
+    return $Complete
+}#endfunction
+
+function ConvertFrom-AUPackedGuid
+{
+    <#
+.SYNOPSIS
+    Converts a Windows Installer packed GUID (32 hex digits) to {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}, or $null.
+.DESCRIPTION
+    The packed form reverses the first three groups and swaps each pair of digits in the last two.
+.PARAMETER Packed
+    The packed GUID.
+#>
+    param (
+        [string]$Packed
+    )
+
+    if ($Packed -notmatch '^[0-9A-Fa-f]{32}$') { return $null }
+    $Reverse = { param ([string]$Text) $Chars = $Text.ToCharArray(); [Array]::Reverse($Chars); -join $Chars }
+    $Swap = {
+        param ([string]$Text)
+        -join @(for ($i = 0; $i -lt $Text.Length; $i += 2) { $Text[$i + 1]; $Text[$i] })
+    }
+    $Guid = '{0}-{1}-{2}-{3}-{4}' -f (& $Reverse $Packed.Substring(0, 8)), (& $Reverse $Packed.Substring(8, 4)), (& $Reverse $Packed.Substring(12, 4)),
+    (& $Swap $Packed.Substring(16, 4)), (& $Swap $Packed.Substring(20, 12))
+    return '{' + $Guid.ToUpperInvariant() + '}'
+}#endfunction
+
+function Read-AUMsiFileMap
+{
+    <#
+.SYNOPSIS
+    Fills a map of each executable Windows Installer records as a component key path to its product's
+    ProductCode, from Installer\UserData for every SID. Returns true when it was read. Never throws.
+.DESCRIPTION
+    Only .exe files on a drive letter are kept: Task 14 looks up executables, and Get-AUKnownExes uses
+    only .exe names. A path two products both record is left out, because neither owns it alone.
+    Registry key paths, and components with no product (the all-zero value), are skipped. UserData
+    feeds this map and ProductCode ownership only, never inventory entries (F33).
+.PARAMETER Base
+    The open HKEY_LOCAL_MACHINE root.
+.PARAMETER Into
+    The map: lowercased full path to ProductCode.
+#>
+    param (
+        [Microsoft.Win32.RegistryKey]$Base,
+        [hashtable]$Into
+    )
+
+    $Shared = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $UserData = $null
+    try
+    {
+        $UserData = $Base.OpenSubKey($script:AUInstallerUserData)
+        if ($null -eq $UserData) { return $true }
+        foreach ($Sid in $UserData.GetSubKeyNames())
+        {
+            $Components = $UserData.OpenSubKey("$Sid\Components")
+            if ($null -eq $Components) { continue }
+            try
+            {
+                foreach ($Component in $Components.GetSubKeyNames())
+                {
+                    $Key = $Components.OpenSubKey($Component)
+                    if ($null -eq $Key) { continue }
+                    try
+                    {
+                        foreach ($ValueName in $Key.GetValueNames())
+                        {
+                            if ($ValueName -notmatch '^[0-9A-Fa-f]{32}$' -or $ValueName -match '^0{32}$') { continue }
+                            $Path = [string]$Key.GetValue($ValueName)
+                            # C?\ marks a component path the same way as C:\.
+                            if ($Path -match '^[A-Za-z]\?\\') { $Path = $Path.Substring(0, 1) + ':' + $Path.Substring(2) }
+                            if ($Path -notmatch '^[A-Za-z]:\\' -or -not $Path.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { continue }
+                            $File = $Path.ToLowerInvariant()
+                            $Code = ConvertFrom-AUPackedGuid $ValueName
+                            if ($Shared.Contains($File)) { continue }
+                            if ($Into.ContainsKey($File))
+                            {
+                                if (-not [string]::Equals([string]$Into[$File], $Code, [StringComparison]::OrdinalIgnoreCase))
+                                {
+                                    [void]$Shared.Add($File)
+                                    $Into.Remove($File)
+                                }
+                                continue
+                            }
+                            $Into[$File] = $Code
+                        }
+                    }
+                    finally { $Key.Close() }
+                }
+            }
+            finally { $Components.Close() }
+        }
+        Write-CMTraceLog -Message "App Usage: Windows Installer records $($Into.Count) executables; $($Shared.Count) shared by two products were left out." -Component 'AppUsage'
+        return $true
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't read Windows Installer UserData: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        return $false
+    }
+    finally { if ($null -ne $UserData) { $UserData.Close() } }
+}#endfunction
+
+function Read-AUUserApps
+{
+    <#
+.SYNOPSIS
+    Reads one user's ARP entries, from the loaded hive or from the snapshot's hive copy. Returns true
+    when both Uninstall views were read. Never throws.
+.DESCRIPTION
+    A Copied user's copy is loaded at HKU\AU_<SID>, read, and unloaded in finally after a garbage
+    collection. A copy that won't load sets the user's ProfileState to CopyFailed. RegPath always shows
+    HKEY_USERS\<SID>, never the mount name. SYSTEM's (S-1-5-18) entries are machine scope; other
+    entries have the user's SID as Scope and ProfilePath. HKEY_CURRENT_USER\Software is shared between
+    32-bit and 64-bit programs, so a per-user entry's Architecture is 32 only from Wow6432Node and
+    otherwise $null.
+.PARAMETER User
+    A Get-AUUsers entry.
+.PARAMETER Snapshot
+    The New-AUSnapshot result, for HiveCopies.
+.PARAMETER Native
+    The list for entries from the native Uninstall key.
+.PARAMETER Wow
+    The list for entries from the Wow6432Node Uninstall key.
+#>
+    param (
+        [pscustomobject]$User,
+        $Snapshot,
+        [System.Collections.Generic.List[object]]$Native,
+        [System.Collections.Generic.List[object]]$Wow
+    )
+
+    $Sid = [string]$User.Sid
+    $ShownBase = "HKEY_USERS\$Sid"
+    $Scope = $Sid
+    $EntryProfilePath = [string]$User.ProfilePath
+    if ($Sid -eq $script:AUSystemSid)
+    {
+        $Scope = 'Machine'
+        $EntryProfilePath = ''
+    }
+    $ReadHive = {
+        param ([Microsoft.Win32.RegistryKey]$Base)
+        $NativeRead = Read-AUArpEntries -Base $Base -ShownBase $ShownBase -SubPath $script:AUUninstallNative -Scope $Scope -ProfilePath $User.ProfilePath -EntryProfilePath $EntryProfilePath -Architecture $null -Into $Native
+        $WowRead = Read-AUArpEntries -Base $Base -ShownBase $ShownBase -SubPath $script:AUUninstallWow -Scope $Scope -ProfilePath $User.ProfilePath -EntryProfilePath $EntryProfilePath -Architecture 32 -Into $Wow
+        return ($NativeRead -and $WowRead)
+    }
+
+    try
+    {
+        switch ([string]$User.ProfileState)
+        {
+            'Loaded'
+            {
+                $Base = Open-AURegistryBase -Hive Users -Name $Sid
+                if ($null -eq $Base)
+                {
+                    Write-CMTraceLog -Message "App Usage: the hive of $Sid is no longer loaded, so its apps weren't read." -Component 'AppUsage' -Type 2
+                    return $false
+                }
+                try { return [bool](& $ReadHive $Base) }
+                finally { $Base.Close() }
+            }
+            'Copied'
+            {
+                $Copy = $null
+                if ($null -ne $Snapshot -and $null -ne $Snapshot.HiveCopies) { $Copy = [string]$Snapshot.HiveCopies[$Sid] }
+                $Mount = Get-AUHiveMountName -Sid $Sid
+                if (-not (Mount-AUHive -MountName $Mount -Path $Copy))
+                {
+                    $User.ProfileState = 'CopyFailed'
+                    return $false
+                }
+                $Base = $null
+                try
+                {
+                    $Base = Open-AURegistryBase -Hive Users -Name $Mount
+                    if ($null -eq $Base)
+                    {
+                        $User.ProfileState = 'CopyFailed'
+                        Write-CMTraceLog -Message "App Usage: HKU\$Mount isn't there after loading the hive copy of $Sid." -Component 'AppUsage' -Type 3
+                        return $false
+                    }
+                    return [bool](& $ReadHive $Base)
+                }
+                finally
+                {
+                    if ($null -ne $Base) { $Base.Close() }
+                    $Base = $null
+                    [void](Dismount-AUHive -MountName $Mount)
+                }
+            }
+            default { return $false }
+        }
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't read the apps of $Sid`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $false
+    }
+}#endfunction
+
+function Get-AUAppxPackages
+{
+    <#
+.SYNOPSIS
+    Returns every user's Store and MSIX packages (Get-AppxPackage -AllUsers). Throws on failure.
+#>
+    return Get-AppxPackage -AllUsers -ErrorAction Stop
+}#endfunction
+
+function Get-AUAppxPublisher
+{
+    <#
+.SYNOPSIS
+    Returns a package's PublisherDisplayName from its manifest, as version 19 reads it. Throws on failure.
+.PARAMETER PackageFullName
+    The package full name.
+#>
+    param (
+        [string]$PackageFullName
+    )
+
+    $Manifest = Get-AppxPackageManifest -Package $PackageFullName -ErrorAction Stop
+    return $Manifest.Package.Properties.PublisherDisplayName
+}#endfunction
+
+function Read-AUStoreApps
+{
+    <#
+.SYNOPSIS
+    Adds an entry for each Store or MSIX package installed for a user. Returns true when the packages
+    were read. Never throws.
+.DESCRIPTION
+    A package counts when a user has it in the Installed state, as in version 19's
+    Get-AppxInstalledApplications; it gets one entry per such user, with that user's SID as Scope
+    (S-1-5-18 is machine scope). DisplayName is the package name and DisplayVersion its version, as in
+    version 19; PackageFamily, InstallLocation, and Architecture come from the package.
+.PARAMETER Users
+    The Get-AUUsers entries, for ProfilePath.
+.PARAMETER Into
+    The list the entries are added to.
+#>
+    param (
+        [object[]]$Users,
+        [System.Collections.Generic.List[object]]$Into
+    )
+
+    try { $Packages = @(Get-AUAppxPackages) }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't read the Store and MSIX packages: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $false
+    }
+    $Profiles = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($User in @($Users)) { if ($null -ne $User -and $User.Sid) { $Profiles[[string]$User.Sid] = [string]$User.ProfilePath } }
+    $Complete = $true
+    foreach ($Package in $Packages)
+    {
+        try
+        {
+            if ($null -eq $Package) { continue }
+            $Sids = New-Object 'System.Collections.Generic.List[string]'
+            $AnyInstalled = $false
+            foreach ($Info in @($Package.PackageUserInformation))
+            {
+                if ($null -eq $Info -or [string]$Info.InstallState -ne 'Installed') { continue }
+                $AnyInstalled = $true
+                $Sid = ''
+                if ($null -ne $Info.UserSecurityId) { $Sid = ([string]$Info.UserSecurityId.Sid).Trim() }
+                if ($Sid -and -not $Sids.Contains($Sid)) { $Sids.Add($Sid) }
+            }
+            if (-not $AnyInstalled) { continue }
+            $Publisher = $null
+            try { $Publisher = Get-AUAppxPublisher -PackageFullName ([string]$Package.PackageFullName) }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't read the manifest of $($Package.PackageFullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            # Installed with no user SID shown: a blank Scope, which counts as present in every scope.
+            if ($Sids.Count -eq 0) { $Sids.Add('') }
+            foreach ($Sid in $Sids)
+            {
+                $Scope = $Sid
+                $EntryPath = $null
+                if ($Sid -eq $script:AUSystemSid) { $Scope = 'Machine' }
+                elseif ($Sid -and $Profiles.ContainsKey($Sid) -and $Profiles[$Sid]) { $EntryPath = $Profiles[$Sid] }
+                if (-not $Scope) { $Scope = $null }
+                $Into.Add([pscustomobject]@{
+                        DisplayName     = $Package.Name
+                        DisplayVersion  = [string]$Package.Version
+                        Publisher       = $Publisher
+                        ProductCode     = $null
+                        PackageFamily   = [string]$Package.PackageFamilyName
+                        InstallLocation = [string]$Package.InstallLocation
+                        DisplayIcon     = $null
+                        UninstallString = $null
+                        Architecture    = [string]$Package.Architecture
+                        Scope           = $Scope
+                        ProfilePath     = $EntryPath
+                        InstallDate     = $null
+                        AppType         = 'UWP'
+                        RegPath         = $null
+                    })
+            }
+        }
+        catch
+        {
+            $Complete = $false
+            Write-CMTraceLog -Message "App Usage: couldn't read the package $($Package.PackageFullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        }
+    }
+    return $Complete
+}#endfunction
+
+function Get-AUInstalledApps
+{
+    <#
+.SYNOPSIS
+    Discovers the installed apps on every accessible profile: Apps, ScopeRead, MsiFileMap,
+    ProfilesFound, and ProfilesRead.
+.DESCRIPTION
+    Inventory entries come only from ARP Uninstall keys (HKLM, 64-bit and 32-bit, and every user's
+    hive, loaded or copied) and, with -IncludeStore, Store and MSIX packages (D46, F33, F35). Windows
+    Installer UserData feeds MsiFileMap only. Apps are in version 19's read order (HKLM native, each
+    user's native key, HKLM Wow6432Node, each user's Wow6432Node key, then Store packages), so
+    ConvertTo-AUInventoryApps gives version 19's result for the same data.
+    ScopeRead (Task 7's shape) holds Machine and every user's SID, each Read or Unread. Machine is Read
+    when both HKLM views and SYSTEM's hive were read; S-1-5-18 always has Machine's state, because
+    SYSTEM's entries are machine scope. A user is Read when both views of their hive were read; a user
+    who is CopyFailed or Missing, or whose copy won't load (ProfileState becomes CopyFailed), is
+    Unread. When -IncludeStore is set and the packages can't be read, every user SID is Unread, since a
+    Store app could be missing from any of them. A Machine that isn't Read, or a Loaded user who isn't,
+    means the list is worse than version 19's read, and the caller falls back to it (D20, D36).
+    ProfilesFound is the number of users given; ProfilesRead, how many are Read. Never throws.
+.PARAMETER Users
+    The Get-AUUsers entries. A failed hive load changes the entry's ProfileState.
+.PARAMETER Snapshot
+    The New-AUSnapshot result, for HiveCopies.
+.PARAMETER IncludeStore
+    Include Store and MSIX packages (Invoke-AppUsage passes $CollectUWPInventory, D46).
+#>
+    param (
+        [object[]]$Users,
+        $Snapshot,
+        [switch]$IncludeStore
+    )
+
+    $ScopeRead = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $MsiFileMap = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Native = New-Object 'System.Collections.Generic.List[object]'
+    $Wow = New-Object 'System.Collections.Generic.List[object]'
+    $Store = New-Object 'System.Collections.Generic.List[object]'
+    $UserList = @($Users | Where-Object { $null -ne $_ -and $_.Sid })
+    $ScopeRead['Machine'] = 'Unread'
+    $ScopeRead[$script:AUSystemSid] = 'Unread'
+    foreach ($User in $UserList) { $ScopeRead[[string]$User.Sid] = 'Unread' }
+
+    try
+    {
+        $MachineRead = $false
+        $Machine = $null
+        try
+        {
+            $Machine = Open-AURegistryBase -Hive Machine
+            $NativeRead = Read-AUArpEntries -Base $Machine -ShownBase 'HKEY_LOCAL_MACHINE' -SubPath $script:AUUninstallNative -Scope 'Machine' -Architecture 64 -Into $Native
+            $WowRead = Read-AUArpEntries -Base $Machine -ShownBase 'HKEY_LOCAL_MACHINE' -SubPath $script:AUUninstallWow -Scope 'Machine' -Architecture 32 -Into $Wow
+            $MachineRead = ($NativeRead -and $WowRead)
+            [void](Read-AUMsiFileMap -Base $Machine -Into $MsiFileMap)
+        }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine's apps: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        finally { if ($null -ne $Machine) { $Machine.Close() } }
+
+        $SystemRead = $true
+        foreach ($User in $UserList)
+        {
+            $UserRead = Read-AUUserApps -User $User -Snapshot $Snapshot -Native $Native -Wow $Wow
+            if ([string]$User.Sid -eq $script:AUSystemSid) { $SystemRead = $UserRead }
+            elseif ($UserRead) { $ScopeRead[[string]$User.Sid] = 'Read' }
+        }
+        if ($MachineRead -and $SystemRead) { $ScopeRead['Machine'] = 'Read' }
+        $ScopeRead[$script:AUSystemSid] = $ScopeRead['Machine']
+
+        if ($IncludeStore -and -not (Read-AUStoreApps -Users $UserList -Into $Store))
+        {
+            foreach ($Name in @($ScopeRead.Keys)) { if ($Name -ne 'Machine') { $ScopeRead[$Name] = 'Unread' } }
+        }
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: app discovery failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        foreach ($Name in @($ScopeRead.Keys)) { $ScopeRead[$Name] = 'Unread' }
+    }
+
+    $Apps = New-Object 'System.Collections.Generic.List[object]'
+    $Apps.AddRange($Native)
+    $Apps.AddRange($Wow)
+    $Apps.AddRange($Store)
+    $Read = @($UserList | Where-Object { $ScopeRead[[string]$_.Sid] -eq 'Read' }).Count
+    Write-CMTraceLog -Message "App Usage: found $($Apps.Count) installed apps ($($Store.Count) Store); machine $($ScopeRead['Machine']); $Read of $($UserList.Count) profiles read." -Component 'AppUsage'
+    return [pscustomobject]@{
+        Apps          = $Apps.ToArray()
+        ScopeRead     = $ScopeRead
+        MsiFileMap    = $MsiFileMap
+        ProfilesFound = $UserList.Count
+        ProfilesRead  = $Read
+    }
+}#endfunction
+
+function ConvertTo-AUInventoryApps
+{
+    <#
+.SYNOPSIS
+    Builds the App Inventory entries from discovered apps: one per DisplayName, newest version, with the
+    inventory's seven fields and no scope (D19, D20).
+.DESCRIPTION
+    Maps each entry to version 19's input shape (DisplayName, DisplayVersion, Publisher,
+    UninstallString, InstallDate, PSPath from RegPath, AppType), in version 19's order: ARP entries
+    sorted by DisplayName, then Store packages sorted and made unique by DisplayName and
+    DisplayVersion. Then ConvertTo-AUAppArray, the inventory's own de-duplication, builds the entries.
+    For HKLM and the signed-in user's data this gives exactly version 19's result (F31).
+.PARAMETER Apps
+    The Get-AUInstalledApps Apps.
+#>
+    param (
+        [object[]]$Apps
+    )
+
+    $Win32 = New-Object 'System.Collections.Generic.List[object]'
+    $Store = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($App in @($Apps))
+    {
+        if ($null -eq $App) { continue }
+        if ($App.AppType -eq 'UWP')
+        {
+            $Store.Add([pscustomobject]@{
+                    DisplayName    = $App.DisplayName
+                    DisplayVersion = $App.DisplayVersion
+                    Publisher      = $App.Publisher
+                    AppType        = 'UWP'
+                })
+            continue
+        }
+        $PSPath = $null
+        if ($App.RegPath) { $PSPath = 'Microsoft.PowerShell.Core\Registry::' + $App.RegPath }
+        $Win32.Add([pscustomobject]@{
+                DisplayName     = $App.DisplayName
+                DisplayVersion  = $App.DisplayVersion
+                Publisher       = $App.Publisher
+                UninstallString = $App.UninstallString
+                InstallDate     = $App.InstallDate
+                PSPath          = $PSPath
+                AppType         = 'Win32'
+            })
+    }
+    $Inventory = @($Win32 | Sort-Object DisplayName) + @($Store | Sort-Object DisplayName, DisplayVersion -Unique)
+    # A DisplayVersion that isn't a version makes version 19's sort write an error record; App Usage
+    # never writes to the console (D40). The sort, and so the result, is the same either way.
+    $ErrorActionPreference = 'SilentlyContinue'
+    return ConvertTo-AUAppArray -Apps $Inventory
+}#endfunction
+
+function ConvertTo-AUAppArray
+{
+    <#
+.SYNOPSIS
+    The App Inventory de-duplication and entry build, shared by metering off and on (F32).
+.DESCRIPTION
+    Moved unchanged from the inline App Inventory section of version 19: one entry per DisplayName,
+    the newest version of duplicates, with AppName, AppVersion, AppPublisher, AppType,
+    AppInstallDate, AppUninstallString, and AppUninstallRegPath. Callers wrap the result in @().
+.PARAMETER Apps
+    Version 19's app objects: DisplayName, DisplayVersion, Publisher, UninstallString, InstallDate,
+    PSPath, and AppType.
+#>
+    param (
+        [object[]]$Apps
+    )
+    Write-CMTraceLog "Deduplicating applications..."
+    $UniqueApps = ($Apps | Group-Object Displayname | Where-Object { $_.Count -eq 1 } ).Group
+    $DuplicatedApps = ($Apps | Group-Object Displayname | Where-Object { $_.Count -gt 1 } ).Group
+    Write-CMTraceLog "Found $($UniqueApps.Count) unique apps and $($DuplicatedApps.Count) duplicated apps"
+
+    Write-CMTraceLog "Selecting newest version of duplicated apps..."
+    $NewestDuplicateApp = ($DuplicatedApps | Group-Object DisplayName) | ForEach-Object { $_.Group | Sort-Object { [version]$_.DisplayVersion } -Descending | Select-Object -First 1 }
+    $CleanAppList = $UniqueApps + $NewestDuplicateApp | Sort-Object DisplayName
+    Write-CMTraceLog "Clean app list contains $($CleanAppList.Count) applications after deduplication"
+
+    Write-CMTraceLog "Building app array for upload..."
+    $AppArray = @()
+    $appArrayCount = 0
+    foreach ($App in $CleanAppList)
+    {
+        $tempapp = New-Object -TypeName PSObject
+
+        if ($null -ne $App.DisplayName)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
+            $appArrayCount++
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value "" -Force
+        }
+
+        if ($null -ne $App.DisplayVersion)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value $App.DisplayVersion -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value "" -Force
+        }
+
+        if ($null -ne $App.Publisher)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value $App.Publisher -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value "" -Force
+        }
+
+        if ($null -ne $App.AppType)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value $App.AppType -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value "Unknown" -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "InstallDate" -and $App.InstallDate)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $App.InstallDate -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $null -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "UninstallString" -and $App.UninstallString)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $App.UninstallString -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $null -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "PSPath" -and $App.PSPath)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $App.PSPath.Split("::")[-1] -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $null -Force
+        }
+
+        $AppArray += $tempapp
+    }
+    Write-CMTraceLog "Added $appArrayCount applications to app array"
+    return $AppArray
+}#endfunction
 #endregion APPUSAGE
 
 #region script
@@ -7621,90 +8558,7 @@ if ($CollectAppInventory)
         Write-CMTraceLog "UWP inventory disabled, skipping"
     }
 
-    Write-CMTraceLog "Deduplicating applications..."
-    $UniqueApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -eq 1 } ).Group
-    $DuplicatedApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -gt 1 } ).Group
-    Write-CMTraceLog "Found $($UniqueApps.Count) unique apps and $($DuplicatedApps.Count) duplicated apps"
-
-    Write-CMTraceLog "Selecting newest version of duplicated apps..."
-    $NewestDuplicateApp = ($DuplicatedApps | Group-Object DisplayName) | ForEach-Object { $_.Group | Sort-Object { [version]$_.DisplayVersion } -Descending | Select-Object -First 1 }
-    $CleanAppList = $UniqueApps + $NewestDuplicateApp | Sort-Object DisplayName
-    Write-CMTraceLog "Clean app list contains $($CleanAppList.Count) applications after deduplication"
-
-    Write-CMTraceLog "Building app array for upload..."
-    $AppArray = @()
-    $appArrayCount = 0
-    foreach ($App in $CleanAppList)
-    {
-        $tempapp = New-Object -TypeName PSObject
-
-        if ($null -ne $App.DisplayName)
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
-            $appArrayCount++
-        }
-        else
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value "" -Force
-        }
-
-        if ($null -ne $App.DisplayVersion)
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value $App.DisplayVersion -Force
-        }
-        else
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value "" -Force
-        }
-
-        if ($null -ne $App.Publisher)
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value $App.Publisher -Force
-        }
-        else
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value "" -Force
-        }
-
-        if ($null -ne $App.AppType)
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value $App.AppType -Force
-        }
-        else
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value "Unknown" -Force
-        }
-
-        if ($App.PSObject.Properties.Name -contains "InstallDate" -and $App.InstallDate)
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $App.InstallDate -Force
-        }
-        else
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $null -Force
-        }
-
-        if ($App.PSObject.Properties.Name -contains "UninstallString" -and $App.UninstallString)
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $App.UninstallString -Force
-        }
-        else
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $null -Force
-        }
-
-        if ($App.PSObject.Properties.Name -contains "PSPath" -and $App.PSPath)
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $App.PSPath.Split("::")[-1] -Force
-        }
-        else
-        {
-            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $null -Force
-        }
-
-        $AppArray += $tempapp
-    }
-    Write-CMTraceLog "Added $appArrayCount applications to app array"
+    $AppArray = @(ConvertTo-AUAppArray -Apps $MyApps)
 
     Write-CMTraceLog 'Converting app array to JSON...'
     $InstalledAppJson = $AppArray | ConvertTo-Json

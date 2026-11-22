@@ -11,6 +11,21 @@ SRUM keeps only about 30 to 60 days of usage, so the script keeps its own histor
 - If the file can't be read, the script never overwrites it. It renames the file to `AppUsage_<Serial>.corrupt-<yyyyMMddHHmmss>.json`, with the time in UTC, starts a new history from what SRUM still holds, and reports `LedgerReset`. The renamed copy can also be read only by SYSTEM and administrators.
 - An app update brings a new build of its executable. Once SRUM holds no usage of the old build, the script combines the old build's history into a newer build of the same app for the same user. It combines builds only when both are matched to the same app, or, for unmatched builds, when the script verified both builds and they have the same company and product names. Executables that only share a file name, such as two `setup.exe` files from different publishers, are never combined.
 
+## Installed Apps and Profiles
+
+App Usage reads the installed apps of every profile on the device, not only the signed-in user's:
+
+- **Profiles:** every profile Windows lists in `ProfileList` (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList`), signed in or not, including the SYSTEM and service accounts.
+- **Signed-in users:** their apps are read from their loaded registry hive.
+- **Signed-out users:** the script copies the user's `NTUSER.DAT` from a shadow copy of the system drive into a folder that only SYSTEM and administrators can open, reads the copy, and deletes it. It never opens a user's live hive file, so a user who signs in during the run isn't affected.
+- **Apps:** the uninstall entries (the apps in **Installed apps** or **Programs and Features**) of the device, 64-bit and 32-bit, and of each profile. Store and MSIX apps are included only when `$CollectUWPInventory` is `$true`, the same setting the App Inventory uses. Windows Installer records tell the script which installed app an executable belongs to; they never add an app to the inventory.
+
+A profile the script can't read is a coverage gap, never a reason to call an app missing. That's a profile whose folder isn't on the device (for example, a profile container or roaming profile that isn't attached), or a signed-out user whose hive couldn't be copied or loaded. Apps in that profile are never `NotInstalled`, and their usage status stays blank. Unread profiles are counted in the App Usage device columns and the collection status.
+
+### The Expanded App Inventory
+
+When App Usage is on, the App Inventory data lists the installed apps of every profile the script read. A device can report more apps than before, mostly per-user installs of users who aren't signed in. Entries are still combined into one per DisplayName, with the newest version, by the same code as before, and they carry no user. When App Usage is off, the App Inventory is read exactly as before: the device's apps and the signed-in user's apps. If the all-profile read fails on a run, that run's App Inventory falls back to the earlier read.
+
 ## What App Usage Reports
 
 App Usage adds usage fields to each app in the App Inventory data (`PowerStacksAppInventory_CL`), and sends a list of the executables it has seen. Both combine every user on the device: they count users, and never name them. Who used what stays in the history file on the device.
