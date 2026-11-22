@@ -137,7 +137,7 @@ $ScriptVersion = '19 - August 10, 2026'
 
 
 # Current date/time
-$Now = Get-Date -Format "yyyy-MM-dd_HHmm"
+$Now = Get-Date -Format "yyyy-MM-dd_HHmmss"
 
 # Enable/Disable Script Transciption
 $Transcribe = $False
@@ -239,7 +239,6 @@ $InventoryDateFormat = "MM-dd HH:mm"
 # Start transcribing:
 if ($Transcribe)
 {
-    Write-Host 'Starting transcription'
     Start-Transcript -Path $logPath | Out-Null
 }
 
@@ -256,13 +255,14 @@ function Write-CMTraceLog
     .DESCRIPTION
       - Defaults to Info severity.
       - Use -WarningMsg or -ErrorMsg to raise severity.
-      - Defaults to writing to $script:logPath.
+      - Writes to the log file only, never the console.
+      - Defaults to writing to $script:CMLog.
 
     .PARAMETER Message
       Log message text.
 
     .PARAMETER Path
-      Log file path. Defaults to $script:logPath.
+      Log file path. Defaults to $script:CMLog.
 
     .PARAMETER Component
       Component name displayed in CMTrace.
@@ -304,7 +304,7 @@ function Write-CMTraceLog
         [Parameter(ParameterSetName = 'BySwitch')]
         [switch] $ErrorMsg,
 
-        # Default behavior: don't emit real PowerShell error records (prevents "At line:..." noise)
+        # Kept for compatibility. Messages are no longer written to the console.
         [switch] $EmitErrorRecord
     )
 
@@ -325,37 +325,17 @@ function Write-CMTraceLog
         }
     }
 
-    # ----- Write to console (clean) -----
-    switch ($Type)
-    {
-        3
-        {
-            if ($EmitErrorRecord)
-            {
-                Write-Error $Message
-            }
-            else
-            {
-                # Keep it highly visible but not a PowerShell error record
-                Write-Warning $Message
-            }
-        }
-        2
-        {
-            Write-Warning $Message
-        }
-        default
-        {
-            Write-Output $Message
-        }
-    }
+    # ----- Console -----
+    # Nothing is written to the console here. The script's only output is the one-line
+    # upload summary at the end, which Intune shows in the detection output column.
+    # Everything else goes to the log file.
 
     # ----- Write to CMTrace log -----
     try
     {
         if ([string]::IsNullOrWhiteSpace($Path))
         {
-            throw "Log path is empty. `$logPath must be set before logging."
+            throw "Log path is empty. `$CMLog must be set before logging."
         }
 
         $dir = Split-Path -Path $Path -Parent
@@ -858,7 +838,6 @@ function Get-Microsoft365
         catch
         {
             Write-CMTraceLog "Get-Microsoft365: CDN API failed: $_" -WarningMsg
-            Write-Warning "CDN API failed: $_"
         }
     }
     else
@@ -1957,7 +1936,8 @@ Write-CMTraceLog "Log API Mode: $LogAPIMode"
 Write-CMTraceLog "Cleaning up old transciption log files..."
 try
 {
-    $oldLogs = Get-ChildItem "C:\Windows\Logs" -Filter "Intune_Inventory_*.log" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $logPath }
+    # Inventory_Script_* is the current transcript name; Intune_Inventory_* is the name older versions used
+    $oldLogs = @(Get-ChildItem "C:\Windows\Logs" -Filter "Inventory_Script_*.log" -ErrorAction SilentlyContinue) + @(Get-ChildItem "C:\Windows\Logs" -Filter "Intune_Inventory_*.log" -ErrorAction SilentlyContinue) | Where-Object { $_.FullName -ne $logPath }
     Write-CMTraceLog "Found $($oldLogs.Count) old transciption log file(s) to delete"
     $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
     Write-CMTraceLog "Old transciption logs cleaned up successfully"
@@ -2415,8 +2395,6 @@ if ($CollectDeviceInventory)
                     $null
                 }
             }
-
-            $Warranty | Format-List
 
         }
     }
@@ -2982,5 +2960,9 @@ if ($Transcribe)
 {
     Stop-Transcript | Out-Null
 }
+
+# The script's only console output: one line with each upload's result and payload size.
+# Intune shows it in the detection output column. Everything else is in the log file.
+Write-Output $OutputMessage
 #endregion script
 
