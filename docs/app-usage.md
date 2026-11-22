@@ -35,7 +35,7 @@ One limit applies to every rule: it has to match. A rule with a version range (`
 
 The rule that wins sets the app's name pattern, and the installed apps that pattern matches are the candidates. Usually there's one, and the executable is matched to it. When there are several, for example a `Contoso*` target on a device with Contoso Alpha and Contoso Beta installed, the script narrows the list with what it knows about the executable. It applies these checks in order and stops as soon as one app is left:
 
-| Check | Keeps the app whose | Reported rule ID |
+| Check | Keeps the app whose | Rule ID for a PowerStacks match |
 |---|---|---|
 | Install path | Install folder holds the executable. When several do, the deepest folder wins. | `ps-resolve-path` |
 | Windows Installer | Windows Installer product owns the executable. Verified builds only. | `ps-resolve-msi` |
@@ -45,7 +45,7 @@ The rule that wins sets the app's name pattern, and the installed apps that patt
 | Architecture | Entry is 32-bit, for an executable under `Program Files (x86)`, or 64-bit, for one under `Program Files`. | `ps-resolve-arch` |
 | Install scope | Per-user install belongs to the user who ran the executable from their own profile. | `ps-resolve-scope` |
 
-A check that has nothing to go on, or that would rule out every app, is skipped. When a check leaves one app, the executable is matched to it and the check's ID is reported as the rule ID, in place of the rule that found the candidates. The match still belongs to that rule's file, so a match from your rules still wins.
+A check that has nothing to go on, or that would rule out every app, is skipped. When a check leaves one app, the executable is matched to it. If the candidates came from one of your rules, your rule's ID is reported, so if you delete the rule, the executable is matched again from the rules that remain. If they came from PowerStacks rules, the check's ID is reported as the rule ID.
 
 When two or more apps are left after every check, the executable is reported as unmatched, and `CandidateTargets` lists the apps it could belong to. Those apps aren't reported as unused because of it. To settle it yourself, give your rule a narrower `target.displayName`.
 

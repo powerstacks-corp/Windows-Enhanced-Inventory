@@ -1,4 +1,6 @@
 BeforeAll {
+    # A silent logger with the real one's parameters, so tests can check what was logged with a ParameterFilter.
+    function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) }
     . "$PSScriptRoot\_Import.ps1"
 
     $script:TestSid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
@@ -548,6 +550,27 @@ Describe 'Resolve-AUIdentity' {
             $r.RuleType | Should -BeExactly 'arpCompare'
             $r.InstalledStateDependent | Should -BeTrue
             $r.ResolvedAppName | Should -BeExactly 'Zoom Workplace (64-bit)'
+        }
+
+        It 'a customer rule whose candidates a step narrows keeps its own rule ID and section, and logs the step' {
+            Mock Write-CMTraceLog { }
+            $m = New-TestMappings -Customer @('{ "id": "c-contoso-1", "type": "identity", "when": { "exeName": "tool.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso*", "publisher": "Contoso*" } }') -PowerStacks @($script:RuleContoso)
+            $apps = @((New-TestApp 'Contoso Alpha' 'Contoso' @{ InstallLocation = 'C:\Apps\Alpha' }), (New-TestApp 'Contoso Beta' 'Contoso' @{ InstallLocation = 'C:\Apps\Beta' }))
+            $r = Resolve-AUIdentity (New-TestFacts @{ FileCompanyName = 'Contoso'; RunPath = 'C:\Apps\Beta\tool.exe' }) $m $apps
+            $r.MatchSection | Should -BeExactly 'Customer'
+            $r.MatchRuleId | Should -BeExactly 'c-contoso-1'
+            $r.RuleType | Should -BeExactly 'identity'
+            $r.ResolvedAppName | Should -BeExactly 'Contoso Beta'
+            Should -Invoke Write-CMTraceLog -Times 1 -Exactly -ParameterFilter { $Message -like '*resolved c-contoso-1 by path*' }
+        }
+
+        It 'the same candidates from a PowerStacks rule record ps-resolve-<step>' {
+            Mock Write-CMTraceLog { }
+            $apps = @((New-TestApp 'Contoso Alpha' 'Contoso' @{ InstallLocation = 'C:\Apps\Alpha' }), (New-TestApp 'Contoso Beta' 'Contoso' @{ InstallLocation = 'C:\Apps\Beta' }))
+            $r = Resolve-AUIdentity (New-TestFacts @{ FileCompanyName = 'Contoso'; RunPath = 'C:\Apps\Beta\tool.exe' }) $script:D47 $apps
+            $r.MatchSection | Should -BeExactly 'PowerStacks'
+            $r.MatchRuleId | Should -BeExactly 'ps-resolve-path'
+            Should -Invoke Write-CMTraceLog -Times 0 -Exactly -ParameterFilter { $Message -like '*resolved*' }
         }
 
         It 'a customer rule still wins' {

@@ -3141,7 +3141,9 @@ function Resolve-AUIdentity
     Identity rules run customer first, then PowerStacks, each in file order; the first rule that
     matches wins (D38, F12). Its candidates are the installed apps its target matches, or the
     ownership or arpCompare hits. With several candidates, the D47 steps narrow them; a step that
-    leaves one records MatchRuleId ps-resolve-<step>. When candidates with two or more DisplayNames
+    leaves one records MatchRuleId ps-resolve-<step> for a PowerStacks match. A customer match keeps
+    the customer rule's ID and logs the step, so its stored target goes when the customer deletes the
+    rule (D38, D41; ps-resolve-* IDs always exist, F11). When candidates with two or more DisplayNames
     survive, the exe stays unresolved: MatchSection None, with CandidateTargets (F26). An identity
     rule with no installed candidate still matches: TargetPattern is set and ResolvedAppName is $null.
     Verified facts come first; an unverified build may match on the current file's CompanyName and
@@ -3207,7 +3209,13 @@ function Resolve-AUIdentity
     {
         $Narrowed = Select-AUCandidate $Facts $Evidence $Candidates
         $Candidates = @($Narrowed.Candidates)
-        if ($Narrowed.Step) { $RuleId = 'ps-resolve-' + $Narrowed.Step }
+        if ($Narrowed.Step)
+        {
+            # A customer match keeps the customer rule's ID, so the stored target goes when the rule
+            # does (D38, D41); ps-resolve-* IDs always exist (F11) and are only for PowerStacks matches.
+            if ($Section -eq 'Customer') { Write-CMTraceLog -Message "App Usage: resolved $RuleId by $($Narrowed.Step)." -Component 'AppUsage' }
+            else { $RuleId = 'ps-resolve-' + $Narrowed.Step }
+        }
         $Names = New-Object 'System.Collections.Generic.List[string]'
         $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($App in $Candidates) { if ($Seen.Add(([string]$App.DisplayName).Trim())) { $Names.Add(([string]$App.DisplayName).Trim()) } }
