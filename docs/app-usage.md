@@ -11,6 +11,81 @@ SRUM keeps only about 30 to 60 days of usage, so the script keeps its own histor
 - If the file can't be read, the script never overwrites it. It renames the file to `AppUsage_<Serial>.corrupt-<yyyyMMddHHmmss>.json`, with the time in UTC, starts a new history from what SRUM still holds, and reports `LedgerReset`. The renamed copy can also be read only by SYSTEM and administrators.
 - An app update brings a new build of its executable. Once SRUM holds no usage of the old build, the script combines the old build's history into a newer build of the same app for the same user. It combines builds only when both are matched to the same app, or, for unmatched builds, when the script verified both builds and they have the same company and product names. Executables that only share a file name, such as two `setup.exe` files from different publishers, are never combined.
 
+## What App Usage Reports
+
+App Usage adds usage fields to each app in the App Inventory data (`PowerStacksAppInventory_CL`), and sends a list of the executables it has seen. Both combine every user on the device: they count users, and never name them. Who used what stays in the history file on the device.
+
+### How Use Is Counted
+
+An executable's run counts as use only when a person used it:
+
+- The account that ran it is a person's account: a Microsoft Entra ID, domain, or local user account. Runs under SYSTEM or a service account never count as use, only as runs.
+- The executable had focus or keyboard and mouse input for at least `$MinFocusSecondsForUse` seconds (1 by default).
+- A command-line tool (role `CLI`) counts on any run by a person, even with no focus, because the focus goes to the terminal window. Its last-used date is the end of that run.
+
+A run with no focus or input, such as a background process, counts as a run, not as use. Use is worked out again from the history on every run, so a new rule, or a role that changes, applies to past usage too.
+
+### Usage Fields on Each Installed App
+
+The App Inventory data keeps one entry for each DisplayName, with the newest version, as before. App Usage adds these fields to each entry, combined across every user on the device:
+
+| Field | Meaning |
+|---|---|
+| `AppLastUsedDate` | The latest use by any user, in UTC, formatted `yyyy-MM-ddTHH:mm:ss.fffffffZ`. Blank when nobody used it. |
+| `AppUsageStatus` | Whether the app is used. See [Usage Status](#usage-status). |
+| `AppLastRanDate` | The latest run of any kind, by any account, including background runs. Same format. |
+| `AppInFocusSeconds` | Total focus time across users, in whole seconds. |
+| `AppUsersWithUse` | How many users used the app. A count, not names. |
+| `AppMatchedExeCount` | How many of the app's executables App Usage has seen. |
+| `AppRunsAsService` | `true` when one of the app's executables is the program of a Windows service, or has the `Service` role. Don't treat these apps as unused only because nobody focused them. |
+
+When App Usage is off, or fails on a run, these fields are blank. An executable that an ignore rule matches doesn't count toward any of them.
+
+### Usage Status
+
+`AppUsageStatus` is one of these values. When more than one applies, the first in the table wins.
+
+| Value | Meaning |
+|---|---|
+| `Used` | Someone used one of the app's executables since the device's watching-since date, the earliest usage App Usage has for the device. |
+| `RanNotUsed` | One of the app's executables ran since then, but nobody used it: for example, it ran only in the background or only under SYSTEM. Not a reclamation candidate on its own. |
+| `Ambiguous` | Nothing is credited to the app, but an executable that could belong to it or to another app ran (see [When a Rule Matches Several Installed Apps](#when-a-rule-matches-several-installed-apps)). Not a reclamation candidate. |
+| `NotUsed` | App Usage knows the app's executables, and none of them ran since the watching-since date. The only value that marks a reclamation candidate. |
+| `NotCovered` | App Usage knows no executable for the app, so it can't measure its use. |
+| Blank | App Usage didn't run or failed on this run, the watching-since date isn't known yet, or the script couldn't read every place the app is installed (the device's apps, or a user's apps). Blank never means `NotUsed`. |
+
+App Usage knows an app's executables when Windows Installer lists them as part of the app, when an identity rule whose target matches the app names them in `when.exeName`, or when it has seen one of them run and matched it to the app.
+
+### Executable Usage
+
+App Usage also sends one entry for each executable build it has seen and each app the build is matched to, with every user combined. Every executable is listed: matched or unmatched, installed or not, and the ones ignore rules match.
+
+| Field | Meaning |
+|---|---|
+| `ExeInfo` | The executable build, as SRUM records it. For a Store or MSIX app, its package name. |
+| `ExeName` | The file name, in lowercase. Blank for a Store or MSIX app. |
+| `RunPath` | The path the build ran from, when the script found it and confirmed it's the same build. |
+| `LocationClass` | The kind of folder it ran from: `Windows`, `ProgramFiles`, `UserProfile`, `Temp`, `Download`, `ManagementCache`, or `Other`. |
+| `FileDescription`, `FileProductName`, `FileCompanyName`, `FileVersion`, `ProductVersion` | The build's file details. Only when the script verified the build (`FactsVerified` is `true`); blank otherwise. |
+| `FactsVerified` | `true` when the file on disk is the build that ran. |
+| `EvidenceCompanyName`, `EvidenceProductName`, `EvidenceSource` | For a build the script couldn't verify: the company and product names of the file now at the same path, with `EvidenceSource` set to `CurrentFileAtPath`. They can match the executable to an app, but they aren't the build's own details. Blank for a verified build. |
+| `Subsystem` | Whether it's a console (command-line) or graphical program, when the script could tell. |
+| `Role` | The kind of executable it is. See [Role](#role). |
+| `ClassificationRuleId` | The ID of the ignore rule that matched it, or else of the classification rule that set its role. Blank when neither did. |
+| `ResolvedAppName` | The DisplayName of the installed app it's matched to, or of the app it was last matched to when that app is no longer installed. |
+| `TargetPattern`, `Publisher` | The name and publisher patterns of the target it's matched to. |
+| `ProductCode` | The target app's Windows Installer product code, or its package family for a Store or MSIX app. |
+| `MatchSection` | `Customer` (one of your rules), `PowerStacks`, `Retained` (a target saved from an earlier run), or `None`. |
+| `MatchRuleId` | The ID of the rule that matched it. |
+| `InstallStatus` | Whether the target app is installed. See [Install Status](#install-status). With several users, it's `Installed` when the app is installed for any of them, else `Unknown` when any of them is unknown, else `NotInstalled`. |
+| `CandidateTargets` | Only for an executable left unmatched with two or more candidate apps: the DisplayNames of those apps. Absent otherwise. |
+| `FirstSeen` | The first time App Usage saw the build run, in UTC. |
+| `LastUsedTime` | The latest use by any user, in UTC. |
+| `LastRanTime` | The latest run of any kind, in UTC. |
+| `InFocusSeconds` | Total focus time across users, in whole seconds. |
+| `UsersWithUse` | How many users used it. |
+| `RanAsSystemOnly` | `true` when it ran, but never under a person's account: only under SYSTEM or a service account. |
+
 ## Mapping Rules
 
 App Usage sees executables, not apps. Mapping rules decide which installed app each executable belongs to, and what kind of executable it is. Rules come from two files:
@@ -56,7 +131,7 @@ The rule that wins sets the app's name pattern, and the installed apps that patt
 
 A check that has nothing to go on, or that would rule out every app, is skipped. When a check leaves one app, the executable is matched to it. If the candidates came from one of your rules, your rule's ID is reported, so if you delete the rule, the executable is matched again from the rules that remain. If they came from PowerStacks rules, the check's ID is reported as the rule ID.
 
-When two or more apps are left after every check, the executable is reported as unmatched, and `CandidateTargets` lists the apps it could belong to. Those apps aren't reported as unused because of it. To settle it yourself, give your rule a narrower `target.displayName`.
+When two or more apps are left after every check, the executable is reported as unmatched, and `CandidateTargets` lists the apps it could belong to. Those apps aren't reported as unused because of it: when the executable runs, an app among them with no use or runs of its own is reported as `Ambiguous`. To settle it yourself, give your rule a narrower `target.displayName`.
 
 ### Targets From Earlier Runs
 

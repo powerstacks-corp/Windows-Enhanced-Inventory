@@ -4602,6 +4602,656 @@ function Invoke-AULedgerFold
     }
     if ($Folded -gt 0) { Write-CMTraceLog -Message "App Usage: folded $Folded aged-out builds into newer builds of the same app." -Component 'AppUsage' }
 }#endfunction
+
+# Device-level aggregation (D19, D30, D31, D32). Users are combined: the per-app fields and the
+# per-executable output carry counts, never a user SID, UPN, or scope. The entries these functions
+# take are ledger entries with this run's results attached by Invoke-AppUsage: Target
+# (Resolve-AUTarget), Classification (Get-AUClassification), Role (Get-AURole), UserType
+# (Get-AUUserType), and InstallStatus (Get-AUInstallStatus for the entry's user). Use is decided only
+# by Get-AUDerivedUse (F5).
+$script:AUMatchedSections = @('Customer', 'PowerStacks', 'Retained')
+# Facts copied into the per-executable output; for an unverified build only the path-level ones (D30).
+$script:AUExeFactFields = @('RunPath', 'LocationClass', 'FileDescription', 'FileProductName', 'FileCompanyName', 'FileVersion', 'ProductVersion', 'Subsystem')
+$script:AUPathFactFields = @('RunPath', 'LocationClass', 'Subsystem')
+
+function ConvertTo-AUOutputDate
+{
+    <#
+.SYNOPSIS
+    Formats a date for the output with Format-AUDate; $null for $null or a date that isn't UTC.
+.DESCRIPTION
+    Format-AUDate throws on a Local or Unspecified date, so a local time is never written with a Z.
+    Here that's contained: the date is left out and the problem logged, and the rest of the output
+    is still produced.
+.PARAMETER Value
+    A Utc date or $null.
+#>
+    param (
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    try { return (Format-AUDate $Value) }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: left a date out of the output: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        return $null
+    }
+}#endfunction
+
+function Test-AUEntryMatched
+{
+    <#
+.SYNOPSIS
+    Tests whether an entry has a target: MatchSection Customer, PowerStacks, or Retained.
+.PARAMETER Entry
+    The entry, with its Target.
+#>
+    param (
+        [pscustomobject]$Entry
+    )
+
+    return ($null -ne $Entry.Target -and [string]$Entry.Target.MatchSection -cin $script:AUMatchedSections)
+}#endfunction
+
+function Get-AUExeKey
+{
+    <#
+.SYNOPSIS
+    Returns the lowercase name an entry's executable is known by: its ExeName, or for a Store or
+    MSIX package (no ExeName) its ExeInfo, the package identity.
+.PARAMETER Entry
+    The entry.
+#>
+    param (
+        [pscustomobject]$Entry
+    )
+
+    $Name = ([string]$Entry.ExeName).Trim()
+    if (-not $Name) { $Name = ([string]$Entry.ExeInfo).Trim() }
+    return $Name.ToLowerInvariant()
+}#endfunction
+
+function New-AUAppIndex
+{
+    <#
+.SYNOPSIS
+    Returns the installed apps prepared for Get-AUTargetAppNames: the apps, their trimmed
+    DisplayNames (ignoring case), and an empty per-target cache.
+.PARAMETER Apps
+    The installed-app entries (Task 13 shape).
+#>
+    param (
+        [object[]]$Apps
+    )
+
+    $Names = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    $List = New-Object 'Collections.Generic.List[object]'
+    foreach ($App in @($Apps))
+    {
+        if ($null -eq $App) { continue }
+        $List.Add($App)
+        $Name = ([string]$App.DisplayName).Trim()
+        if ($Name -and -not $Names.ContainsKey($Name)) { $Names[$Name] = $Name }
+    }
+    return [pscustomobject]@{
+        Apps  = $List.ToArray()
+        Names = $Names
+        Cache = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    }
+}#endfunction
+
+function Get-AUTargetAppNames
+{
+    <#
+.SYNOPSIS
+    Returns the trimmed DisplayNames of the installed apps a target belongs to; none when its app
+    isn't installed.
+.DESCRIPTION
+    When the target's ResolvedAppName (the concrete DisplayName it was matched to) is installed, that
+    app alone. Otherwise every installed app that is the target app (Test-AUTargetApp, the test
+    Get-AUInstallStatus uses), so an update that renamed the entry is still credited. The result is
+    cached per target in the index.
+.PARAMETER Target
+    The Resolve-AUTarget result.
+.PARAMETER Index
+    The New-AUAppIndex result.
+#>
+    param (
+        [pscustomobject]$Target,
+        [pscustomobject]$Index
+    )
+
+    $Separator = [string][char]31
+    $Signature = @([string]$Target.ResolvedAppName, [string]$Target.TargetPattern, [string]$Target.TargetPublisher, [string]$Target.ProductCode,
+        [string]$Target.PackageFamily, [string]$Target.RuleType, [string]$Target.InstalledStateDependent) -join $Separator
+    $Names = $Index.Cache[$Signature]
+    if ($null -ne $Names) { return $Names }
+
+    $Found = New-Object 'Collections.Generic.List[string]'
+    $Resolved = ([string]$Target.ResolvedAppName).Trim()
+    if ($Resolved -and $Index.Names.ContainsKey($Resolved)) { $Found.Add($Index.Names[$Resolved]) }
+    else
+    {
+        $Keys = Get-AUTargetKeys $Target
+        foreach ($App in $Index.Apps)
+        {
+            $Name = ([string]$App.DisplayName).Trim()
+            if (-not $Name -or $Found.Contains($Name)) { continue }
+            if (Test-AUTargetApp $App $Keys) { $Found.Add($Name) }
+        }
+    }
+    $Names = [string[]]$Found.ToArray()
+    $Index.Cache[$Signature] = $Names
+    return $Names
+}#endfunction
+
+function Get-AUKnownExes
+{
+    <#
+.SYNOPSIS
+    Returns each installed app's known executables: DisplayName (ignoring case) to a set of lowercase exe names (F23).
+.DESCRIPTION
+    An app's executables are known from three sources: the .exe files Windows Installer lists as
+    components of the app's ProductCode; the exeName of each identity rule (customer and PowerStacks)
+    whose target matches the app, as written in the rule, wildcards included; and the executables of
+    entries matched to the app (Get-AUTargetAppNames). A Store or MSIX package entry is known by its
+    ExeInfo. Ignored entries don't count (F22), and an unresolved entry belongs to no app. An app with
+    no known executable is absent, so Get-AUAppUsage reports it NotCovered.
+.PARAMETER Apps
+    The installed-app entries (Task 13 shape), with ProductCode.
+.PARAMETER MsiFileMap
+    Lowercased full file path to the ProductCode of the Windows Installer product that owns it.
+.PARAMETER Mappings
+    The whole Get-AUMappings result (F18), or $null.
+.PARAMETER Entries
+    The entries, with this run's Target and Classification.
+#>
+    param (
+        [object[]]$Apps,
+        [hashtable]$MsiFileMap,
+        [pscustomobject]$Mappings,
+        [object[]]$Entries
+    )
+
+    $Known = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Add = {
+        param ([string]$Name, [string]$Exe)
+        $Set = $Known[$Name]
+        if ($null -eq $Set)
+        {
+            $Set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $Known[$Name] = $Set
+        }
+        [void]$Set.Add($Exe.ToLowerInvariant())
+    }
+    $Index = New-AUAppIndex $Apps
+    $AppsByName = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($App in $Index.Apps)
+    {
+        $Name = ([string]$App.DisplayName).Trim()
+        if (-not $Name) { continue }
+        if (-not $AppsByName.ContainsKey($Name)) { $AppsByName[$Name] = New-Object 'Collections.Generic.List[object]' }
+        $AppsByName[$Name].Add($App)
+    }
+    $AllNames = [string[]]@($AppsByName.Keys)
+
+    # Windows Installer components of each app's product.
+    $ByCode = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($App in $Index.Apps)
+    {
+        $Code = ([string]$App.ProductCode).Trim()
+        $Name = ([string]$App.DisplayName).Trim()
+        if (-not $Code -or -not $Name) { continue }
+        if (-not $ByCode.ContainsKey($Code)) { $ByCode[$Code] = New-Object 'Collections.Generic.List[string]' }
+        if (-not $ByCode[$Code].Contains($Name)) { $ByCode[$Code].Add($Name) }
+    }
+    if ($null -ne $MsiFileMap -and $ByCode.Count -gt 0)
+    {
+        foreach ($Path in $MsiFileMap.Keys)
+        {
+            $Owners = $ByCode[([string]$MsiFileMap[$Path]).Trim()]
+            if ($null -eq $Owners) { continue }
+            $File = ([string]$Path).Trim()
+            if (-not $File.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $Leaf = $File.Substring($File.LastIndexOfAny([char[]]@('\', '/')) + 1)
+            if (-not $Leaf) { continue }
+            foreach ($Name in $Owners) { & $Add $Name $Leaf }
+        }
+    }
+
+    # Identity rules: the exe a rule names belongs to every installed app its target matches.
+    if ($null -ne $Mappings -and $null -ne $Mappings.Mappings)
+    {
+        foreach ($Section in @($Mappings.Mappings.customer, $Mappings.Mappings.powerStacks))
+        {
+            if ($null -eq $Section) { continue }
+            foreach ($Rule in @($Section.identityRules))
+            {
+                if ($null -eq $Rule -or $Rule.type -cne 'identity' -or $null -eq $Rule.when -or $null -eq $Rule.target) { continue }
+                $Exe = ([string]$Rule.when.exeName).Trim()
+                $NamePattern = $Rule.target.displayName
+                if (-not $Exe -or $null -eq $NamePattern -or $null -eq $Rule.target.publisher) { continue }
+                $Keys = Get-AUTargetKeys ([pscustomobject]@{ TargetPattern = [string]$NamePattern; TargetPublisher = [string]$Rule.target.publisher; RuleType = 'identity'; InstalledStateDependent = $false })
+                # A rule target has no ProductCode or PackageFamily, so its DisplayName pattern has to
+                # match: one -like over every name narrows the apps, then the target-app test decides.
+                foreach ($Name in @($AllNames -like [string]$NamePattern))
+                {
+                    foreach ($App in $AppsByName[$Name])
+                    {
+                        if (Test-AUTargetApp $App $Keys) { & $Add $Name $Exe; break }
+                    }
+                }
+            }
+        }
+    }
+
+    # Executables seen and matched to the app.
+    foreach ($Entry in @($Entries))
+    {
+        if ($null -eq $Entry -or -not (Test-AUEntryMatched $Entry)) { continue }
+        if ($null -ne $Entry.Classification -and $Entry.Classification.Ignored -eq $true) { continue }
+        $Exe = Get-AUExeKey $Entry
+        if (-not $Exe) { continue }
+        foreach ($Name in @(Get-AUTargetAppNames $Entry.Target $Index)) { & $Add $Name $Exe }
+    }
+    return $Known
+}#endfunction
+
+function Get-AUAppUsage
+{
+    <#
+.SYNOPSIS
+    Returns the usage fields for each installed-app entry, keyed by DisplayName ignoring case (F24).
+.DESCRIPTION
+    One value per de-duplicated inventory entry (its AppName), combined across every user on the
+    device (D19). Each value holds AppLastUsedDate (the latest credited use by any user),
+    AppUsageStatus, AppLastRanDate (the latest run of any kind), AppInFocusSeconds (total focus, whole
+    seconds), AppUsersWithUse (how many users had credited use), AppMatchedExeCount (how many of the
+    app's executables were seen), and AppRunsAsService (a matched executable is a service binary or
+    has the Service role). Dates are UTC text from Format-AUDate. No user identity (D31).
+    An entry belongs to the apps Get-AUTargetAppNames gives for its target. Use comes only from
+    Get-AUDerivedUse (F5), so SYSTEM and service accounts never give credited use. Ignored entries
+    are left out (F22).
+    AppUsageStatus, first that applies (D32): Used (a matched exe has credited use since
+    WatchingSince), RanNotUsed (a matched exe ran since then), Ambiguous (an unresolved exe with this
+    app among its CandidateTargets ran since then, D30), NotUsed (the app has known exes, or matched
+    exes, and none ran), NotCovered (none known). It's blank ($null) unless CollectionOk is true,
+    WatchingSince is known, and every scope holding the app in Apps (a blank Scope is Machine) is Read
+    in ScopeRead, so missing coverage is never NotUsed. When CollectionOk is false, every field is
+    blank.
+.PARAMETER Entries
+    The entries, with this run's Target, Classification, Role, and UserType.
+.PARAMETER InventoryApps
+    The de-duplicated inventory entries (ConvertTo-AUInventoryApps), with AppName.
+.PARAMETER KnownExesByApp
+    The Get-AUKnownExes result.
+.PARAMETER WatchingSince
+    The ledger's WatchingSince (Utc), or $null.
+.PARAMETER ScopeRead
+    Machine or a SID to Read, Unread, or Deleted. A scope that's missing counts as Unread.
+.PARAMETER Apps
+    The installed-app entries (Task 13 shape), with their internal Scope.
+.PARAMETER CollectionOk
+    True when App Usage collected usage successfully this run.
+#>
+    param (
+        [object[]]$Entries,
+        [object[]]$InventoryApps,
+        [hashtable]$KnownExesByApp,
+        [Nullable[datetime]]$WatchingSince,
+        [hashtable]$ScopeRead,
+        [object[]]$Apps,
+        [bool]$CollectionOk
+    )
+
+    $Result = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Inventory = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($App in @($InventoryApps))
+    {
+        if ($null -eq $App) { continue }
+        $Name = [string]$App.AppName
+        if ([string]::IsNullOrWhiteSpace($Name) -or $Result.ContainsKey($Name)) { continue }
+        $Result[$Name] = $null
+        $Inventory[$Name] = $Name.Trim()
+    }
+
+    if (-not $CollectionOk)
+    {
+        foreach ($Name in @($Result.Keys))
+        {
+            $Result[$Name] = [pscustomobject][ordered]@{ AppLastUsedDate = $null; AppUsageStatus = $null; AppLastRanDate = $null; AppInFocusSeconds = $null; AppUsersWithUse = $null; AppMatchedExeCount = $null; AppRunsAsService = $null }
+        }
+        return $Result
+    }
+
+    $Index = New-AUAppIndex $Apps
+    $States = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($Trimmed in $Inventory.Values)
+    {
+        if ($States.ContainsKey($Trimmed)) { continue }
+        $States[$Trimmed] = @{
+            LastUsed  = $null
+            LastRan   = $null
+            Focus     = [double]0
+            Users     = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            Exes      = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            Service   = $false
+            Credited  = $false
+            Ran       = $false
+            Ambiguous = $false
+        }
+    }
+
+    # Inline per-entry work: this loop runs once per ledger entry, thousands of times.
+    foreach ($Entry in @($Entries))
+    {
+        if ($null -eq $Entry) { continue }
+        if ($null -ne $Entry.Classification -and $Entry.Classification.Ignored -eq $true) { continue }
+        $Use = Get-AUDerivedUse $Entry ([string]$Entry.Role) ([string]$Entry.UserType)
+        $LastRan = $Use.LastRanTime
+        $LastUsed = $Use.LastUsedTime
+        $RanSince = ($null -ne $LastRan -and ($null -eq $WatchingSince -or $LastRan -ge $WatchingSince))
+        $UsedSince = ($null -ne $LastUsed -and ($null -eq $WatchingSince -or $LastUsed -ge $WatchingSince))
+        $Target = $Entry.Target
+
+        if ($null -eq $Target -or [string]$Target.MatchSection -cnotin $script:AUMatchedSections)
+        {
+            # Unresolved (D30, D47): each surviving candidate that is installed may be Ambiguous.
+            if (-not $RanSince -or $null -eq $Target) { continue }
+            $Candidates = New-Object 'Collections.Generic.List[string]'
+            foreach ($Candidate in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Candidate)) { $Candidates.Add(([string]$Candidate).Trim()) } }
+            if ($Candidates.Count -lt 2) { continue }
+            foreach ($Name in $Candidates) { if ($States.ContainsKey($Name)) { $States[$Name].Ambiguous = $true } }
+            continue
+        }
+
+        $Exe = ([string]$Entry.ExeName).Trim()
+        if (-not $Exe) { $Exe = ([string]$Entry.ExeInfo).Trim() }
+        $IsService = ([string]$Entry.Role -ceq 'Service' -or ($null -ne $Entry.Facts -and $Entry.Facts.IsServiceBinary -eq $true))
+        foreach ($Name in @(Get-AUTargetAppNames $Target $Index))
+        {
+            $State = $States[$Name]
+            if ($null -eq $State) { continue }
+            if ($null -ne $LastUsed -and ($null -eq $State.LastUsed -or $LastUsed -gt $State.LastUsed)) { $State.LastUsed = $LastUsed }
+            if ($null -ne $LastRan -and ($null -eq $State.LastRan -or $LastRan -gt $State.LastRan)) { $State.LastRan = $LastRan }
+            $State.Focus += [double]$Entry.FocusTotal
+            if ($Exe) { [void]$State.Exes.Add($Exe) }
+            if ($IsService) { $State.Service = $true }
+            if ($RanSince) { $State.Ran = $true }
+            if ($UsedSince) { $State.Credited = $true }
+            if ($Use.HasCreditedUse) { [void]$State.Users.Add(([string]$Entry.UserSid).Trim()) }
+        }
+    }
+
+    # Coverage (D32): every scope holding the app must have been read this run.
+    $ReadState = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $ScopeRead) { foreach ($Key in $ScopeRead.Keys) { $ReadState[([string]$Key).Trim()] = [string]$ScopeRead[$Key] } }
+    $Covered = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($App in $Index.Apps)
+    {
+        $Name = ([string]$App.DisplayName).Trim()
+        if (-not $Name) { continue }
+        $Scope = ([string]$App.Scope).Trim()
+        if (-not $Scope) { $Scope = 'Machine' }
+        $IsRead = ($ReadState[$Scope] -ceq 'Read')
+        if ($Covered.ContainsKey($Name)) { $Covered[$Name] = ($Covered[$Name] -and $IsRead) }
+        else { $Covered[$Name] = $IsRead }
+    }
+
+    foreach ($Name in @($Result.Keys))
+    {
+        $Trimmed = $Inventory[$Name]
+        $State = $States[$Trimmed]
+        $Status = $null
+        if ($null -ne $WatchingSince -and $Covered[$Trimmed] -eq $true)
+        {
+            $KnownExes = $null
+            if ($null -ne $KnownExesByApp) { $KnownExes = $KnownExesByApp[$Trimmed] }
+            if ($State.Credited) { $Status = 'Used' }
+            elseif ($State.Ran) { $Status = 'RanNotUsed' }
+            elseif ($State.Ambiguous) { $Status = 'Ambiguous' }
+            elseif ($State.Exes.Count -gt 0 -or ($null -ne $KnownExes -and @($KnownExes).Count -gt 0)) { $Status = 'NotUsed' }
+            else { $Status = 'NotCovered' }
+        }
+        $Result[$Name] = [pscustomobject][ordered]@{
+            AppLastUsedDate    = ConvertTo-AUOutputDate $State.LastUsed
+            AppUsageStatus     = $Status
+            AppLastRanDate     = ConvertTo-AUOutputDate $State.LastRan
+            AppInFocusSeconds  = [long][Math]::Round($State.Focus)
+            AppUsersWithUse    = $State.Users.Count
+            AppMatchedExeCount = $State.Exes.Count
+            AppRunsAsService   = $State.Service
+        }
+    }
+    return $Result
+}#endfunction
+
+function Get-AUExeGroups
+{
+    <#
+.SYNOPSIS
+    Groups entries by exe build and target, combining users (D31), in a stable order.
+.DESCRIPTION
+    The key is the ExeInfo plus the target: MatchSection, MatchRuleId, TargetPattern, TargetPublisher,
+    and ResolvedAppName for a matched entry, or None plus the CandidateTargets for an unmatched one.
+    Each group's Representative supplies the facts, role, and classification: an entry with verified
+    facts first, then one with facts, then the one that ran last, then the lowest user SID, so the
+    choice doesn't depend on the order of the entries. Returns Entries, Representative, and Matched
+    per group, ordered by key.
+.PARAMETER Entries
+    The entries, with this run's Target.
+#>
+    param (
+        [object[]]$Entries
+    )
+
+    $Separator = [string][char]31
+    $Groups = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    # Inline per-entry work: this loop runs once per ledger entry, thousands of times.
+    foreach ($Entry in @($Entries))
+    {
+        if ($null -eq $Entry) { continue }
+        $Target = $Entry.Target
+        $Matched = ($null -ne $Target -and [string]$Target.MatchSection -cin $script:AUMatchedSections)
+        $Key = ([string]$Entry.ExeInfo).Trim()
+        if ($Matched)
+        {
+            foreach ($Part in @($Target.MatchSection, $Target.MatchRuleId, $Target.TargetPattern, $Target.TargetPublisher, $Target.ResolvedAppName)) { $Key += $Separator + ([string]$Part).Trim() }
+        }
+        else
+        {
+            $Key += $Separator + 'None'
+            if ($null -ne $Target) { foreach ($Part in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Part)) { $Key += $Separator + ([string]$Part).Trim() } } }
+        }
+        $Group = $Groups[$Key]
+        if ($null -eq $Group)
+        {
+            $Group = [pscustomobject]@{ Key = $Key; Entries = New-Object 'Collections.Generic.List[object]'; Representative = $null; Matched = $Matched }
+            $Groups[$Key] = $Group
+        }
+        $Group.Entries.Add($Entry)
+    }
+
+    $Keys = [string[]]@($Groups.Keys)
+    [Array]::Sort($Keys, [StringComparer]::Ordinal)
+    foreach ($Key in $Keys)
+    {
+        $Group = $Groups[$Key]
+        $Best = $null
+        $BestRank = 0
+        foreach ($Entry in $Group.Entries)
+        {
+            # Rank: 2 for verified facts, 1 for facts, 0 for none.
+            $EntryRank = 0
+            if ($null -ne $Entry.Facts) { $EntryRank = 1; if ($Entry.Facts.FactsVerified -eq $true) { $EntryRank = 2 } }
+            if ($null -eq $Best) { $Best = $Entry; $BestRank = $EntryRank; continue }
+            if ($EntryRank -ne $BestRank) { if ($EntryRank -gt $BestRank) { $Best = $Entry; $BestRank = $EntryRank }; continue }
+            $EntryRan = $Entry.LastRanTime
+            $BestRan = $Best.LastRanTime
+            if ($null -ne $EntryRan -and ($null -eq $BestRan -or $EntryRan -gt $BestRan)) { $Best = $Entry; $BestRank = $EntryRank; continue }
+            if ($null -ne $BestRan -and ($null -eq $EntryRan -or $BestRan -gt $EntryRan)) { continue }
+            if ([string]::CompareOrdinal([string]$Entry.UserSid, [string]$Best.UserSid) -lt 0) { $Best = $Entry; $BestRank = $EntryRank }
+        }
+        $Group.Representative = $Best
+        $Group
+    }
+}#endfunction
+
+function ConvertTo-AUExeUsage
+{
+    <#
+.SYNOPSIS
+    Returns the per-executable output: one entry per exe build and target, users combined (D31).
+.DESCRIPTION
+    Every entry is kept: matched or unmatched, Retained, NotInstalled, and ignored (with the ignore
+    rule's ID in ClassificationRuleId, F22). Fields, in order: ExeInfo, ExeName, RunPath,
+    LocationClass, FileDescription, FileProductName, FileCompanyName, FileVersion, ProductVersion
+    (verified facts only; blank otherwise), FactsVerified, EvidenceCompanyName, EvidenceProductName,
+    EvidenceSource (CurrentFileAtPath; present only for an unverified build with current-file
+    evidence, D30), Subsystem, Role, ClassificationRuleId, ResolvedAppName, TargetPattern, Publisher
+    (the target's publisher pattern), ProductCode (or the package family), MatchSection, MatchRuleId,
+    InstallStatus, CandidateTargets (only when two or more candidates survived D47, F26), FirstSeen,
+    LastUsedTime, LastRanTime, InFocusSeconds, UsersWithUse, and RanAsSystemOnly.
+    Across users (F25), InstallStatus is Unmatched when there's no target, else Installed if any
+    user's is, else Unknown if any is (or is missing), else NotInstalled. FirstSeen is the earliest,
+    LastUsedTime (Get-AUDerivedUse, F5) and LastRanTime the latest, InFocusSeconds the total in whole
+    seconds, UsersWithUse the users with credited use, and RanAsSystemOnly true when it ran but never
+    for an interactive user. The facts, role, and classification come from the group's
+    representative (Get-AUExeGroups). No user identity (D31).
+.PARAMETER Entries
+    The entries, with this run's Target, Classification, Role, UserType, and InstallStatus.
+#>
+    param (
+        [object[]]$Entries
+    )
+
+    $Output = New-Object 'Collections.Generic.List[object]'
+    foreach ($Group in @(Get-AUExeGroups $Entries))
+    {
+        $Rep = $Group.Representative
+        $Facts = $Rep.Facts
+        $Target = $Rep.Target
+        $Verified = ($null -ne $Facts -and $Facts.FactsVerified -eq $true)
+        # The facts, blank as $null; the build-specific ones only for a verified build.
+        $FactValues = @{}
+        foreach ($Name in $script:AUExeFactFields)
+        {
+            $Value = $null
+            if ($null -ne $Facts -and ($Verified -or $Name -cin $script:AUPathFactFields)) { $Value = [string]$Facts.$Name }
+            if ([string]::IsNullOrWhiteSpace($Value)) { $Value = $null }
+            $FactValues[$Name] = $Value
+        }
+
+        $Evidence = $null
+        if (-not $Verified -and $null -ne $Facts -and $null -ne $Facts.PathEvidence) { $Evidence = $Facts.PathEvidence }
+        $RuleId = $null
+        if ($null -ne $Rep.Classification)
+        {
+            if ($Rep.Classification.Ignored -eq $true) { $RuleId = [string]$Rep.Classification.IgnoreRuleId }
+            else { $RuleId = [string]$Rep.Classification.ClassificationRuleId }
+            if (-not $RuleId) { $RuleId = $null }
+        }
+
+        $Status = 'Unmatched'
+        $Candidates = $null
+        if ($Group.Matched)
+        {
+            $Status = 'NotInstalled'
+            foreach ($Entry in $Group.Entries)
+            {
+                $UserStatus = [string]$Entry.InstallStatus
+                if ($UserStatus -ceq 'Installed') { $Status = 'Installed'; break }
+                if ($UserStatus -cne 'NotInstalled') { $Status = 'Unknown' }
+            }
+        }
+        elseif ($null -ne $Target)
+        {
+            $Names = New-Object 'Collections.Generic.List[string]'
+            foreach ($Name in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Name)) { $Names.Add(([string]$Name).Trim()) } }
+            if ($Names.Count -gt 1) { $Candidates = $Names.ToArray() }
+        }
+
+        $FirstSeen = $null
+        $LastUsed = $null
+        $LastRan = $null
+        $Focus = [double]0
+        $Users = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $InteractiveRun = $false
+        foreach ($Entry in $Group.Entries)
+        {
+            $Use = Get-AUDerivedUse $Entry ([string]$Entry.Role) ([string]$Entry.UserType)
+            if ($null -ne $Entry.FirstSeen -and ($null -eq $FirstSeen -or $Entry.FirstSeen -lt $FirstSeen)) { $FirstSeen = $Entry.FirstSeen }
+            if ($null -ne $Use.LastUsedTime -and ($null -eq $LastUsed -or $Use.LastUsedTime -gt $LastUsed)) { $LastUsed = $Use.LastUsedTime }
+            if ($null -ne $Use.LastRanTime -and ($null -eq $LastRan -or $Use.LastRanTime -gt $LastRan)) { $LastRan = $Use.LastRanTime }
+            $Focus += [double]$Entry.FocusTotal
+            if ($Use.HasCreditedUse) { [void]$Users.Add(([string]$Entry.UserSid).Trim()) }
+            if ($null -ne $Use.LastRanTime -and (Test-AUInteractiveUserType ([string]$Entry.UserType))) { $InteractiveRun = $true }
+        }
+
+        $Matched = $Group.Matched
+        $Out = [ordered]@{
+            ExeInfo              = [string]$Rep.ExeInfo
+            ExeName              = $(if ([string]::IsNullOrWhiteSpace([string]$Rep.ExeName)) { $null } else { [string]$Rep.ExeName })
+            RunPath              = $FactValues['RunPath']
+            LocationClass        = $FactValues['LocationClass']
+            FileDescription      = $FactValues['FileDescription']
+            FileProductName      = $FactValues['FileProductName']
+            FileCompanyName      = $FactValues['FileCompanyName']
+            FileVersion          = $FactValues['FileVersion']
+            ProductVersion       = $FactValues['ProductVersion']
+            FactsVerified        = $Verified
+            EvidenceCompanyName  = $(if ($null -ne $Evidence -and $Evidence.CompanyName) { [string]$Evidence.CompanyName } else { $null })
+            EvidenceProductName  = $(if ($null -ne $Evidence -and $Evidence.ProductName) { [string]$Evidence.ProductName } else { $null })
+            EvidenceSource       = $(if ($null -ne $Evidence) { 'CurrentFileAtPath' } else { $null })
+            Subsystem            = $FactValues['Subsystem']
+            Role                 = $(if ([string]$Rep.Role) { [string]$Rep.Role } else { $null })
+            ClassificationRuleId = $RuleId
+            ResolvedAppName      = $(if ($Matched -and $Target.ResolvedAppName) { [string]$Target.ResolvedAppName } else { $null })
+            TargetPattern        = $(if ($Matched -and $null -ne $Target.TargetPattern) { [string]$Target.TargetPattern } else { $null })
+            Publisher            = $(if ($Matched -and $null -ne $Target.TargetPublisher) { [string]$Target.TargetPublisher } else { $null })
+            ProductCode          = $(if ($Matched -and $Target.ProductCode) { [string]$Target.ProductCode } elseif ($Matched -and $Target.PackageFamily) { [string]$Target.PackageFamily } else { $null })
+            MatchSection         = $(if ($Matched) { [string]$Target.MatchSection } else { 'None' })
+            MatchRuleId          = $(if ($Matched -and $Target.MatchRuleId) { [string]$Target.MatchRuleId } else { $null })
+            InstallStatus        = $Status
+        }
+        if ($null -ne $Candidates) { $Out['CandidateTargets'] = $Candidates }
+        $Out['FirstSeen'] = ConvertTo-AUOutputDate $FirstSeen
+        $Out['LastUsedTime'] = ConvertTo-AUOutputDate $LastUsed
+        $Out['LastRanTime'] = ConvertTo-AUOutputDate $LastRan
+        $Out['InFocusSeconds'] = [long][Math]::Round($Focus)
+        $Out['UsersWithUse'] = $Users.Count
+        $Out['RanAsSystemOnly'] = ($null -ne $LastRan -and -not $InteractiveRun)
+        $Output.Add([pscustomobject]$Out)
+    }
+    return $Output.ToArray()
+}#endfunction
+
+function Get-AUUnmatchedExeCount
+{
+    <#
+.SYNOPSIS
+    Returns UnmatchedExeCount_d: how many per-executable entries have no target, leaving out ignored ones (F22).
+.DESCRIPTION
+    Counts at the ConvertTo-AUExeUsage grain (exe build and target, users combined), so it equals the
+    number of Unmatched entries in that output whose representative isn't ignored.
+.PARAMETER Entries
+    The entries, with this run's Target and Classification.
+#>
+    param (
+        [object[]]$Entries
+    )
+
+    $Count = 0
+    foreach ($Group in @(Get-AUExeGroups $Entries))
+    {
+        if ($Group.Matched) { continue }
+        $Classification = $Group.Representative.Classification
+        if ($null -ne $Classification -and $Classification.Ignored -eq $true) { continue }
+        $Count++
+    }
+    return $Count
+}#endfunction
 #endregion APPUSAGE
 
 #region script
