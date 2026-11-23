@@ -11802,6 +11802,11 @@ function Send-AUInventoryRun
         [int]$LockTimeoutSeconds = $script:AULockTimeoutSeconds
     )
 
+    # The script's own preference (powershell.exe -File), whatever the caller's, as in Invoke-AppUsage
+    # and the sender: under Stop, a logger error after the rows were sent (the log is locked) would
+    # end this function, and the caller's own upload would send the row again. It holds for the outbox
+    # and row functions called from here too, so they run as they do under powershell.exe -File.
+    $ErrorActionPreference = 'Continue'
     if ($null -eq $Sender) { throw 'Send-AUInventoryRun needs -Sender.' }
     $State = [pscustomobject]@{
         Tokens     = New-Object 'System.Collections.Generic.List[string]'
