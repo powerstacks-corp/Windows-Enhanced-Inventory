@@ -7,15 +7,16 @@ App Usage (software metering) records which installed apps people actually use, 
 App Usage runs only where it's supported. On any other device, the inventory runs as before, and App Usage reports why it skipped in `AppUsageCollectionStatus_s`.
 
 - **Windows:** Windows 11 25H2 (build 26200) or later. Windows 10 and earlier Windows 11 releases report `UnsupportedOS`.
-- **PowerShell:** 64-bit Windows PowerShell 5.1, running as SYSTEM, the way Intune runs the script. In Constrained Language mode, for example under an application control policy, App Usage is skipped and the inventory uploads as in version 19, without the App Usage columns. The reason, `LanguageMode:ConstrainedLanguage`, appears in the script log.
+- **PowerShell:** 64-bit Windows PowerShell 5.1, running as SYSTEM, the way Intune runs the script. In Constrained Language Mode, for example on a device whose application control policy doesn't allow the script, App Usage is skipped, and the inventory runs without App Usage. The reason, `LanguageMode:ConstrainedLanguage; skipped`, is in the script log; don't count on it reaching the workspace. See [Application Control](#application-control).
 
 Before you turn it on:
 
 1. Install the BI for Intune release that reads split runs. With App Usage on, a large device can send its App Inventory data as several rows (see [How the Data Is Sent](#how-the-data-is-sent)), and earlier releases don't read those rows.
-1. Add the App Usage columns to the `PowerStacksAppInventory_CL` table and its data collection rule.
-1. Wait 30 minutes after the data collection rule changes. A change reaches the service's ingestion points unevenly, and a row that arrives before the change has reached them all can lose its run columns. Reports ignore that row and its run.
+1. Add the App Usage columns to the `PowerStacksAppInventory_CL` table and its data collection rule. Run `Update-PowerStacksAppInventorySchema.ps1` from the `postdeploy` folder of [EnhancedInventoryDeploy](https://github.com/powerstacks-corp/EnhancedInventoryDeploy). Until it reaches the main branch, the updater is on the repository's release branch, `release/app-usage-v1`. [Add the App Usage columns to an existing deployment](https://github.com/powerstacks-corp/EnhancedInventoryDeploy/blob/release/app-usage-v1/README.md#add-the-app-usage-columns-to-an-existing-deployment) has the steps, including the backup it saves and how to roll back. A deployment made from a version of EnhancedInventoryDeploy that includes App Usage already has the columns.
+1. Wait the full 30 minutes after the data collection rule changes. A change reaches the service's ingestion points unevenly. Until it reaches them all, uploads still succeed, but a row can lose its new columns without any error, and a test row that keeps them doesn't prove that every upload will. Reports ignore a row that lost its run columns, and the rest of its run.
+1. Get the release build of the script. See [Deploy the Release Build](#deploy-the-release-build).
 
-Then set `$CollectAppMetering = $true` in `Intune_Windows_Inventory.ps1` and deploy the script as before.
+Then set `$CollectAppMetering = $true` in the release build of `Intune_Windows_Inventory.ps1`, and deploy it as before. Start with a few devices, and then the rest.
 
 These settings, at the top of the script, control App Usage:
 
@@ -26,7 +27,30 @@ These settings, at the top of the script, control App Usage:
 | `$MinFocusSecondsForUse` | `1` | How many seconds of focus or input count as use. |
 | `$AppUsageCustomerMappingsPath` | `C:\ProgramData\PowerStacks\AppUsage\customer-mappings.json` | Where the script looks for your mapping rules. |
 
-To turn App Usage off, set `$CollectAppMetering = $false`. The next run sends exactly the App Inventory row it sent before App Usage, and the usage history stays on the device. If you also roll back the data collection rule, change the script first and the rule only after devices stop sending App Usage rows.
+To turn App Usage off, set `$CollectAppMetering = $false`. The next run sends exactly the App Inventory row it sent before App Usage, and the usage history stays on the device. If you also roll back the data collection rule, change the script first and the rule only after devices stop sending App Usage rows. The updater's `-RollbackFrom` parameter puts back the rule it saved; see [Roll back](https://github.com/powerstacks-corp/EnhancedInventoryDeploy/blob/release/app-usage-v1/README.md#roll-back).
+
+### Deploy the Release Build
+
+Deploy the `Intune_Windows_Inventory.ps1` from a release of this repository, not the file in the repository itself. The repository file is the source. It's over the 512 KB size limit Intune puts on a remediation script, and it doesn't have the PowerStacks mapping rules built in, so App Usage would skip and report `MappingsUnavailable:Missing`. PowerStacks makes the release build from it with `Build-InventoryRelease.ps1`, which builds the rules in and removes the comments inside functions. Keep `Test-AppUsageMappings.ps1` and `customer-mappings.example.json` from the same release with it. See [What a Release Contains](#what-a-release-contains).
+
+## Privacy
+
+App Usage records which apps people use on their devices, and for how long. That's activity monitoring, and some organizations need approval first, for example from a works council.
+
+- Everyone with access to the BI for Intune app sees all of its data. BI for Intune is a Power BI template app, and template apps don't support row-level security, so you can't limit who sees which devices' usage. Turning App Usage on or off is the control.
+- App Usage sends no user names or SIDs as fields, and its user fields are counts. But `RunPath`, and `ExeInfo` for some executables, is the path the executable ran from. For an app installed in a user's profile, that path includes the profile folder, such as `C:\Users\<profile folder>\...`, which often contains the user's name. Treat `RunPath` and `ExeInfo` as data that can identify a user in your reports.
+- Who used what stays in the usage history on each device, which only SYSTEM and administrators can read (see [Usage History on the Device](#usage-history-on-the-device)).
+- App Usage writes no user names, SIDs, or profile paths to the script log in `C:\Windows\Logs`, because standard users can read that log.
+
+## Application Control
+
+App Control for Business (formerly WDAC) script rules apply to the whole inventory script, not only App Usage. On a device that enforces them, PowerShell runs any script the policy doesn't allow in Constrained Language Mode, and the inventory script might not run correctly in that mode. Some customers might need to sign the script:
+
+- If your policy doesn't already allow scripts that Intune deploys, sign `Intune_Windows_Inventory.ps1` with a code-signing certificate your policy trusts. The certificate's root must also be in the device's trusted root store.
+- Sign the script after you set its settings, and sign it again after any change, because editing the file invalidates the signature.
+- Your mapping rules are a separate file, so changing them doesn't mean signing the script again.
+
+In Constrained Language Mode, App Usage doesn't start, because it can't load the Windows components it needs. The inventory runs without App Usage. The reason, `LanguageMode:ConstrainedLanguage; skipped`, is in the script log; don't count on it reaching the workspace. For more information, see [Understand App Control script enforcement](https://learn.microsoft.com/windows/security/application-security/application-control/app-control-for-business/design/script-enforcement).
 
 ## Usage History on the Device
 
@@ -36,6 +60,12 @@ SRUM keeps only about 30 to 60 days of usage, so the script keeps its own histor
 - The script writes a new copy of the file to disk and then swaps it in, so a run that stops partway, or a power loss, leaves the earlier file in place.
 - If the file can't be read, the script never overwrites it. It renames the file to `AppUsage_<Serial>.corrupt-<yyyyMMddHHmmss>.json`, with the time in UTC, starts a new history from what SRUM still holds, and reports `LedgerReset`. The renamed copy can also be read only by SYSTEM and administrators.
 - An app update brings a new build of its executable. Once SRUM holds no usage of the old build, the script combines the old build's history into a newer build of the same app for the same user. It combines builds only when both are matched to the same app, or, for unmatched builds, when the script verified both builds and they have the same company and product names. Executables that only share a file name, such as two `setup.exe` files from different publishers, are never combined.
+
+### The Work Folder
+
+While it runs, App Usage copies the SRUM database, and the registry hives of users who aren't signed in, into a folder for the run under `C:\Windows\PowerStacksAppUsage`, and deletes the copies when it's done. The script creates `C:\Windows\PowerStacksAppUsage` so that only SYSTEM and administrators can open it, because the copies hold every user's activity.
+
+If `C:\Windows\PowerStacksAppUsage` already exists and isn't a folder that only SYSTEM and administrators control, the script never changes, reads, or deletes it, and App Usage skips the run with `SrumReadFailed:WorkDirUntrusted`. That includes a folder an administrator made by hand or with another tool, which gets the permissions of `C:\Windows`. App Usage skips on every run until an administrator deletes the folder. The next run then creates it again.
 
 ## Installed Apps and Profiles
 
@@ -54,7 +84,7 @@ When App Usage is on, the App Inventory data lists the installed apps of every p
 
 ## What App Usage Reports
 
-App Usage adds usage fields to each app in the App Inventory data (`PowerStacksAppInventory_CL`), and sends a list of the executables it has seen. Both combine every user on the device: they count users, and never name them. Who used what stays in the history file on the device.
+App Usage adds usage fields to each app in the App Inventory data (`PowerStacksAppInventory_CL`), and sends a list of the executables it has seen. Both combine every user on the device: their user fields are counts, not names. An executable's path can still include a user's profile folder (see [Privacy](#privacy)). Who used what stays in the history file on the device.
 
 ### How Use Is Counted
 
@@ -103,9 +133,9 @@ App Usage also sends one entry for each executable build it has seen and each ap
 
 | Field | Meaning |
 |---|---|
-| `ExeInfo` | The executable build, as SRUM records it. For a Store or MSIX app, its package name. |
+| `ExeInfo` | The executable build, as SRUM records it. For a Store or MSIX app, its package name. For some executables it's the path the executable ran from, which can include a user's profile folder. |
 | `ExeName` | The file name, in lowercase. Blank for a Store or MSIX app. |
-| `RunPath` | The path the build ran from, when the script found it and confirmed it's the same build. |
+| `RunPath` | The path the build ran from, when the script found it and confirmed it's the same build. For an app installed in a user's profile, the path includes the profile folder, which often contains the user's name. |
 | `LocationClass` | The kind of folder it ran from: `Windows`, `ProgramFiles`, `UserProfile`, `Temp`, `Download`, `ManagementCache`, or `Other`. |
 | `FileDescription`, `FileProductName`, `FileCompanyName`, `FileVersion`, `ProductVersion` | The build's file details. Only when the script verified the build (`FactsVerified` is `true`); blank otherwise. |
 | `FactsVerified` | `true` when the file on disk is the build that ran. A file outside the Windows and Program Files folders counts only when SYSTEM, Administrators, TrustedInstaller, or the user who ran it owns the file, so one user can't plant a file that gives another user's executable its details. |
@@ -159,7 +189,7 @@ This run's rows get the script's usual upload retries. A row that still fails is
 - The ingestion service can reject a row itself, with HTTP 400 (bad request) or 413 (too large), and a resend of the same row can't succeed. A saved row rejected that way is deleted, and the run goes on to the next saved row. A new row rejected that way is saved like any other, so the next run tries it once more.
 - No other failure deletes a row. That includes 401 and 403, for example from an expired client secret or a missing role on the data collection rule, a throttled or timed-out request, a server error, and a failed token request. The row waits for the next run.
 - A saved row that was sent but can't be deleted is renamed to `<RunId>-<RowIndex>.json.sent`, so it's never sent again, and a later run deletes it.
-- Two inventory runs never use the folder at the same time. A run that finds another run using it for 60 seconds sends its own rows without the folder and reports `OutboxSkipped`; any of its rows that fail are lost.
+- Two inventory runs never use the folder at the same time. They take turns with a lock, `Global\PowerStacksAppUsageOutbox`. A run that waits 60 seconds and still can't get the lock sends its own rows without the folder and reports `OutboxSkipped`; any of its rows that fail may be lost. Usually another inventory run holds the lock, but any process on the device can hold it.
 - When App Usage is off, the folder stays on the device and its rows aren't sent.
 
 ## Device Columns
@@ -185,26 +215,26 @@ Row 1 of every run with App Usage on carries these columns, next to the App Inve
 |---|---|
 | `OK` | Nothing to report. |
 | `UnsupportedOS` | Windows is older than Windows 11 25H2 (build 26200). App Usage skipped. |
-| `LanguageMode:<mode>; skipped` | PowerShell isn't in Full Language mode. App Usage skipped. In Constrained Language mode the inventory uploads as in version 19, without the App Usage columns, so this token appears in the script log, not in the workspace. |
+| `LanguageMode:<mode>; skipped` | PowerShell isn't in Full Language mode, so App Usage skipped. In Constrained Language Mode the inventory runs without App Usage. The reason is in the script log; don't count on it reaching the workspace. See [Application Control](#application-control). |
 | `AppUsageFailed:OsBuild` | The Windows build number couldn't be read. App Usage skipped. |
 | `AppUsageFailed:Serial` | The serial number couldn't be read, so the usage history can't be named. App Usage skipped. A device with no serial number uses its computer name instead and isn't affected. |
-| `MappingsUnavailable:Missing` | The PowerStacks mapping rules aren't in the script. App Usage skipped. |
+| `MappingsUnavailable:Missing` | The PowerStacks mapping rules aren't in the script, which happens when the script that ran is the repository's source file instead of the release build. App Usage skipped. See [Deploy the Release Build](#deploy-the-release-build). |
 | `MappingsUnavailable:Invalid` | The PowerStacks mapping rules in the script didn't load. App Usage skipped. |
-| `AppUsageBusy` | Another inventory run on the device held the App Usage lock for 60 seconds. App Usage skipped this run. |
+| `AppUsageBusy` | App Usage couldn't get its lock, `Global\PowerStacksAppUsage`, within 60 seconds (or couldn't open it), so App Usage skipped this run. Usually that's another inventory run, but any process on the device can hold the lock. If a device reports this on every run, look for a process that holds it. |
 | `AppUsageFailed` | An unexpected error. The script log has the details. The usage fields are blank for this run. |
 | `ShadowCopyFailed` | No shadow copy of the system drive could be taken. App Usage skipped. |
 | `LowDiskSpace` | The drive that holds the work folder had less free space than the copies need: at least 2 GB, and at least three times the size of the SRUM database and the signed-out users' hives. Nothing was copied, and App Usage skipped. |
-| `SrumReadFailed:WorkDirUntrusted` | The work folder `C:\Windows\PowerStacksAppUsage` isn't a folder that only SYSTEM and administrators control, so the script left it alone and App Usage skipped. Delete the folder as an administrator; the next run creates it again. |
+| `SrumReadFailed:WorkDirUntrusted` | The work folder `C:\Windows\PowerStacksAppUsage` isn't a folder that only SYSTEM and administrators control, so the script left it alone and App Usage skipped. A folder an administrator made counts too. App Usage skips on every run until an administrator deletes the folder; the next run creates it again. See [The Work Folder](#the-work-folder). |
 | `SrumReadFailed:<reason>` | The SRUM database couldn't be read this run, so no new usage was added. The history on the device is unchanged. The reason is `CopyFailed`, `EsentMissing`, `NoDatabase`, `LiveDatabase`, `HeaderFailed`, `RepairFailed`, `OpenFailed`, `IdMapFailed`, `NoTimeline`, `TimelineFailed`, `ReadFailed`, or `NoRows` (the read worked but held no usage). |
 | `LedgerReset` | The usage history on the device couldn't be read. It was renamed and a new one started. |
 | `LedgerWriteFailed` | The usage history couldn't be saved. The earlier file is unchanged, and this run's results were still sent. |
 | `DiscoveryFailed` | The all-profile app read was incomplete, so the App Inventory used the earlier read: the device's apps and the signed-in user's apps. |
 | `ProfileUnread:<count>` | How many profiles couldn't be read. Their apps are never `NotInstalled`. |
-| `HiveUnloadFailed:<count>` | How many copied user hives were still loaded at the end of the run. |
+| `HiveUnloadFailed:<count>` | How many copied user hives were still loaded at the end of the run, under `HKEY_USERS\AU_<SID>`. They hold copies, not the users' own hives. The next run that reads that user unloads it first; restarting the device also unloads it. |
 | `MsiFileMapFailed` | The Windows Installer component records couldn't be read, so they didn't help match executables to apps. |
 | `InvalidCustomerMappings` | The customer mapping file isn't valid, so it was ignored this run. With `:TooLarge`, it's over 1 MB. With `:UnsafePath` or `:ReparsePoint`, its path was refused. |
 | `PendingRows` | Rows from an earlier run are still waiting to be sent. See [Rows That Fail to Send](#rows-that-fail-to-send). |
-| `OutboxSkipped` | The folder for unsent rows couldn't be used this run, so rows that weren't sent may be lost. |
+| `OutboxSkipped` | The folder for unsent rows couldn't be used this run: something held its lock for 60 seconds, the folder couldn't be read, or it isn't the protected folder the script creates. This run's rows were still sent, but any that failed may be lost. See [Rows That Fail to Send](#rows-that-fail-to-send). |
 
 A device without a customer mapping file reports `OK`; its blank `CustomerMappingsHash_s` shows that it has none.
 
@@ -527,6 +557,8 @@ Each release publishes three files. You deploy the script; keep the other two wi
 | `customer-mappings.example.json` | An example rules file. Copy it, name the copy `customer-mappings.json`, and replace the examples with your rules. |
 
 A release never contains a file named `customer-mappings.json`, so it can't replace yours.
+
+The `Intune_Windows_Inventory.ps1` in the repository itself is the source, not the file you deploy: it's over Intune's 512 KB limit and has no PowerStacks rules built in. PowerStacks builds the release file from it with `Build-InventoryRelease.ps1`.
 
 The PowerStacks rules are the Base64 value between the `# BEGIN APPUSAGE MAPPINGS` and `# END APPUSAGE MAPPINGS` lines of the script. Don't edit that block by hand. The script checks the rules on every run; if they don't load or don't validate, App Usage skips the run and reports `MappingsUnavailable:Invalid`. To change how executables match, use your own file.
 
