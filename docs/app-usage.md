@@ -193,6 +193,7 @@ Row 1 of every run with App Usage on carries these columns, next to the App Inve
 | `AppUsageBusy` | Another inventory run on the device held the App Usage lock for 60 seconds. App Usage skipped this run. |
 | `AppUsageFailed` | An unexpected error. The script log has the details. The usage fields are blank for this run. |
 | `ShadowCopyFailed` | No shadow copy of the system drive could be taken. App Usage skipped. |
+| `LowDiskSpace` | The drive that holds the work folder had less free space than the copies need: at least 2 GB, and at least three times the size of the SRUM database and the signed-out users' hives. Nothing was copied, and App Usage skipped. |
 | `SrumReadFailed:WorkDirUntrusted` | The work folder `C:\Windows\PowerStacksAppUsage` isn't a folder that only SYSTEM and administrators control, so the script left it alone and App Usage skipped. Delete the folder as an administrator; the next run creates it again. |
 | `SrumReadFailed:<reason>` | The SRUM database couldn't be read this run, so no new usage was added. The history on the device is unchanged. The reason is `CopyFailed`, `EsentMissing`, `NoDatabase`, `LiveDatabase`, `HeaderFailed`, `RepairFailed`, `OpenFailed`, `IdMapFailed`, `NoTimeline`, `TimelineFailed`, `ReadFailed`, or `NoRows` (the read worked but held no usage). |
 | `LedgerReset` | The usage history on the device couldn't be read. It was renamed and a new one started. |

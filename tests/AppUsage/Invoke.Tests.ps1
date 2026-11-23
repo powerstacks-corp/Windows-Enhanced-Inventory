@@ -269,7 +269,7 @@ Describe 'Format-AUStatus and the status token list (F42)' {
             $Token.Contains(';') | Should -BeFalse
         }
         foreach ($Name in @('OK', 'UnsupportedOS', 'AppUsageBusy', 'ShadowCopyFailed', 'LedgerReset', 'LedgerWriteFailed', 'DiscoveryFailed', 'InvalidCustomerMappings',
-                'AppUsageFailed:Serial', 'AppUsageFailed:OsBuild', 'PendingRows', 'OutboxSkipped', 'AppUsageFailed', 'MsiFileMapFailed', 'skipped'))
+                'AppUsageFailed:Serial', 'AppUsageFailed:OsBuild', 'PendingRows', 'OutboxSkipped', 'AppUsageFailed', 'MsiFileMapFailed', 'skipped', 'LowDiskSpace'))
         {
             $script:AUStatusTokens | Should -Contain $Name
         }
@@ -455,6 +455,17 @@ function Write-CMTraceLog { param (`$Message, `$Component, `$Type) }
         Mock New-AUSnapshot { [pscustomobject]@{ WorkDir = $WorkDir; ShadowId = $null; SrumDbPath = $null; HiveCopies = @{}; MachineDomainSid = ''; Status = 'ShadowCopyFailed' } }
         $Result = Invoke-AppUsage -RunId $script:Run
         Get-TestTokens $Result | Should -Contain 'ShadowCopyFailed'
+        Should -Invoke Get-AUInstalledApps -Times 0 -Exactly
+        Should -Invoke Read-AUSrum -Times 0 -Exactly
+        Should -Invoke Remove-AUSnapshot -Times 1 -Exactly
+        $Result.InventoryApps | Should -BeNullOrEmpty
+    }
+
+    It 'skips the run with LowDiskSpace, and still removes the work folder (I4)' {
+        Mock New-AUSnapshot { [pscustomobject]@{ WorkDir = $WorkDir; ShadowId = $null; SrumDbPath = $null; HiveCopies = @{}; MachineDomainSid = ''; Status = 'LowDiskSpace' } }
+        $Result = Invoke-AppUsage -RunId $script:Run
+        Get-TestTokens $Result | Should -Be @('LowDiskSpace')
+        $Result.DeviceColumns['AppUsageCollectionStatus_s'] | Should -BeExactly 'LowDiskSpace'
         Should -Invoke Get-AUInstalledApps -Times 0 -Exactly
         Should -Invoke Read-AUSrum -Times 0 -Exactly
         Should -Invoke Remove-AUSnapshot -Times 1 -Exactly

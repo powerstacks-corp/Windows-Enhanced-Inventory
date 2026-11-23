@@ -306,6 +306,8 @@ Describe 'New-AUSnapshot' {
         # Records how many copies were made when the shadow copy was released.
         $script:CopiesAtRelease = $null
         Mock Remove-AUShadowCopy { $script:CopiesAtRelease = $script:Copied.Count; $true }
+        # Plenty of free space, unless a test says otherwise.
+        Mock Get-AUFreeSpace { [long]100GB }
     }
 
     It 'gives ShadowCopyFailed, a null SrumDbPath, and no copies when the shadow copy fails' {
@@ -373,6 +375,54 @@ Describe 'New-AUSnapshot' {
         [IO.File]::ReadAllText((Join-Path $script:WorkDir 'shadow.id')) | Should -Be $script:ShadowId
     }
 
+    It 'skips with LowDiskSpace, copying nothing, when the work folder''s drive has <Free> free and the copies need <Needed>' -ForEach @(
+        @{ Free = '1.5 GB'; FreeBytes = [long]1.5GB; Needed = '10 MB'; NeededBytes = [long]10MB }
+        @{ Free = '5 GB'; FreeBytes = [long]5GB; Needed = '2 GB'; NeededBytes = [long]2GB }
+        @{ Free = 'an unknown amount'; FreeBytes = $null; Needed = '10 MB'; NeededBytes = [long]10MB }
+    ) {
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        $script:FreeBytes = $FreeBytes
+        $script:NeededBytes = $NeededBytes
+        Mock Get-AUFreeSpace { $script:FreeBytes }
+        Mock Get-AUCopyBytes { $script:NeededBytes }
+        $S = New-AUSnapshot -WorkDir $script:WorkDir
+        $S.Status | Should -BeExactly 'LowDiskSpace'
+        $S.SrumDbPath | Should -BeNullOrEmpty
+        $S.HiveCopies[$script:SignedOutSid] | Should -BeNullOrEmpty
+        Should -Invoke Copy-AUShadowFile -Times 0
+        Should -Invoke Get-AUFreeSpace -Times 1 -Exactly -ParameterFilter { $Path -eq $script:WorkDir }
+        # The shadow copy and its link are still released.
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:ShadowId }
+        Test-Path -LiteralPath (Join-Path $script:WorkDir 'shadow') | Should -BeFalse
+        $S.ShadowId | Should -BeNullOrEmpty
+    }
+
+    It 'copies when the drive has at least 2 GB and three times the copies free: <Free> free for <Needed>' -ForEach @(
+        @{ Free = '2.5 GB'; FreeBytes = [long]2.5GB; Needed = '100 MB'; NeededBytes = [long]100MB }
+        @{ Free = '7 GB'; FreeBytes = [long]7GB; Needed = '2 GB'; NeededBytes = [long]2GB }
+    ) {
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        $script:FreeBytes = $FreeBytes
+        $script:NeededBytes = $NeededBytes
+        Mock Get-AUFreeSpace { $script:FreeBytes }
+        Mock Get-AUCopyBytes { $script:NeededBytes }
+        $S = New-AUSnapshot -WorkDir $script:WorkDir
+        $S.Status | Should -BeExactly 'OK'
+        $S.SrumDbPath | Should -Not -BeNullOrEmpty
+        $script:Copied | Should -Contain "$(Join-Path $script:WorkDir 'shadow')\Windows\System32\sru\*"
+    }
+
+    It 'sizes the SRUM folder and each signed-out hive, with its logs, from the shadow link' {
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Mock Get-AUCopyBytes { [long]0 }
+        $null = New-AUSnapshot -WorkDir $script:WorkDir
+        $Link = Join-Path $script:WorkDir 'shadow'
+        Should -Invoke Get-AUCopyBytes -Times 1 -Exactly -ParameterFilter { $SruFolder -eq "$Link\Windows\System32\sru" -and @($HiveFolders) -contains "$Link\Users\signedout" -and @($HiveFolders).Count -eq 1 }
+    }
+
     It 'records a hive that does not copy as $null and a SRUM copy failure in Status' {
         Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
         Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
@@ -382,6 +432,28 @@ Describe 'New-AUSnapshot' {
         $S.SrumDbPath | Should -BeNullOrEmpty
         $S.ShadowId | Should -BeNullOrEmpty
         $S.HiveCopies[$script:SignedOutSid] | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-AUCopyBytes and Get-AUFreeSpace (I4)' {
+    It 'adds up the SRUM folder''s files and each hive folder''s NTUSER.DAT, .LOG1, and .LOG2' {
+        $Sru = Join-Path $TestDrive "sru-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -ItemType Directory -Path $Sru
+        [IO.File]::WriteAllBytes((Join-Path $Sru 'SRUDB.dat'), (New-Object byte[] 100))
+        [IO.File]::WriteAllBytes((Join-Path $Sru 'SRU.log'), (New-Object byte[] 200))
+        $Hive = Join-Path $TestDrive "hive-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -ItemType Directory -Path $Hive
+        [IO.File]::WriteAllBytes((Join-Path $Hive 'NTUSER.DAT'), (New-Object byte[] 300))
+        [IO.File]::WriteAllBytes((Join-Path $Hive 'NTUSER.DAT.LOG1'), (New-Object byte[] 50))
+        [IO.File]::WriteAllBytes((Join-Path $Hive 'ntuser.ini'), (New-Object byte[] 999))
+        Get-AUCopyBytes -SruFolder $Sru -HiveFolders @($Hive, (Join-Path $TestDrive 'missing')) | Should -Be 650
+        Get-AUCopyBytes -SruFolder (Join-Path $TestDrive 'missing') -HiveFolders @() | Should -Be 0
+    }
+
+    It 'reads the free space of the drive that holds a path, and gives $null when it can''t' {
+        Get-AUFreeSpace -Path $TestDrive | Should -BeGreaterThan 0
+        Get-AUFreeSpace -Path 'Contoso\relative' | Should -BeNullOrEmpty
+        Get-AUFreeSpace -Path '' | Should -BeNullOrEmpty
     }
 }
 

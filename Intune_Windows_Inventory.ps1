@@ -5741,6 +5741,9 @@ $script:AURepairTimeoutSeconds = 900
 $script:AUStaleRunHours = 24
 # The marker file in a run folder that names its shadow copy, so a later run can delete it.
 $script:AUShadowMarker = 'shadow.id'
+# The least free space the work folder's drive must keep before the snapshot copies are made (I4);
+# the copies also need three times their own size free.
+$script:AUMinFreeBytes = 2GB
 # The status when the work root can't be made safe, so App Usage skips the run.
 $script:AUWorkDirUntrustedStatus = 'SrumReadFailed:WorkDirUntrusted'
 
@@ -6377,6 +6380,69 @@ function Write-AUShadowMarker
     finally { $Stream.Dispose() }
 }#endfunction
 
+function Get-AUCopyBytes
+{
+    <#
+.SYNOPSIS
+    Returns the total size, in bytes, of the files New-AUSnapshot copies: every file in the SRUM folder, and each hive folder's NTUSER.DAT, NTUSER.DAT.LOG1, and NTUSER.DAT.LOG2.
+.DESCRIPTION
+    Sizes are attribute reads; no file is opened. A folder or file that isn't there adds nothing.
+    Never throws: a size that can't be read adds nothing, so the 2 GB floor still applies.
+.PARAMETER SruFolder
+    The SRUM folder under the shadow link.
+.PARAMETER HiveFolders
+    Each signed-out profile's folder under the shadow link.
+#>
+    param (
+        [string]$SruFolder,
+        [string[]]$HiveFolders
+    )
+
+    [long]$Total = 0
+    try
+    {
+        if ($SruFolder -and [IO.Directory]::Exists($SruFolder))
+        {
+            foreach ($File in [IO.Directory]::GetFiles($SruFolder)) { $Total += (New-Object IO.FileInfo $File).Length }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't size the SRUM folder in the shadow copy: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    foreach ($Folder in @($HiveFolders))
+    {
+        if (-not $Folder) { continue }
+        foreach ($Name in @('NTUSER.DAT', 'NTUSER.DAT.LOG1', 'NTUSER.DAT.LOG2'))
+        {
+            try
+            {
+                $Info = New-Object IO.FileInfo ([IO.Path]::Combine($Folder, $Name))
+                if ($Info.Exists) { $Total += $Info.Length }
+            }
+            catch { }
+        }
+    }
+    return $Total
+}#endfunction
+
+function Get-AUFreeSpace
+{
+    <#
+.SYNOPSIS
+    Returns the free space, in bytes, available on the drive that holds Path, or $null when it can't be read. Never throws.
+.PARAMETER Path
+    A drive-letter path, such as the run's work folder.
+#>
+    param (
+        [string]$Path
+    )
+
+    try
+    {
+        if ([string]::IsNullOrWhiteSpace($Path) -or $Path -notmatch '^[A-Za-z]:\\') { return $null }
+        return [long](New-Object IO.DriveInfo ($Path.Substring(0, 1))).AvailableFreeSpace
+    }
+    catch { return $null }
+}#endfunction
+
 function New-AUSnapshot
 {
     <#
@@ -6396,9 +6462,14 @@ function New-AUSnapshot
     shadow copy exists, its ID is in <WorkDir>\shadow.id, so a run killed mid-snapshot leaves it for
     the next run's New-AUWorkDir to delete. When the release fails, ShadowId and the marker stay,
     and Remove-AUSnapshot tries again.
+    Before anything is copied, the free space on the work folder's drive (Get-AUFreeSpace) must be
+    at least 2 GB and at least three times the size of the copies (Get-AUCopyBytes), which leaves
+    room for a repaired SRUM copy. Otherwise nothing is copied and Status is LowDiskSpace; free
+    space that can't be read counts as too little.
     Status is OK, ShadowCopyFailed (no shadow copy, or it couldn't be linked; SrumDbPath and every
-    hive copy $null), or SrumReadFailed:CopyFailed (the shadow copy worked but SRUDB.dat didn't
-    copy). Never throws; call Remove-AUSnapshot in finally.
+    hive copy $null), LowDiskSpace (the same, for too little free space), or
+    SrumReadFailed:CopyFailed (the shadow copy worked but SRUDB.dat didn't copy). Never throws;
+    call Remove-AUSnapshot in finally.
 .PARAMETER WorkDir
     The run's work folder, from New-AUWorkDir.
 #>
@@ -6452,6 +6523,26 @@ function New-AUSnapshot
             [void][IO.Directory]::CreateDirectory($SruFolder)
             $SruSource = ConvertTo-AUShadowPath -Path ([IO.Path]::GetDirectoryName($script:AULiveSrumPath)) -ShadowRoot $Mount
             $SrumCopy = [IO.Path]::Combine($SruFolder, 'SRUDB.dat')
+
+            # Free space first (I4): at least 2 GB, and three times what the copies need.
+            $HiveFolders = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($UserProfile in $SignedOut)
+            {
+                $Source = ConvertTo-AUShadowPath -Path $UserProfile.ProfilePath -ShadowRoot $Mount
+                if ($Source) { $HiveFolders.Add($Source) }
+            }
+            $Needed = [long](Get-AUCopyBytes -SruFolder $SruSource -HiveFolders $HiveFolders.ToArray())
+            $Floor = [Math]::Max([long]$script:AUMinFreeBytes, 3 * $Needed)
+            $Free = Get-AUFreeSpace -Path $WorkDir
+            if ($null -eq $Free -or [long]$Free -lt $Floor)
+            {
+                $Snapshot.Status = 'LowDiskSpace'
+                $FreeText = 'an unknown amount of'
+                if ($null -ne $Free) { $FreeText = "$([Math]::Round([long]$Free / 1MB)) MB" }
+                Write-CMTraceLog -Message "App Usage: skipped this run, because the work folder's drive has $FreeText free space, and the copies ($([Math]::Round($Needed / 1MB)) MB) need $([Math]::Round($Floor / 1MB)) MB free." -Component 'AppUsage' -Type 3
+                return $Snapshot
+            }
+
             # The logs and checkpoint let esentutl /r recover the copy; only SRUDB.dat is required.
             if ($SruSource) { [void](Copy-AUShadowFile -Source "$SruSource\*" -Destination $SruFolder) }
             if ([IO.File]::Exists($SrumCopy)) { $Snapshot.SrumDbPath = $SrumCopy }
@@ -10039,6 +10130,7 @@ $script:AUStatusTokens = @(
     'AppUsageFailed:Serial'             # The serial number couldn't be read, so the ledger can't be named: App Usage skipped.
     'AppUsageFailed:OsBuild'            # The Windows build number couldn't be read: App Usage skipped.
     'ShadowCopyFailed'                  # No shadow copy of the system drive: App Usage skipped.
+    'LowDiskSpace'                      # Too little free space for the snapshot copies: App Usage skipped.
     'SrumReadFailed:WorkDirUntrusted'   # C:\Windows\PowerStacksAppUsage isn't safe to use: App Usage skipped.
     'SrumReadFailed:CopyFailed'         # SRUDB.dat didn't copy from the shadow copy.
     'SrumReadFailed:EsentMissing'       # The ManagedEsent assembly isn't there.
@@ -10375,7 +10467,7 @@ function Invoke-AUCollection
 .DESCRIPTION
     In order (F10, F16, F17, F29, F35, F36):
     1. New-AUWorkDir and New-AUSnapshot. An untrusted work root (New-AUWorkDir throws
-       SrumReadFailed:WorkDirUntrusted) or ShadowCopyFailed skips the rest of the run.
+       SrumReadFailed:WorkDirUntrusted), ShadowCopyFailed, or LowDiskSpace skips the rest of the run.
     2. Get-AUUsers and Get-AUInstalledApps -IncludeStore. A Machine scope that isn't Read, or a
        signed-in user who isn't, is DiscoveryFailed: InventoryApps and AppFields stay $null, and the
        inventory uses its own read (D20, D36). Unread profiles, hive copies left loaded, and an
@@ -10433,6 +10525,11 @@ function Invoke-AUCollection
         {
             Add-AUStatusToken $Tokens 'ShadowCopyFailed'
             Write-CMTraceLog -Message 'App Usage: skipped this run, because no shadow copy could be taken.' -Component 'AppUsage' -Type 3
+            return
+        }
+        if ([string]$Snapshot.Status -eq 'LowDiskSpace')
+        {
+            Add-AUStatusToken $Tokens 'LowDiskSpace'
             return
         }
 
