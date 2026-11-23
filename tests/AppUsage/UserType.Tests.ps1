@@ -78,7 +78,7 @@ Describe 'Add-AUDeletedScopes (F29, Task 21)' {
         $Scopes[$Sid] | Should -BeExactly 'Deleted'
     }
 
-    It 'leaves a service, virtual, or system account that never has a profile alone: <Sid>' -ForEach @(
+    It 'marks a service, virtual, or system account that never has a profile NoProfile, not Deleted: <Sid>' -ForEach @(
         @{ Sid = 'S-1-5-90-0-1' }
         @{ Sid = 'S-1-5-96-0-1' }
         @{ Sid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' }
@@ -91,7 +91,8 @@ Describe 'Add-AUDeletedScopes (F29, Task 21)' {
     ) {
         $Scopes = @{ Machine = 'Read' }
         Add-AUDeletedScopes -ScopeRead $Scopes -Users $script:Profiles -Sids @($Sid) | Should -Be 0
-        $Scopes.ContainsKey($Sid) | Should -BeFalse
+        # NoProfile, not Deleted: Get-AUInstallStatus reads it as it read Deleted, so NotInstalled stays possible.
+        $Scopes[$Sid] | Should -BeExactly 'NoProfile'
     }
 
     It 'counts only the interactive SIDs it marks' {
@@ -99,5 +100,20 @@ Describe 'Add-AUDeletedScopes (F29, Task 21)' {
         $Sids = @('S-1-5-90-0-1', 'S-1-5-90-0-2', 'S-1-5-96-0-1', 'S-1-12-1-9999-9999-9999-9999', 'S-1-5-21-1111111111-2222222222-3333333333-1001')
         Add-AUDeletedScopes -ScopeRead $Scopes -Users $script:Profiles -Sids $Sids | Should -Be 1
         @($Scopes.Keys | Where-Object { $Scopes[$_] -eq 'Deleted' }) | Should -Be @('S-1-12-1-9999-9999-9999-9999')
+        @($Scopes.Keys | Where-Object { $Scopes[$_] -eq 'NoProfile' }).Count | Should -Be 3
+    }
+
+    It 'keeps a state already in ScopeRead for a service account' {
+        $Scopes = @{ Machine = 'Read'; 'S-1-5-90-0-1' = 'Unread' }
+        Add-AUDeletedScopes -ScopeRead $Scopes -Users $script:Profiles -Sids @('S-1-5-90-0-1') | Should -Be 0
+        $Scopes['S-1-5-90-0-1'] | Should -BeExactly 'Unread'
+    }
+
+    It 'gives Get-AUInstallStatus NotInstalled for a NoProfile SID, as it did for Deleted' {
+        $Target = [pscustomobject]@{ MatchSection = 'PowerStacks'; MatchRuleId = 'ps-test-1'; TargetPattern = 'Contoso Alpha*'; TargetPublisher = 'Contoso*'; ProductCode = $null; PackageFamily = $null }
+        $Scopes = @{ Machine = 'Read' }
+        $null = Add-AUDeletedScopes -ScopeRead $Scopes -Users $script:Profiles -Sids @('S-1-5-90-0-1')
+        Get-AUInstallStatus $Target @() $Scopes 'S-1-5-90-0-1' | Should -BeExactly 'NotInstalled'
+        Get-AUInstallStatus $Target @() @{ Machine = 'Read'; 'S-1-5-90-0-1' = 'Deleted' } 'S-1-5-90-0-1' | Should -BeExactly 'NotInstalled'
     }
 }

@@ -4033,16 +4033,17 @@ function Get-AUInstallStatus
     normalized DisplayName and Publisher (Get-AUNormalizedText, the arpCompare comparison) equal the
     target's ResolvedAppName and publisher: an update that renames the entry, Contoso Alpha 1.0 to
     Contoso Alpha 1.1, still counts. An app with no scope counts as in scope. Otherwise NotInstalled
-    only when Machine was Read and the user's scope was Read or Deleted (the profile is gone from
-    ProfileList); else Unknown. A blank UserSid leaves the user's scope unknown, so Unknown; a SID
-    missing from ScopeRead counts as Unread (F29). A mapped executable whose target is absent stays
+    only when Machine was Read and the user's scope was Read, Deleted (the profile is gone from
+    ProfileList), or NoProfile (a service or virtual account, which never has one); else Unknown.
+    A blank UserSid leaves the user's scope unknown, so Unknown; a SID missing from ScopeRead counts
+    as Unread (F29). A mapped executable whose target is absent stays
     mapped.
 .PARAMETER Target
     The Resolve-AUTarget result.
 .PARAMETER InstalledApps
     The installed-app entries, with their internal Scope (Machine or a SID).
 .PARAMETER ScopeRead
-    Machine or a SID to Read, Unread, or Deleted.
+    Machine or a SID to Read, Unread, Deleted, or NoProfile.
 .PARAMETER UserSid
     The entry's user SID.
 .PARAMETER AppIndex
@@ -4080,7 +4081,7 @@ function Get-AUInstallStatus
     }
     if ((& $StateOf 'Machine') -ne 'Read') { return 'Unknown' }
     # The target may be a per-user install, and with no SID that scope can't have been read.
-    if (-not $Sid -or (& $StateOf $Sid) -notin @('Read', 'Deleted')) { return 'Unknown' }
+    if (-not $Sid -or (& $StateOf $Sid) -notin @('Read', 'Deleted', 'NoProfile')) { return 'Unknown' }
     return 'NotInstalled'
 }#endfunction
 
@@ -5469,7 +5470,7 @@ function Get-AUAppUsage
 .PARAMETER WatchingSince
     The ledger's WatchingSince (Utc), or $null.
 .PARAMETER ScopeRead
-    Machine or a SID to Read, Unread, or Deleted. A scope that's missing counts as Unread.
+    Machine or a SID to Read, Unread, Deleted, or NoProfile. A scope that's missing counts as Unread.
 .PARAMETER Apps
     The installed-app entries (Task 13 shape), with their internal Scope.
 .PARAMETER CollectionOk
@@ -10825,9 +10826,11 @@ function Add-AUDeletedScopes
 .DESCRIPTION
     A SID already in ScopeRead keeps its state. With no users (ProfileList couldn't be read),
     nothing is marked, because a profile can't be known to be gone. Only interactive SIDs
-    (Test-AUInteractiveUserType: CloudOnly, Domain, Local) are marked: SYSTEM, service, and virtual
-    accounts such as Window Manager (S-1-5-90-*) and Font Driver Host (S-1-5-96-*) never have a
-    profile, so their absence from ProfileList doesn't mean a deleted user (Task 21).
+    (Test-AUInteractiveUserType: CloudOnly, Domain, Local) are marked Deleted and counted. Any other
+    SID, such as SYSTEM, a service account, or the Window Manager (S-1-5-90-*) and Font Driver Host
+    (S-1-5-96-*) virtual accounts, never has a profile, so it's marked NoProfile instead: not a
+    deleted user, and read for install status exactly as Deleted is, because it has no per-user
+    apps to read (Task 21).
 .PARAMETER ScopeRead
     The discovery's ScopeRead.
 .PARAMETER Users
@@ -10849,10 +10852,14 @@ function Add-AUDeletedScopes
     {
         $Value = ([string]$Sid).Trim()
         if (-not $Value -or $Profiles.Contains($Value)) { continue }
-        if (-not (Test-AUInteractiveUserType (Get-AUUserType -Sid $Value -MachineDomainSid ''))) { continue }
         $Known = $false
         foreach ($Name in $ScopeRead.Keys) { if ([string]::Equals([string]$Name, $Value, [StringComparison]::OrdinalIgnoreCase)) { $Known = $true; break } }
         if ($Known) { continue }
+        if (-not (Test-AUInteractiveUserType (Get-AUUserType -Sid $Value -MachineDomainSid '')))
+        {
+            $ScopeRead[$Value] = 'NoProfile'
+            continue
+        }
         $ScopeRead[$Value] = 'Deleted'
         $Count++
     }
@@ -11004,7 +11011,7 @@ function Invoke-AUCollection
        rows' own SIDs (case-insensitive), and with -NoArchive when the copy was repaired or the read
        is incomplete.
     5. Interactive ledger SIDs missing from ProfileList become Deleted in ScopeRead (F29), after the
-       merge so a deleted user's new rows count too. Service and virtual accounts never do.
+       merge so a deleted user's new rows count too. Service and virtual accounts become NoProfile.
     6. Every ledger entry is recalculated (Set-AUEntryResult; Package-kind entries only with
        IncludeStore), with one read budget and one service map for the run (F36).
     7. Invoke-AULedgerFold, then Get-AUKnownExes, Get-AUAppUsage, ConvertTo-AUExeUsage, and

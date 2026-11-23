@@ -1042,9 +1042,37 @@ Describe 'Invoke-AppUsage recalculates every entry (D13, F16, F17, F22, F29)' {
         function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) $script:Logged.Add($Message) }
         $null = Invoke-AppUsage -RunId $script:Run
         $script:ScopeSeen[$script:Gone] | Should -BeExactly 'Deleted'
-        $script:ScopeSeen.ContainsKey($Dwm) | Should -BeFalse
-        $script:ScopeSeen.ContainsKey($Umfd) | Should -BeFalse
+        $script:ScopeSeen[$Dwm] | Should -BeExactly 'NoProfile'
+        $script:ScopeSeen[$Umfd] | Should -BeExactly 'NoProfile'
         @($script:Logged | Where-Object { $_ -like 'App Usage: * ledger users are no longer in ProfileList (Deleted).' }) | Should -Be @('App Usage: 1 ledger users are no longer in ProfileList (Deleted).')
+    }
+
+    It 'gives a service or virtual account''s entry of an app that isn''t installed NotInstalled, not Unknown (Task 21, fix round 1)' {
+        # No Get-AUInstallStatus mock: the real ScopeRead state decides each entry's status and the exe roll-up.
+        $Dwm = 'S-1-5-90-0-1'
+        $Service = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+        Save-TestLedger @(
+            (New-TestEntry $Dwm 'gamma.exe' @{ Facts = (New-TestFacts 'gamma.exe'); LastRanTime = $script:Earlier })
+            (New-TestEntry $Service 'gamma.exe' @{ Facts = (New-TestFacts 'gamma.exe'); LastRanTime = $script:Earlier })
+        )
+        $script:Entries = $null
+        $script:RealExeUsage = ${function:ConvertTo-AUExeUsage}
+        Mock ConvertTo-AUExeUsage { $script:Entries = $Entries; & $script:RealExeUsage -Entries $Entries }
+        $script:Logged = New-Object 'System.Collections.Generic.List[string]'
+        function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) $script:Logged.Add($Message) }
+        $Result = Invoke-AppUsage -RunId $script:Run
+        foreach ($Sid in @($Dwm, $Service))
+        {
+            $Entry = @($script:Entries | Where-Object { $_.UserSid -eq $Sid })
+            $Entry.Count | Should -Be 1
+            $Entry[0].UserType | Should -BeExactly 'Service'
+            $Entry[0].Target.MatchSection | Should -BeExactly 'PowerStacks'
+            $Entry[0].InstallStatus | Should -BeExactly 'NotInstalled' -Because $Sid
+        }
+        $Gamma = Get-TestExe $Result 'gamma.exe'
+        $Gamma.Count | Should -Be 1
+        $Gamma[0].InstallStatus | Should -BeExactly 'NotInstalled'
+        @($script:Logged | Where-Object { $_ -like '*no longer in ProfileList (Deleted)*' }).Count | Should -Be 0
     }
 
     It 'gives the deleted user''s per-user target NotInstalled on its own (F29)' {
