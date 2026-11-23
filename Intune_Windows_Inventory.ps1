@@ -8472,24 +8472,42 @@ function Read-AUMsiFileMap
     only .exe names. A path two products both record is left out, because neither owns it alone.
     Registry key paths, and components with no product (the all-zero value), are skipped. UserData
     feeds this map and ProductCode ownership only, never inventory entries (F33).
+    A machine registration (UserData\S-1-5-18) claims any file. A per-user one (UserData\<SID>, which
+    a standard user can create by installing a per-user package) claims only files under that SID's
+    profile folder, so it can never claim, or make shared, a machine file for every user; with no
+    profile folder known for the SID, it claims nothing. Ignored claims are counted in the log.
 .PARAMETER Base
     The open HKEY_LOCAL_MACHINE root.
 .PARAMETER Into
     The map: lowercased full path to ProductCode.
+.PARAMETER ProfilePaths
+    SID to profile folder (the Get-AUUsers ProfilePath of each user).
 #>
     param (
         [Microsoft.Win32.RegistryKey]$Base,
-        [hashtable]$Into
+        [hashtable]$Into,
+        [hashtable]$ProfilePaths
     )
 
     $Shared = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $UserData = $null
+    $Ignored = 0
     try
     {
         $UserData = $Base.OpenSubKey($script:AUInstallerUserData)
         if ($null -eq $UserData) { return $true }
         foreach ($Sid in $UserData.GetSubKeyNames())
         {
+            # A per-user registration claims only files in its own profile folder (I3).
+            $Prefix = $null
+            if (-not [string]::Equals($Sid, $script:AUSystemSid, [StringComparison]::OrdinalIgnoreCase))
+            {
+                $Folder = ''
+                if ($null -ne $ProfilePaths) { $Folder = ([string]$ProfilePaths[$Sid]).Trim().TrimEnd('\') }
+                if ($Folder -notmatch '^[A-Za-z]:\\[^\\]') { $Folder = $null }
+                if ($Folder) { $Prefix = $Folder + '\' }
+                else { $Prefix = '' }
+            }
             $Components = $UserData.OpenSubKey("$Sid\Components")
             if ($null -eq $Components) { continue }
             try
@@ -8508,6 +8526,11 @@ function Read-AUMsiFileMap
                             if ($Path -match '^[A-Za-z]\?\\') { $Path = $Path.Substring(0, 1) + ':' + $Path.Substring(2) }
                             if ($Path -notmatch '^[A-Za-z]:\\' -or -not $Path.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { continue }
                             $File = $Path.ToLowerInvariant()
+                            if ($null -ne $Prefix -and ($Prefix -eq '' -or -not $File.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)))
+                            {
+                                $Ignored++
+                                continue
+                            }
                             $Code = ConvertFrom-AUPackedGuid $ValueName
                             if ($Shared.Contains($File)) { continue }
                             if ($Into.ContainsKey($File))
@@ -8527,7 +8550,7 @@ function Read-AUMsiFileMap
             }
             finally { $Components.Close() }
         }
-        Write-CMTraceLog -Message "App Usage: Windows Installer records $($Into.Count) executables; $($Shared.Count) shared by two products were left out." -Component 'AppUsage'
+        Write-CMTraceLog -Message "App Usage: Windows Installer records $($Into.Count) executables; $($Shared.Count) shared by two products were left out, and $Ignored per-user records outside their own profile folder were ignored." -Component 'AppUsage'
         return $true
     }
     catch
@@ -8858,7 +8881,9 @@ function Get-AUInstalledApps
             $NativeRead = Read-AUArpEntries -Base $Machine -ShownBase 'HKEY_LOCAL_MACHINE' -SubPath $script:AUUninstallNative -Scope 'Machine' -Architecture 64 -Into $Native
             $WowRead = Read-AUArpEntries -Base $Machine -ShownBase 'HKEY_LOCAL_MACHINE' -SubPath $script:AUUninstallWow -Scope 'Machine' -Architecture 32 -Into $Wow
             $MachineRead = ($NativeRead -and $WowRead)
-            $MsiRead = [bool](Read-AUMsiFileMap -Base $Machine -Into $MsiFileMap)
+            $ProfilePaths = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($User in $UserList) { $ProfilePaths[[string]$User.Sid] = [string]$User.ProfilePath }
+            $MsiRead = [bool](Read-AUMsiFileMap -Base $Machine -Into $MsiFileMap -ProfilePaths $ProfilePaths)
         }
         catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine's apps: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         finally { if ($null -ne $Machine) { $Machine.Close() } }

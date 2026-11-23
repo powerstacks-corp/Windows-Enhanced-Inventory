@@ -63,7 +63,16 @@ BeforeAll {
     Set-FixtureKey "M\$script:Components\C3" @{ $script:EpsilonPacked = 'C:\Program Files\Contoso\Epsilon\epsilon.exe' }
     Set-FixtureKey "M\$script:Components\C4" @{ $script:DeltaPacked = '02:\SOFTWARE\Contoso\Delta.exe' }
     Set-FixtureKey "M\$script:Components\C5" @{ ('A' * 32) = 'C:\Program Files\Shared\common.exe' }
-    Set-FixtureKey "M\$($script:Components.Replace('S-1-5-18', $script:LoadedSid))\C6" @{ ('B' * 32) = 'C:\Program Files\Shared\common.exe' }
+    # Alice's per-user registrations (I3): one claims a machine file another product owns, one a file in her profile,
+    # one a file in Bob's profile, and one a folder whose name only starts with hers.
+    $script:UserComponents = $script:Components.Replace('S-1-5-18', $script:LoadedSid)
+    Set-FixtureKey "M\$script:UserComponents\C6" @{ ('B' * 32) = 'C:\Program Files\Shared\common.exe' }
+    Set-FixtureKey "M\$script:UserComponents\C8" @{ ('C' * 32) = 'C:\Users\alice\AppData\Local\Programs\Gamma\gamma.exe' }
+    Set-FixtureKey "M\$script:UserComponents\C9" @{ ('D' * 32) = 'C:\Users\bob\AppData\Local\Tools\bobtool.exe' }
+    Set-FixtureKey "M\$script:UserComponents\C10" @{ ('E' * 32) = 'C:\Users\alice2\Tools\near.exe' }
+    # Two machine products that both record one file.
+    Set-FixtureKey "M\$script:Components\C11" @{ ('A' * 32) = 'C:\Program Files\Shared\both.exe' }
+    Set-FixtureKey "M\$script:Components\C12" @{ ('B' * 32) = 'C:\Program Files\Shared\both.exe' }
     Set-FixtureKey "M\$script:Components\C7" @{ ('A' * 32) = 'C:\Program Files\Contoso\Delta\readme.txt' }
     Set-FixtureKey "M\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$script:EpsilonPacked\InstallProperties" @{ DisplayName = 'Contoso Epsilon'; DisplayVersion = '1.0' }
     # SYSTEM's hive stand-in.
@@ -412,13 +421,42 @@ Describe 'Get-AUInstalledApps' -Skip:(-not $script:IsAdmin) {
         $Map['c:\program files\contoso\epsilon\epsilon.exe'] | Should -BeExactly $script:EpsilonCode
         $Map['c:\program files\contoso\delta\delta.exe'] | Should -BeExactly $script:DeltaCode
         $Map['c:\program files\contoso\delta\helper.exe'] | Should -BeExactly $script:DeltaCode
+        # A per-user registration doesn't make a machine file shared (I3).
+        $Map['c:\program files\shared\common.exe'] | Should -BeExactly (ConvertFrom-AUPackedGuid ('A' * 32))
         # Shared by two products, a component with no product, a registry key path, and a file that isn't an .exe.
-        $Map.ContainsKey('c:\program files\shared\common.exe') | Should -BeFalse
+        $Map.ContainsKey('c:\program files\shared\both.exe') | Should -BeFalse
         $Map.ContainsKey('c:\program files\contoso\delta\zero.exe') | Should -BeFalse
-        $Map.Count | Should -Be 3
+        $Map.Count | Should -Be 4
         @(Get-TestApp $Result.Apps 'Contoso Epsilon').Count | Should -Be 0
         @(ConvertTo-AUInventoryApps -Apps $Result.Apps | Where-Object AppName -eq 'Contoso Epsilon').Count | Should -Be 0
         @($Map.Keys | Where-Object { $_ -cne $_.ToLowerInvariant() }).Count | Should -Be 0
+    }
+
+    It 'lets a per-user registration claim only files in that user''s profile folder; SYSTEM''s claim anywhere (I3)' {
+        $Base = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$script:FixtureKey\M")
+        try
+        {
+            $Map = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+            $Profiles = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+            $Profiles[$script:LoadedSid] = $script:AlicePath + '\'
+            $Profiles['S-1-5-18'] = 'C:\Windows\system32\config\systemprofile'
+            Read-AUMsiFileMap -Base $Base -Into $Map -ProfilePaths $Profiles | Should -BeTrue
+        }
+        finally { $Base.Close() }
+        $Map['c:\users\alice\appdata\local\programs\gamma\gamma.exe'] | Should -BeExactly (ConvertFrom-AUPackedGuid ('C' * 32))
+        # Her claim on a machine file neither takes it nor makes it shared.
+        $Map['c:\program files\shared\common.exe'] | Should -BeExactly (ConvertFrom-AUPackedGuid ('A' * 32))
+        $Map.ContainsKey('c:\users\bob\appdata\local\tools\bobtool.exe') | Should -BeFalse
+        $Map.ContainsKey('c:\users\alice2\tools\near.exe') | Should -BeFalse
+        # SYSTEM's registrations claim files outside its profile folder.
+        $Map['c:\program files\contoso\epsilon\epsilon.exe'] | Should -BeExactly $script:EpsilonCode
+        $Map.Count | Should -Be 5
+    }
+
+    It 'passes every user''s profile folder to the Windows Installer map' {
+        Mock Read-AUMsiFileMap { $true }
+        $null = Get-AUInstalledApps -Users @((New-TestUser $script:LoadedSid 'Loaded' $script:AlicePath), (New-TestUser $script:CopiedSid 'CopyFailed' $script:BobPath))
+        Should -Invoke Read-AUMsiFileMap -Times 1 -Exactly -ParameterFilter { $ProfilePaths[$script:LoadedSid] -eq $script:AlicePath -and $ProfilePaths[$script:CopiedSid] -eq $script:BobPath -and $ProfilePaths[$script:LoadedSid.ToLowerInvariant()] -eq $script:AlicePath }
     }
 
     It 'reads SYSTEM''s hive as machine scope, and S-1-5-18 has the machine''s read state' {
