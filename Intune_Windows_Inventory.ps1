@@ -6925,6 +6925,561 @@ function Read-AUSrum
     return $Read
 }#endfunction
 
+# Executable facts (Task 14; D24, D30, F13, F36 to F38). SRUM gives kernel paths and a build
+# fingerprint. A kernel path is translated by suffix probing under each fixed drive (QueryDosDevice
+# needs compiling, D25), and a file's facts are read only when its PE TimeDateStamp and CheckSum
+# equal the build's (D24). Files are only ever opened to read their headers and version info.
+$script:AUFileShare = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+$script:AUUnixEpoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
+# The PE header bytes read at e_lfanew: the signature (4), the file header (20), and the optional
+# header through Subsystem (70). CheckSum and Subsystem sit at the same offsets in PE32 and PE32+.
+$script:AUPeHeaderBytes = 94
+$script:AUServicesKey = 'SYSTEM\CurrentControlSet\Services'
+
+function Get-AUFixedDrives
+{
+    <#
+.SYNOPSIS
+    Returns the roots of the ready fixed drives, such as C: and E:, for kernel path probing.
+.DESCRIPTION
+    A separate function so tests can point probing at TestDrive folders. Returns nothing when the
+    drives can't be listed; callers wrap the call in @(). Never throws.
+#>
+    $Roots = New-Object 'System.Collections.Generic.List[string]'
+    try
+    {
+        foreach ($Drive in [IO.DriveInfo]::GetDrives())
+        {
+            if ($Drive.DriveType -ne [IO.DriveType]::Fixed) { continue }
+            $Ready = $false
+            try { $Ready = $Drive.IsReady } catch { $Ready = $false }
+            if ($Ready) { $Roots.Add($Drive.Name.Substring(0, 2).ToUpperInvariant()) }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the fixed drives: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    # Unrolled, so a pipeline gets one root at a time.
+    return $Roots.ToArray()
+}#endfunction
+
+function ConvertTo-AUIoPath
+{
+    <#
+.SYNOPSIS
+    Returns the form of a drive-letter path to open: with the \\?\ prefix when it's 260 characters or longer.
+.DESCRIPTION
+    Only for opening the file. Facts and run paths never carry the prefix.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ($Path.Length -ge 260 -and $Path -match '^[A-Za-z]:\\') { return '\\?\' + $Path }
+    return $Path
+}#endfunction
+
+function Get-AULongPath
+{
+    <#
+.SYNOPSIS
+    Expands any 8.3 short name in a drive-letter path to its long name.
+.DESCRIPTION
+    Only a segment holding ~ is looked up, by listing its parent folder with the segment as the
+    pattern; it's replaced when exactly one entry answers to it. A segment that isn't found, or a
+    failure, leaves the path as given. Never throws.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrEmpty($Path) -or $Path.IndexOf('~') -lt 0) { return $Path }
+    try
+    {
+        $Parts = $Path.Split('\')
+        $Current = $Parts[0]
+        for ($i = 1; $i -lt $Parts.Count; $i++)
+        {
+            $Segment = $Parts[$i]
+            if ($Segment.IndexOf('~') -ge 0 -and $Segment.IndexOfAny([char[]]@('*', '?')) -lt 0)
+            {
+                $Parent = New-Object IO.DirectoryInfo ((ConvertTo-AUIoPath $Current) + '\')
+                $Found = @($Parent.GetFileSystemInfos($Segment))
+                if ($Found.Count -eq 1) { $Segment = $Found[0].Name }
+            }
+            $Current = $Current + '\' + $Segment
+        }
+        return $Current
+    }
+    catch { return $Path }
+}#endfunction
+
+function Get-AUPeFingerprint
+{
+    <#
+.SYNOPSIS
+    Reads a file's PE build fingerprint: LinkTimeUtc (Utc kind), CheckSum ([uint32]), and Subsystem.
+.DESCRIPTION
+    Reads only the DOS header and the PE headers, with a FileStream opened for reading that lets
+    others read, write, and delete the file; no compiling. LinkTimeUtc is the file header's
+    TimeDateStamp and CheckSum the optional header's, the same types ConvertFrom-AUExeInfo gives, so
+    the comparison is exact. Subsystem is GUI (2), Console (3), or Other for any other value (Native,
+    EFI, and so on). Returns $null for a missing file, a folder, or a file that isn't a PE image.
+    Never throws.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $Stream = $null
+    try
+    {
+        $IoPath = ConvertTo-AUIoPath $Path
+        if (-not [IO.File]::Exists($IoPath)) { return $null }
+        $Stream = New-Object IO.FileStream ($IoPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $script:AUFileShare)
+        $ReadAll = {
+            param ([byte[]]$Buffer)
+            $Total = 0
+            while ($Total -lt $Buffer.Length)
+            {
+                $Count = $Stream.Read($Buffer, $Total, $Buffer.Length - $Total)
+                if ($Count -le 0) { break }
+                $Total += $Count
+            }
+            return ($Total -eq $Buffer.Length)
+        }
+
+        $Dos = New-Object byte[] 64
+        if (-not (& $ReadAll $Dos) -or $Dos[0] -ne 0x4D -or $Dos[1] -ne 0x5A) { return $null }
+        $Offset = [BitConverter]::ToInt32($Dos, 0x3C)
+        if ($Offset -lt 64 -or [long]$Offset + $script:AUPeHeaderBytes -gt $Stream.Length) { return $null }
+        $Stream.Position = $Offset
+        $Header = New-Object byte[] $script:AUPeHeaderBytes
+        if (-not (& $ReadAll $Header)) { return $null }
+        if ([BitConverter]::ToUInt32($Header, 0) -ne 0x00004550) { return $null }
+        if ([BitConverter]::ToUInt16($Header, 20) -lt 70) { return $null }
+        $Magic = [BitConverter]::ToUInt16($Header, 24)
+        if ($Magic -ne 0x10B -and $Magic -ne 0x20B) { return $null }
+
+        $Subsystem = 'Other'
+        switch ([BitConverter]::ToUInt16($Header, 24 + 68))
+        {
+            2 { $Subsystem = 'GUI' }
+            3 { $Subsystem = 'Console' }
+        }
+        return [pscustomobject]@{
+            LinkTimeUtc = $script:AUUnixEpoch.AddSeconds([double][BitConverter]::ToUInt32($Header, 8))
+            CheckSum    = [BitConverter]::ToUInt32($Header, 24 + 64)
+            Subsystem   = $Subsystem
+        }
+    }
+    catch { return $null }
+    finally { if ($null -ne $Stream) { $Stream.Dispose() } }
+}#endfunction
+
+function Test-AUFingerprintMatch
+{
+    <#
+.SYNOPSIS
+    Tests whether a file's fingerprint is the build an ExeInfo names: equal LinkTimeUtc and CheckSum.
+.DESCRIPTION
+    False when either is missing, or the ExeInfo isn't a Win32 fingerprint with both values.
+.PARAMETER Fingerprint
+    The Get-AUPeFingerprint result.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result.
+#>
+    param (
+        [pscustomobject]$Fingerprint,
+        [pscustomobject]$ExeInfo
+    )
+
+    if ($null -eq $Fingerprint -or $null -eq $ExeInfo -or $ExeInfo.Kind -ne 'Win32') { return $false }
+    if ($null -eq $ExeInfo.LinkTimeUtc -or $null -eq $ExeInfo.CheckSum) { return $false }
+    return ($Fingerprint.LinkTimeUtc.Ticks -eq ([datetime]$ExeInfo.LinkTimeUtc).Ticks -and [uint32]$Fingerprint.CheckSum -eq [uint32]$ExeInfo.CheckSum)
+}#endfunction
+
+function Resolve-AUKernelPath
+{
+    <#
+.SYNOPSIS
+    Translates a SRUM kernel path (\Device\HarddiskVolumeN\...) to the drive-letter path of the same build, or $null.
+.DESCRIPTION
+    Strips the volume prefix and tries the rest under each fixed drive (Get-AUFixedDrives). A
+    candidate counts only when its PE TimeDateStamp and CheckSum equal the ExeInfo fingerprint and
+    its file name is the ExeInfo exe name (D24). Exactly one verified candidate is returned, with
+    any 8.3 short names expanded; none, or two or more (ambiguous), gives $null. A verified path
+    caches the volume's drive: a cached volume tries only that drive, and a drive cached for another
+    volume isn't tried. A Package or Other entry, or a Win32 entry without a fingerprint, is never
+    probed. A path with an empty, . or .. segment, a stream name, or wildcard characters is refused.
+    Never throws.
+.PARAMETER KernelPath
+    The Resource row's KernelPath.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER VolumeCache
+    The run's volume-to-drive map (lowercase volume name to drive root), or $null.
+#>
+    param (
+        [string]$KernelPath,
+        [pscustomobject]$ExeInfo,
+        [hashtable]$VolumeCache
+    )
+
+    try
+    {
+        if ($null -eq $ExeInfo -or $ExeInfo.Kind -ne 'Win32' -or $null -eq $ExeInfo.LinkTimeUtc -or $null -eq $ExeInfo.CheckSum) { return $null }
+        if ([string]::IsNullOrWhiteSpace($KernelPath)) { return $null }
+        $Match = [regex]::Match($KernelPath.Trim(), '^\\Device\\(?<Volume>HarddiskVolume\d+)\\(?<Rest>.+)$', 'IgnoreCase')
+        if (-not $Match.Success) { return $null }
+        $Volume = $Match.Groups['Volume'].Value.ToLowerInvariant()
+        $Rest = $Match.Groups['Rest'].Value
+        if ($Rest.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0 -or $Rest.IndexOfAny([char[]]@(':', '*', '?')) -ge 0) { return $null }
+        foreach ($Segment in $Rest.Split('\'))
+        {
+            if ($Segment.Trim() -eq '' -or $Segment -eq '.' -or $Segment -eq '..') { return $null }
+        }
+
+        $Cached = $null
+        if ($null -ne $VolumeCache) { $Cached = [string]$VolumeCache[$Volume] }
+        if ($Cached) { $Roots = @($Cached) }
+        else
+        {
+            $Claimed = @()
+            if ($null -ne $VolumeCache) { $Claimed = @($VolumeCache.Values) }
+            $Roots = @(Get-AUFixedDrives | Where-Object { $_ -and $Claimed -notcontains $_ })
+        }
+
+        $Verified = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($Root in $Roots)
+        {
+            $Candidate = ([string]$Root).TrimEnd('\') + '\' + $Rest
+            if (Test-AUFingerprintMatch (Get-AUPeFingerprint $Candidate) $ExeInfo) { $Verified.Add(@($Root, $Candidate)) }
+        }
+        if ($Verified.Count -eq 0) { return $null }
+        if ($Verified.Count -gt 1)
+        {
+            Write-CMTraceLog -Message "App Usage: $KernelPath verifies under $($Verified.Count) drives; the path stays untranslated." -Component 'AppUsage'
+            return $null
+        }
+
+        $Path = Get-AULongPath $Verified[0][1]
+        $Leaf = $Path.Substring($Path.LastIndexOf('\') + 1)
+        if ($ExeInfo.ExeName -and -not [string]::Equals($Leaf, [string]$ExeInfo.ExeName, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        if ($null -ne $VolumeCache -and -not $Cached) { $VolumeCache[$Volume] = [string]$Verified[0][0] }
+        return $Path
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't translate $($KernelPath): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        return $null
+    }
+}#endfunction
+
+function Find-AUExePath
+{
+    <#
+.SYNOPSIS
+    Returns the one fingerprint-verified drive-letter path among an entry's candidate kernel paths, or $null (F37).
+.DESCRIPTION
+    The candidates are the Resource rows with the entry's user and exe name. Each distinct kernel
+    path (ignoring case) goes through Resolve-AUKernelPath. One verified path is returned; none, or
+    two or more distinct verified paths (System32 and SysWOW64 copies of one build, say), give $null,
+    and the entry keeps no path (D24). Never throws.
+.PARAMETER KernelPaths
+    The candidate kernel paths.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER VolumeCache
+    The run's volume-to-drive map, shared across entries.
+#>
+    param (
+        [string[]]$KernelPaths,
+        [pscustomobject]$ExeInfo,
+        [hashtable]$VolumeCache
+    )
+
+    if ($null -eq $ExeInfo -or $ExeInfo.Kind -ne 'Win32') { return $null }
+    $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $Found = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($Kernel in @($KernelPaths))
+    {
+        if ([string]::IsNullOrWhiteSpace($Kernel) -or -not $Seen.Add($Kernel.Trim())) { continue }
+        $Path = Resolve-AUKernelPath $Kernel $ExeInfo $VolumeCache
+        if ($Path -and -not ($Found -contains $Path)) { $Found.Add($Path) }
+    }
+    if ($Found.Count -eq 1) { return $Found[0] }
+    if ($Found.Count -gt 1) { Write-CMTraceLog -Message "App Usage: $($Found.Count) paths verify for $($ExeInfo.ExeName); its path stays unknown (D24)." -Component 'AppUsage' }
+    return $null
+}#endfunction
+
+function Get-AUVersionInfo
+{
+    <#
+.SYNOPSIS
+    Returns a file's version info ([Diagnostics.FileVersionInfo]). A separate function so tests can make it fail.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    return [Diagnostics.FileVersionInfo]::GetVersionInfo((ConvertTo-AUIoPath $Path))
+}#endfunction
+
+function ConvertTo-AUPackageFamily
+{
+    <#
+.SYNOPSIS
+    Returns the package family name (Name_PublisherId) of a Package-kind ExeInfo, or $null.
+.DESCRIPTION
+    A package full name (Name_Version_Architecture_ResourceId_PublisherId) keeps its first and last
+    parts; a family name is kept as it is. An !AppId is dropped. Anything ConvertFrom-AUExeInfo
+    doesn't call Package gives $null.
+.PARAMETER ExeInfo
+    The SRUM ExeInfo string.
+#>
+    param (
+        [string]$ExeInfo
+    )
+
+    if ((ConvertFrom-AUExeInfo $ExeInfo).Kind -ne 'Package') { return $null }
+    $Value = $ExeInfo.Trim()
+    $Bang = $Value.IndexOf('!')
+    if ($Bang -ge 0) { $Value = $Value.Substring(0, $Bang) }
+    $Parts = $Value.Split('_')
+    if ($Parts.Count -eq 5) { return $Parts[0] + '_' + $Parts[4] }
+    if ($Parts.Count -eq 2) { return $Value }
+    return $null
+}#endfunction
+
+function Get-AUExeFacts
+{
+    <#
+.SYNOPSIS
+    Returns an executable's facts, in exactly Task 5's shape (F13), reading build facts only from a verified file (D24).
+.DESCRIPTION
+    Fields: ExeName, RunPath, LocationClass, FileDescription, FileProductName, FileCompanyName,
+    FileVersion, ProductVersion, FactsVerified, Subsystem, MsiProductCode, PackageFamily,
+    IsServiceBinary, UserSid, and PathEvidence.
+    Path-level facts come from the path: RunPath, LocationClass ($null with no path), and
+    IsServiceBinary (the service map). Build facts (version info, Subsystem, and the Windows
+    Installer owner) are filled in only when the file's PE TimeDateStamp and CheckSum equal the
+    ExeInfo's, both before and after the version info is read; FactsVerified says so. When the build
+    is unverified and the file at the path is a PE image, PathEvidence holds that current file's
+    CompanyName and ProductName: identity evidence only, never the build's facts (D30). A Package
+    entry reads no file: it gets its PackageFamily from the ExeInfo text, and no path. Never throws.
+.PARAMETER Path
+    The verified drive-letter path (Find-AUExePath), another observed path, or $null.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER MsiFileMap
+    Lowercased full path to the ProductCode of the Windows Installer product that owns it.
+.PARAMETER ServiceBinaries
+    Lowercased path to service name (Get-AUServiceBinaries).
+.PARAMETER UserSid
+    The entry's user SID (from the ledger key).
+.PARAMETER ExeInfoText
+    The SRUM ExeInfo string, for a Package entry's PackageFamily.
+#>
+    param (
+        [string]$Path,
+        [pscustomobject]$ExeInfo,
+        [hashtable]$MsiFileMap,
+        [hashtable]$ServiceBinaries,
+        [string]$UserSid,
+        [string]$ExeInfoText
+    )
+
+    $Kind = $null
+    $ExeName = $null
+    if ($null -ne $ExeInfo) { $Kind = [string]$ExeInfo.Kind; $ExeName = $ExeInfo.ExeName }
+    $RunPath = $null
+    if ($Kind -ne 'Package' -and -not [string]::IsNullOrWhiteSpace($Path)) { $RunPath = $Path.Trim() }
+
+    $Facts = [pscustomobject][ordered]@{
+        ExeName         = $ExeName
+        RunPath         = $RunPath
+        LocationClass   = $null
+        FileDescription = $null
+        FileProductName = $null
+        FileCompanyName = $null
+        FileVersion     = $null
+        ProductVersion  = $null
+        FactsVerified   = $false
+        Subsystem       = $null
+        MsiProductCode  = $null
+        PackageFamily   = $null
+        IsServiceBinary = $false
+        UserSid         = $UserSid
+        PathEvidence    = $null
+    }
+    if ($Kind -eq 'Package')
+    {
+        try { $Facts.PackageFamily = ConvertTo-AUPackageFamily $ExeInfoText } catch { $Facts.PackageFamily = $null }
+        return $Facts
+    }
+    if (-not $RunPath) { return $Facts }
+
+    $Text = { param ($Value) if ($null -eq $Value) { return $null }; return ([string]$Value).Trim() }
+    $Key = $RunPath.ToLowerInvariant()
+    $Facts.LocationClass = Get-AULocationClass $RunPath
+    if ($null -ne $ServiceBinaries -and $ServiceBinaries.ContainsKey($Key)) { $Facts.IsServiceBinary = $true }
+
+    $Before = Get-AUPeFingerprint $RunPath
+    if (Test-AUFingerprintMatch $Before $ExeInfo)
+    {
+        try
+        {
+            $Info = Get-AUVersionInfo $RunPath
+            # The file could be replaced while it's read; the facts count only if the build is still there.
+            if ($null -ne $Info -and (Test-AUFingerprintMatch (Get-AUPeFingerprint $RunPath) $ExeInfo))
+            {
+                $Facts.FileDescription = & $Text $Info.FileDescription
+                $Facts.FileProductName = & $Text $Info.ProductName
+                $Facts.FileCompanyName = & $Text $Info.CompanyName
+                $Facts.FileVersion = & $Text $Info.FileVersion
+                $Facts.ProductVersion = & $Text $Info.ProductVersion
+                $Facts.Subsystem = $Before.Subsystem
+                if ($null -ne $MsiFileMap -and $MsiFileMap.ContainsKey($Key)) { $Facts.MsiProductCode = [string]$MsiFileMap[$Key] }
+                $Facts.FactsVerified = $true
+                return $Facts
+            }
+        }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't read the version info of $($RunPath): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        # A partly filled verified read never stands.
+        foreach ($Name in @('FileDescription', 'FileProductName', 'FileCompanyName', 'FileVersion', 'ProductVersion', 'Subsystem', 'MsiProductCode')) { $Facts.$Name = $null }
+    }
+
+    # Unverified: the current file at this path may give identity evidence (D30).
+    try
+    {
+        if ($null -ne (Get-AUPeFingerprint $RunPath))
+        {
+            $Info = Get-AUVersionInfo $RunPath
+            if ($null -ne $Info) { $Facts.PathEvidence = [pscustomobject][ordered]@{ CompanyName = & $Text $Info.CompanyName; ProductName = & $Text $Info.ProductName } }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read the current file's version info at $($RunPath): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    return $Facts
+}#endfunction
+
+function Get-AUServiceRecords
+{
+    <#
+.SYNOPSIS
+    Returns every Win32 service's Name and PathName. A separate function so tests can mock the WMI read.
+#>
+    return @(Get-CimInstance -ClassName Win32_Service -Property Name, PathName -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; PathName = [string]$_.PathName } })
+}#endfunction
+
+function Get-AUServiceDll
+{
+    <#
+.SYNOPSIS
+    Returns a service's Parameters\ServiceDll value, expanded, or $null. A separate function so tests can mock the registry read.
+.PARAMETER ServiceName
+    The service name.
+#>
+    param (
+        [string]$ServiceName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ServiceName) -or $ServiceName.IndexOfAny([char[]]@('\', '/')) -ge 0) { return $null }
+    $Base = Open-AURegistryBase -Hive Machine
+    $Key = $null
+    try
+    {
+        $Key = $Base.OpenSubKey("$script:AUServicesKey\$ServiceName\Parameters")
+        if ($null -eq $Key) { return $null }
+        $Value = Get-AURegistryValue -Key $Key -Name 'ServiceDll' -ProfilePath ''
+        if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { return $null }
+        return $Value
+    }
+    finally
+    {
+        if ($null -ne $Key) { $Key.Close() }
+        $Base.Close()
+    }
+}#endfunction
+
+function ConvertTo-AUServiceFile
+{
+    <#
+.SYNOPSIS
+    Returns the file a service's PathName or ServiceDll names, as a drive-letter path, or $null.
+.DESCRIPTION
+    Machine environment variables are expanded; a quoted path is taken whole, an unquoted one up to
+    its .exe or .dll, so arguments are dropped (Get-AUCommandFile). A \??\ prefix is removed and
+    \SystemRoot\ becomes the Windows folder. Anything that isn't then a drive-letter path gives $null.
+.PARAMETER Command
+    The PathName or ServiceDll value.
+#>
+    param (
+        [string]$Command
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    $File = Get-AUCommandFile (Expand-AUEnvironmentText -Text $Command.Trim() -ProfilePath '')
+    if (-not $File) { return $null }
+    $File = $File.Trim()
+    if ($File.StartsWith('\??\')) { $File = $File.Substring(4) }
+    if ($File -match '^\\SystemRoot\\') { $File = [Environment]::GetEnvironmentVariable('SystemRoot') + $File.Substring(11) }
+    if ($File -notmatch '^[A-Za-z]:\\') { return $null }
+    return $File
+}#endfunction
+
+function Get-AUServiceBinaries
+{
+    <#
+.SYNOPSIS
+    Returns the files Windows services run: lowercased path to service name (F36).
+.DESCRIPTION
+    From each Win32_Service PathName, quoted or unquoted, with its arguments dropped. A service
+    hosted by svchost.exe maps through its Parameters\ServiceDll value instead, or is left out when
+    it has none. When two services run the same file, the first by name keeps it. Read once per run;
+    Task 15 passes the result to Get-AUExeFacts. An unreadable service list gives an empty map and is
+    logged. Never throws.
+#>
+    $Map = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    try { $Services = @(Get-AUServiceRecords) }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't list the services; no executable counts as a service binary: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        return $Map
+    }
+
+    $Order = @($Services | Where-Object { $null -ne $_ } | Sort-Object -Property @{ Expression = { [string]$_.Name } })
+    $Hosted = 0
+    foreach ($Service in $Order)
+    {
+        $Name = ([string]$Service.Name).Trim()
+        if (-not $Name) { continue }
+        $File = $null
+        try
+        {
+            $File = ConvertTo-AUServiceFile ([string]$Service.PathName)
+            if ($File -and [string]::Equals([IO.Path]::GetFileName($File), 'svchost.exe', [StringComparison]::OrdinalIgnoreCase))
+            {
+                $File = ConvertTo-AUServiceFile (Get-AUServiceDll $Name)
+                if ($File) { $Hosted++ }
+            }
+        }
+        catch { $File = $null }
+        if (-not $File) { continue }
+        $Key = $File.ToLowerInvariant()
+        if (-not $Map.ContainsKey($Key)) { $Map[$Key] = $Name }
+    }
+    Write-CMTraceLog -Message "App Usage: $($Map.Count) service binaries from $($Order.Count) services ($Hosted hosted by svchost.exe)." -Component 'AppUsage'
+    return $Map
+}#endfunction
+
 # All-profile discovery and the inventory list (Task 13). App Usage reads HKEY_USERS through .NET
 # registry keys and its own AU_<SID> mount names, never a PSDrive named HKU (F34): the D36 fallback,
 # Get-InstalledApplications, mounts and removes that drive.
