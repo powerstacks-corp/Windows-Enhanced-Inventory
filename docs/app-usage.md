@@ -124,12 +124,12 @@ When App Usage is off, or fails on a run, these fields are blank. An executable 
 |---|---|
 | `Used` | Someone used one of the app's executables since the device's watching-since date, the earliest usage App Usage has for the device. |
 | `RanNotUsed` | One of the app's executables ran since then, but nobody used it: for example, it ran only in the background or only under SYSTEM. Not a reclamation candidate on its own. |
-| `Ambiguous` | Nothing is credited to the app, but an executable that might be the app's ran: one that could belong to it or to another app (see [When a Rule Matches Several Installed Apps](#when-a-rule-matches-several-installed-apps)), or an unmatched executable with the name of one of the app's known executables, for example a build the script couldn't verify. Not a reclamation candidate. |
+| `Ambiguous` | Nothing is credited to the app, but an executable that might be the app's ran: one that could belong to it or to another app (see [When a Rule Matches Several Installed Apps](#when-a-rule-matches-several-installed-apps)), an unmatched executable with the name of one of the app's known executables, for example a build the script couldn't verify, or an unmatched executable that ran from inside the app's install folder. An executable matched to an app that isn't installed counts as unmatched here. Not a reclamation candidate. |
 | `NotUsed` | App Usage knows the app's executables, and none of them ran since the watching-since date, whether matched to the app or not. The only value that marks a reclamation candidate. |
 | `NotCovered` | App Usage knows no executable for the app, so it can't measure its use. |
 | Blank | App Usage didn't run or failed on this run, the watching-since date isn't known yet, or the script couldn't read every place the app is installed (the device's apps, or a user's apps). Blank never means `NotUsed`. |
 
-App Usage knows an app's executables when Windows Installer lists them as part of the app, when an identity rule whose target matches the app names them in `when.exeName` (a pattern such as `contoso*.exe` covers every name it matches), or when it has seen one of them run and matched it to the app. An executable matched to a different app doesn't count as a run of this one.
+App Usage knows an app's executables when Windows Installer lists them as part of the app, when an identity rule whose target matches the app names them in `when.exeName` (a pattern such as `contoso*.exe` covers every name it matches), or when it has seen one of them run and matched it to the app. An executable that an ignore rule matches isn't one of the app's known executables, so an app whose only known executable is ignored is `NotCovered`. An executable matched to a different app doesn't count as a run of this one.
 
 ### Executable Usage
 
@@ -297,6 +297,8 @@ The rule that wins sets the app's name pattern, and the installed apps that patt
 | Architecture | Entry is 32-bit, for an executable under `Program Files (x86)`, or 64-bit, for one under `Program Files`. | `ps-resolve-arch` |
 | Install scope | Per-user install belongs to the user who ran the executable from their own profile. | `ps-resolve-scope` |
 
+A target pattern also makes the rule's executable one of the known executables of every installed app the pattern matches. In the `Contoso*` example, Contoso Beta knows the rule's executable too, and when that executable runs and is matched to Contoso Alpha, it isn't a run of Contoso Beta. So when an unmatched executable runs from inside Contoso Beta's install folder, Contoso Beta is reported as `Ambiguous`, not `NotUsed`. To measure each app, give each one its own rule with a target that matches only that app, for example `Contoso Alpha*` and `Contoso Beta*`.
+
 A check that has nothing to go on, or that would rule out every app, is skipped. When a check leaves one app, the executable is matched to it. If the candidates came from one of your rules, your rule's ID is reported, so if you delete the rule, the executable is matched again from the rules that remain. If they came from PowerStacks rules, the check's ID is reported as the rule ID.
 
 When two or more apps are left after every check, the executable is reported as unmatched, and `CandidateTargets` lists the apps it could belong to. Those apps aren't reported as unused because of it: when the executable runs, an app among them with no use or runs of its own is reported as `Ambiguous`. To settle it yourself, give your rule a narrower `target.displayName`.
@@ -400,7 +402,7 @@ When the script can't verify the build that ran, it uses the publisher and produ
 
 #### Ignore Rules
 
-An ignore rule has the same `when` conditions as a classification rule and no `role`. It marks an executable that isn't an app, such as a kiosk shell. The executable's usage is still recorded, but it doesn't make an app count as used, and it isn't counted as unmatched.
+An ignore rule has the same `when` conditions as a classification rule and no `role`. It marks an executable that isn't an app, such as a kiosk shell. The executable's usage is still recorded, but it doesn't make an app count as used, it isn't counted as unmatched, and it isn't one of the app's known executables. An app whose only known executable is ignored is reported as `NotCovered`, never `NotUsed`.
 
 The validator rejects any field it doesn't know, so a misspelled condition can't quietly make a rule match more than you meant.
 

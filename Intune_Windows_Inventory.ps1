@@ -5330,8 +5330,10 @@ function Get-AUKnownExes
     components of the app's ProductCode; the exeName of each identity rule (customer and PowerStacks)
     whose target matches the app, as written in the rule, wildcards included; and the executables of
     entries matched to the app (Get-AUTargetAppNames). A Store or MSIX package entry is known by its
-    ExeInfo. Ignored entries don't count (F22), and an unresolved entry belongs to no app. An app with
-    no known executable is absent, so Get-AUAppUsage reports it NotCovered.
+    ExeInfo. Ignored entries don't count (F22): an exe an ignored entry names is left out of the first
+    two sources as well (a rule's wildcard exeName it matches too), unless an entry that isn't ignored
+    is matched to the app. An unresolved entry belongs to no app. An app with no known executable is
+    absent, so Get-AUAppUsage reports it NotCovered.
     Every value is a -like pattern: a rule's exeName as written (the validator checked it), and every
     other name escaped with ConvertTo-AUWildcardLiteral, because a file name may hold `, [, or ] and
     must match only itself.
@@ -5425,6 +5427,37 @@ function Get-AUKnownExes
         }
     }
 
+    # An exe an ignore rule matched isn't app use, so it isn't a known exe of any app from Windows
+    # Installer or a rule either (F22): an app whose only known exe is ignored is NotCovered, not NotUsed.
+    # A rule's wildcard exeName that an ignored exe matches goes too, which errs toward NotCovered.
+    $Ignored = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($Entry in @($Entries))
+    {
+        if ($null -eq $Entry -or $null -eq $Entry.Classification -or $Entry.Classification.Ignored -ne $true) { continue }
+        $Exe = Get-AUExeKey $Entry
+        if ($Exe) { [void]$Ignored.Add($Exe) }
+    }
+    if ($Ignored.Count -gt 0)
+    {
+        $IgnoredNames = [string[]]@($Ignored)
+        foreach ($Name in @($Known.Keys))
+        {
+            $Set = $Known[$Name]
+            foreach ($Pattern in @($Set))
+            {
+                # Every value is a -like pattern (escaped when literal); one that won't parse is compared exactly.
+                if ($Pattern.IndexOfAny($script:AUWildcardChars) -lt 0) { $Drop = $Ignored.Contains($Pattern) }
+                else
+                {
+                    try { $Drop = (@($IgnoredNames -like $Pattern).Count -gt 0) }
+                    catch { $Drop = $Ignored.Contains([Management.Automation.WildcardPattern]::Unescape($Pattern)) }
+                }
+                if ($Drop) { [void]$Set.Remove($Pattern) }
+            }
+            if ($Set.Count -eq 0) { $Known.Remove($Name) }
+        }
+    }
+
     # Executables seen and matched to the app.
     foreach ($Entry in @($Entries))
     {
@@ -5454,10 +5487,14 @@ function Get-AUAppUsage
     are left out (F22).
     AppUsageStatus, first that applies (D32): Used (a matched exe has credited use since
     WatchingSince), RanNotUsed (a matched exe ran since then), Ambiguous (an unresolved exe with this
-    app among its CandidateTargets ran since then, or an unmatched exe whose name is one of the app's
-    known or matched exes ran since then, a wildcard known exe compared with -like, D30), NotUsed (the
-    app has known exes, or matched exes, and none ran, matched or not), NotCovered (none known). An exe
-    matched to another app never makes this app Ambiguous. It's blank ($null) unless CollectionOk is true,
+    app among its CandidateTargets ran since then, or, for an app that would otherwise be NotUsed, an
+    unmatched exe ran since then whose name is one of the app's known or matched exes, a wildcard known
+    exe compared with -like (D30), or whose RunPath is inside one of the app's install folders
+    (Get-AUAppFolders), as for a sibling under a target pattern that matches several apps), NotUsed
+    (the app has known exes, or matched exes, and none ran, matched or not), NotCovered (none known).
+    An exe matched to a target that no installed app is counts as unmatched here, so a rule whose
+    target isn't installed never makes another app NotUsed. An exe matched to another installed app
+    never makes this app Ambiguous. It's blank ($null) unless CollectionOk is true,
     WatchingSince is known, and every scope holding the app in Apps (a blank Scope is Machine) is Read
     in ScopeRead, so missing coverage is never NotUsed. When CollectionOk is false, every field is
     blank.
@@ -5526,7 +5563,19 @@ function Get-AUAppUsage
 
     # Exe names (ExeName, or ExeInfo for a package) of unmatched entries that ran since WatchingSince.
     # An app whose known exe ran unmatched (an unverified build, say) is Ambiguous, never NotUsed (D30).
+    # An entry matched to a target that isn't installed counts as unmatched here.
     $UnmatchedRan = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    # Every folder above the RunPath of those entries, ending with \, so an app whose install folder
+    # holds one is Ambiguous, never NotUsed: a sibling under a target pattern knows the rule's exe, not
+    # its own unmatched one.
+    $UnmatchedFolders = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $AddUnmatched = {
+        param ([string]$Exe, $Facts)
+        if ($Exe) { [void]$UnmatchedRan.Add($Exe) }
+        if ($null -eq $Facts) { return }
+        $RunPath = ([string]$Facts.RunPath).Trim().Replace('/', '\')
+        for ($At = $RunPath.IndexOf('\'); $At -ge 0; $At = $RunPath.IndexOf('\', $At + 1)) { [void]$UnmatchedFolders.Add($RunPath.Substring(0, $At + 1)) }
+    }
 
     # Inline per-entry work: this loop runs once per ledger entry, thousands of times.
     foreach ($Entry in @($Entries))
@@ -5546,7 +5595,7 @@ function Get-AUAppUsage
             if (-not $RanSince) { continue }
             $Exe = ([string]$Entry.ExeName).Trim()
             if (-not $Exe) { $Exe = ([string]$Entry.ExeInfo).Trim() }
-            if ($Exe) { [void]$UnmatchedRan.Add($Exe) }
+            & $AddUnmatched $Exe $Entry.Facts
             if ($null -eq $Target) { continue }
             $Candidates = [Collections.Generic.List[string]]::new()
             foreach ($Candidate in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Candidate)) { $Candidates.Add(([string]$Candidate).Trim()) } }
@@ -5562,7 +5611,11 @@ function Get-AUAppUsage
         $Focus = [double]0
         if (Test-AUInteractiveUserType ([string]$Entry.UserType)) { $Focus = [double]$Entry.FocusTotal }
         $UserSid = ([string]$Entry.UserSid).Trim()
-        foreach ($Name in @(Get-AUTargetAppNames $Target $Index))
+        $Names = @(Get-AUTargetAppNames $Target $Index)
+        # A target that isn't installed (a rule whose app is absent, or an uninstalled retained target):
+        # the exe may belong to an installed app that knows it, so it counts as unmatched (final review A2).
+        if ($Names.Count -eq 0 -and $RanSince) { & $AddUnmatched $Exe $Entry.Facts }
+        foreach ($Name in $Names)
         {
             $State = $States[$Name]
             if ($null -eq $State) { continue }
@@ -5582,10 +5635,13 @@ function Get-AUAppUsage
     $ReadState = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     if ($null -ne $ScopeRead) { foreach ($Key in $ScopeRead.Keys) { $ReadState[([string]$Key).Trim()] = [string]$ScopeRead[$Key] } }
     $Covered = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    $AppsByName = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($App in $Index.Apps)
     {
         $Name = ([string]$App.DisplayName).Trim()
         if (-not $Name) { continue }
+        if (-not $AppsByName.ContainsKey($Name)) { $AppsByName[$Name] = [Collections.Generic.List[object]]::new() }
+        $AppsByName[$Name].Add($App)
         $Scope = ([string]$App.Scope).Trim()
         if (-not $Scope) { $Scope = 'Machine' }
         $IsRead = ($ReadState[$Scope] -ceq 'Read')
@@ -5627,6 +5683,15 @@ function Get-AUAppUsage
                                 catch { Write-CMTraceLog -Message "App Usage: known exe pattern '$Pattern' for $Trimmed isn't valid; compared exactly." -Component 'AppUsage' -Type 2 }
                             }
                             if ($Hit) { $Status = 'Ambiguous'; break }
+                        }
+                    }
+                    # An unmatched exe that ran from inside one of the app's install folders (final review A1).
+                    if ($Status -ceq 'NotUsed' -and $UnmatchedFolders.Count -gt 0 -and $null -ne $AppsByName[$Trimmed])
+                    {
+                        foreach ($App in $AppsByName[$Trimmed])
+                        {
+                            foreach ($Folder in (Get-AUAppFolders $App)) { if ($UnmatchedFolders.Contains($Folder)) { $Status = 'Ambiguous'; break } }
+                            if ($Status -ceq 'Ambiguous') { break }
                         }
                     }
                 }
