@@ -73,6 +73,37 @@ Describe 'Build-InventoryRelease.ps1' {
         $Built = [IO.File]::ReadAllText($OutFile, [Text.Encoding]::UTF8)
         $Ours = [IO.File]::ReadAllText($ShippedMappings) | ConvertFrom-Json
         $Absent = Join-Path (New-TestDir 'nocustomer') 'customer-mappings.json'
+
+        # A copy of the source in its own TestDrive folder, with the mappings and companions beside
+        # it. Head goes right after the #region APPUSAGE line; Tail goes just before #endregion APPUSAGE.
+        function New-TestSource([string]$Name, [string]$Head = '', [string]$Tail = '')
+        {
+            $Dir = New-TestDir $Name
+            foreach ($File in @('Test-AppUsageMappings.ps1', 'customer-mappings.example.json', 'powerstacks-mappings.json'))
+            {
+                Copy-Item -LiteralPath (Join-Path $RepoRoot $File) -Destination (Join-Path $Dir $File)
+            }
+            $Marker = "#region APPUSAGE`r`n"
+            $Text = $Source.Insert($Source.IndexOf($Marker) + $Marker.Length, $Head)
+            if ($Tail) { $Text = $Text.Insert($Text.IndexOf('#endregion APPUSAGE'), $Tail) }
+            $Path = Join-Path $Dir 'Intune_Windows_Inventory.ps1'
+            [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+            return $Path
+        }
+
+        # Loads a script text's APPUSAGE region in a fresh runspace and returns what Expression gives.
+        function Invoke-TestRegion([string]$Text, [string]$Expression)
+        {
+            $Shell = [powershell]::Create()
+            try
+            {
+                [void]$Shell.AddScript("function Write-CMTraceLog { }`r`n" + [regex]::Match($Text, $RegionPattern).Groups[1].Value + "`r`n" + $Expression)
+                $Result = @($Shell.Invoke())
+                if ($Shell.Streams.Error.Count -gt 0) { throw "The region didn't load: $($Shell.Streams.Error[0])" }
+                return $Result
+            }
+            finally { $Shell.Dispose() }
+        }
     }
 
     It 'builds, printing our rules version and the size against the 524,288-byte limit' {
@@ -229,25 +260,104 @@ Describe 'Build-InventoryRelease.ps1' {
         @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) | Should -Be @('SourceScript', 'MappingsPath', 'OutFile')
     }
 
-    It 'fails, with the size, when the output is over the limit' {
-        $Dir = New-TestDir 'oversize'
-        foreach ($Name in @('Test-AppUsageMappings.ps1', 'customer-mappings.example.json', 'powerstacks-mappings.json'))
-        {
-            Copy-Item -LiteralPath (Join-Path $RepoRoot $Name) -Destination (Join-Path $Dir $Name)
-        }
+    It 'an over-limit build leaves nothing that looks like a release' {
         # Comments outside the stripped regions are kept, so 300 KB of them push the output over.
         $Padding = (1..3000 | ForEach-Object { '# ' + ('x' * 97) }) -join "`r`n"
-        $Big = Join-Path $Dir 'Intune_Windows_Inventory.ps1'
-        [IO.File]::WriteAllText($Big, $Source + "`r`n" + $Padding + "`r`n", (New-Object Text.UTF8Encoding($false)))
+        $Big = New-TestSource 'oversize'
+        [IO.File]::AppendAllText($Big, "`r`n" + $Padding + "`r`n", (New-Object Text.UTF8Encoding($false)))
+        $Dir = Split-Path $Big
         $r = Invoke-TestBuild $Big (Join-Path $Dir 'powerstacks-mappings.json') (Join-Path $Dir 'out\Intune_Windows_Inventory.ps1')
         $r.ExitCode | Should -Be 1
         $r.Output | Should -Match 'bytes over the 524288-byte limit'
+        Test-Path (Join-Path $Dir 'out') | Should -BeFalse
+
+        # An output folder that was already there stays empty: no script, no companions, no temporary file.
+        $Existing = New-TestDir 'oversize\existing'
+        $r = Invoke-TestBuild $Big (Join-Path $Dir 'powerstacks-mappings.json') (Join-Path $Existing 'Intune_Windows_Inventory.ps1')
+        $r.ExitCode | Should -Be 1
+        @(Get-ChildItem -LiteralPath $Existing -Force) | Should -BeNullOrEmpty
     }
 
     It 'refuses to build over the source script' {
         $r = Invoke-TestBuild $SourceScript $ShippedMappings $SourceScript
         $r.ExitCode | Should -Be 2
         $r.Output | Should -Match "can't be the source script"
+    }
+
+    It 'resolves relative paths against the current PowerShell location, not the process folder' {
+        $Copy = New-TestSource 'relative'
+        $Work = Split-Path $Copy
+        $Launch = New-TestDir 'relative-launch'
+        $Command = "Set-Location -LiteralPath '$Work'; & '$Builder' -SourceScript .\Intune_Windows_Inventory.ps1 -MappingsPath .\powerstacks-mappings.json -OutFile .\rel\Intune_Windows_Inventory.ps1; exit `$LASTEXITCODE"
+        Push-Location -LiteralPath $Launch
+        try { $Output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $Command 2>&1 }
+        finally { Pop-Location }
+        $LASTEXITCODE | Should -Be 0 -Because ($Output | Out-String)
+        Test-Path (Join-Path $Work 'rel\Intune_Windows_Inventory.ps1') | Should -BeTrue
+        Test-Path (Join-Path $Launch 'rel') | Should -BeFalse
+    }
+
+    It 'keeps a command ended by a comment line after a line continuation, and the spaces in a multi-line string' {
+        $Repro = @(
+            'function Get-AUTestContinuation'
+            '{'
+            '    $out = @(Write-Output 1 `'
+            '# dangling comment'
+            'Write-Output 2)'
+            '    return $out.Count'
+            '}'
+            'function Get-AUTestStringLength'
+            '{'
+            '    <#c#> $s = "abc   '
+            'def"'
+            '    return $s.Length'
+            '}'
+            ''
+        ) -join "`r`n"
+        $Fixture = New-TestSource 'repro' -Head $Repro
+        $Dir = Split-Path $Fixture
+        $Out = Join-Path $Dir 'out\Intune_Windows_Inventory.ps1'
+        $r = Invoke-TestBuild $Fixture (Join-Path $Dir 'powerstacks-mappings.json') $Out
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        foreach ($Path in @($Fixture, $Out))
+        {
+            Invoke-TestRegion ([IO.File]::ReadAllText($Path)) 'Get-AUTestContinuation; Get-AUTestStringLength' | Should -Be @(2, 11) -Because $Path
+        }
+    }
+
+    It 'fails closed when the built script''s Get-AUMappings doesn''t read the embedded rules' {
+        $Broken = New-TestSource 'selfload' -Tail "function Get-AUMappings { param (`$Embedded, `$BesideDir, `$CustomerPath) return [pscustomobject]@{ Source = 'None'; Errors = @('broken') } }`r`n"
+        $Dir = Split-Path $Broken
+        $r = Invoke-TestBuild $Broken (Join-Path $Dir 'powerstacks-mappings.json') (Join-Path $Dir 'out\Intune_Windows_Inventory.ps1')
+        $r.ExitCode | Should -Be 2
+        $r.Output | Should -Match "didn't read the embedded rules"
+        Test-Path (Join-Path $Dir 'out') | Should -BeFalse
+    }
+}
+
+Describe 'The build''s token check (Compare-BuildTokens)' {
+    BeforeAll {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Builder, [ref]$null, [ref]$null)
+        $Function = $Ast.Find({ param ($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'Compare-BuildTokens' }, $true)
+        . ([scriptblock]::Create($Function.Extent.Text))
+    }
+
+    It 'accepts removed comments and blank lines' {
+        Compare-BuildTokens "`$a = 1 # note`r`n# line`r`n`r`n<# block #>`r`n`$b = 2`r`n" "`$a = 1`r`n`$b = 2`r`n" | Should -BeNullOrEmpty
+        Compare-BuildTokens "`$a<#c#>+1" "`$a +1" | Should -BeNullOrEmpty
+    }
+
+    It 'catches a command merged across a line continuation' {
+        Compare-BuildTokens "`$o = @(Write-Output 1 ```r`n# c`r`nWrite-Output 2)" "`$o = @(Write-Output 1 ```r`nWrite-Output 2)" | Should -Match 'became'
+    }
+
+    It 'catches a changed string' {
+        Compare-BuildTokens "<#c#> `$s = `"abc   `r`ndef`"" " `$s = `"abc`r`ndef`"" | Should -Match 'became'
+    }
+
+    It 'catches a changed or missing token' {
+        Compare-BuildTokens "`$a = 1`r`n" "`$b = 1`r`n" | Should -Match 'became'
+        Compare-BuildTokens "`$a = 1; `$b = 2`r`n" "`$a = 1`r`n" | Should -Not -BeNullOrEmpty
     }
 }
 
@@ -256,7 +366,7 @@ Describe 'Seed rules in powerstacks-mappings.json' {
         function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) }
         $Absent = Join-Path (New-TestDir 'seed-nocustomer') 'customer-mappings.json'
         $Shipped = Get-AUMappings -Embedded '' -BesideDir $RepoRoot -CustomerPath $Absent
-        $SeedClassificationIds = @('ps-class-windows-msftcorp', 'ps-class-windows-msmpeng', 'ps-class-windows-nissrv', 'ps-class-windows-mpcmdrun', 'ps-class-windows-mpdefendercoreservice', 'ps-class-windows-defenderaiplatformhost', 'ps-class-windows-tabtip', 'ps-class-helper-edgeupdate')
+        $SeedClassificationIds = @('ps-class-windows-msftcorp', 'ps-class-windows-msmpeng', 'ps-class-windows-msmpeng-platform', 'ps-class-windows-nissrv', 'ps-class-windows-nissrv-platform', 'ps-class-windows-mpcmdrun', 'ps-class-windows-mpcmdrun-platform', 'ps-class-windows-mpdefendercoreservice', 'ps-class-windows-mpdefendercoreservice-platform', 'ps-class-windows-defenderaiplatformhost-platform', 'ps-class-windows-tabtip', 'ps-class-helper-edgeupdate')
 
         # Verified facts in the Task 14 shape, with the values seen on lab and test devices.
         function New-TestFacts([string]$Exe, [string]$RunPath, [string]$Company, [string]$Product, [string]$Description)
@@ -317,11 +427,15 @@ Describe 'Seed rules in powerstacks-mappings.json' {
         )
         $ClassificationCases = @(
             @{ Id = 'ps-class-windows-msftcorp'; Exe = 'Defrag.exe'; Path = 'C:\Windows\System32\Defrag.exe'; Company = 'Microsoft Corp.'; Role = 'Windows' }
-            @{ Id = 'ps-class-windows-msmpeng'; Exe = 'MsMpEng.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\MsMpEng.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
+            @{ Id = 'ps-class-windows-msmpeng'; Exe = 'MsMpEng.exe'; Path = 'C:\Program Files\Windows Defender\MsMpEng.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
+            @{ Id = 'ps-class-windows-msmpeng-platform'; Exe = 'MsMpEng.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\MsMpEng.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
             @{ Id = 'ps-class-windows-nissrv'; Exe = 'NisSrv.exe'; Path = 'C:\Program Files\Windows Defender\NisSrv.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
-            @{ Id = 'ps-class-windows-mpcmdrun'; Exe = 'MpCmdRun.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\MpCmdRun.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
+            @{ Id = 'ps-class-windows-nissrv-platform'; Exe = 'NisSrv.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\NisSrv.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
+            @{ Id = 'ps-class-windows-mpcmdrun'; Exe = 'MpCmdRun.exe'; Path = 'C:\Program Files\Windows Defender\MpCmdRun.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
+            @{ Id = 'ps-class-windows-mpcmdrun-platform'; Exe = 'MpCmdRun.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\MpCmdRun.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
             @{ Id = 'ps-class-windows-mpdefendercoreservice'; Exe = 'MpDefenderCoreService.exe'; Path = 'C:\Program Files\Windows Defender\MpDefenderCoreService.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
-            @{ Id = 'ps-class-windows-defenderaiplatformhost'; Exe = 'DefenderAiPlatformHost.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\DefenderAiPlatformHost.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
+            @{ Id = 'ps-class-windows-mpdefendercoreservice-platform'; Exe = 'MpDefenderCoreService.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\MpDefenderCoreService.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
+            @{ Id = 'ps-class-windows-defenderaiplatformhost-platform'; Exe = 'DefenderAiPlatformHost.exe'; Path = 'C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26100.4-0\DefenderAiPlatformHost.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
             @{ Id = 'ps-class-windows-tabtip'; Exe = 'TabTip.exe'; Path = 'C:\Program Files\Common Files\microsoft shared\ink\TabTip.exe'; Company = 'Microsoft Corporation'; Role = 'Windows' }
             @{ Id = 'ps-class-helper-edgeupdate'; Exe = 'MicrosoftEdgeUpdate.exe'; Path = 'C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe'; Company = 'Microsoft Corporation'; Role = 'Helper' }
         )
@@ -372,6 +486,11 @@ Describe 'Seed rules in powerstacks-mappings.json' {
 
     It '<Id> leaves <Exe> from another publisher alone' -ForEach $ClassificationCases {
         $c = Get-AUClassification (New-TestFacts $Exe $Path 'Contoso Ltd.' $null $null) $Shipped 'None'
+        $c.ClassificationRuleId | Should -BeNullOrEmpty
+    }
+
+    It '<Id> leaves a <Exe> in a user folder alone, whatever its publisher says' -ForEach $ClassificationCases {
+        $c = Get-AUClassification (New-TestFacts $Exe ('C:\Users\a\AppData\Local\Fake\' + $Exe) $Company $null $null) $Shipped 'None'
         $c.ClassificationRuleId | Should -BeNullOrEmpty
     }
 
