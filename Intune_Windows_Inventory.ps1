@@ -1748,6 +1748,9 @@ function New-BearerToken(
 # does not abort the run. $StartIndex spreads devices evenly across the pool.
 function Invoke-LogSubmission([string[]]$Uris, $Body, [hashtable]$Headers = @{}, [int]$StartIndex = 0)
 {
+    # The last submission's HTTP status (the success code, or the last rejection's; $null without a
+    # response), so the App Usage row sender can tell a permanent rejection from a transient one.
+    $script:LastSubmissionStatusCode = $null
     $n = $Uris.Count
     if ($n -lt 1)
     {
@@ -1764,7 +1767,9 @@ function Invoke-LogSubmission([string[]]$Uris, $Body, [hashtable]$Headers = @{},
             $uri = $Uris[($StartIndex + $cycle + $i) % $n]
             try
             {
-                return Invoke-WebRequest -Uri $uri -Method "POST" -Headers $Headers -Body $Body -ContentType "application/json" -UseBasicParsing
+                $submitted = Invoke-WebRequest -Uri $uri -Method "POST" -Headers $Headers -Body $Body -ContentType "application/json" -UseBasicParsing
+                $script:LastSubmissionStatusCode = $submitted.StatusCode
+                return $submitted
             }
             catch
             {
@@ -1782,6 +1787,7 @@ function Invoke-LogSubmission([string[]]$Uris, $Body, [hashtable]$Headers = @{},
                 $lastMsg = $_.Exception.Message
             }
         }
+        $script:LastSubmissionStatusCode = $lastCode
         if ($cycle -ge $SubmissionMaxRetries)
         {
             Write-CMTraceLog "Submission failed after $cycle backoff cycle(s) across $n target(s) (last status: $lastCode): $lastMsg" -ErrorMsg
@@ -1817,8 +1823,14 @@ function Send-LogIngestionAPI(
     $method = "POST"
     $contentType = "application/json"
 
-    #validate that payload data does not exceed limits
-    if ($body.Length -gt $script:AUMaxRowBytes)
+    #validate that payload data does not exceed limits (0.9 MB, the App Usage row limit; the same value
+    #when the APPUSAGE region's constant isn't loaded)
+    $maxBodyBytes = $script:AUMaxRowBytes
+    if (-not $maxBodyBytes)
+    {
+        $maxBodyBytes = 943718
+    }
+    if ($body.Length -gt $maxBodyBytes)
     {
         throw("Upload payload is too big and exceed the 1Mb limit for a single upload. Please reduce the payload size. Current payload size is: " + ($body.Length / 1024 / 1024).ToString("#.#") + "Mb")
     }
@@ -2697,7 +2709,10 @@ $script:AUResolveSteps = @('path', 'msi', 'publisher', 'product', 'version', 'ar
 $script:AULegalSuffixes = @('inc', 'incorporated', 'corp', 'corporation', 'co', 'company', 'llc', 'llp', 'lp', 'ltd', 'limited', 'gmbh', 'ag', 'sa', 'sarl', 'srl', 'bv', 'nv', 'plc', 'pty', 'oy', 'ab', 'as', 'kk')
 $script:AUArchTokens = @('x64', 'x86', 'x86_64', 'amd64', 'arm64', '64-bit', '32-bit', '64bit', '32bit', 'win64', 'win32')
 # Normalized app names and publishers, so arpCompare doesn't repeat the work for every exe in a run.
-$script:AUNormalizedText = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+# Constrained Language Mode refuses this type; App Usage skips in that mode (D37), and the check keeps
+# the region loading there without an error record.
+$script:AUNormalizedText = $null
+if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') { $script:AUNormalizedText = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal) }
 
 function Get-AULocationClass
 {
@@ -5565,6 +5580,9 @@ function ConvertTo-AUChunks
 }#endfunction
 
 $script:AULockName = 'Global\PowerStacksAppUsage'
+# The outbox lock: the App Inventory sends with metering on hold it, not the run lock, so a send that
+# backs off for minutes (Invoke-LogSubmission) never makes an overlapping run's App Usage AppUsageBusy.
+$script:AUOutboxLockName = 'Global\PowerStacksAppUsageOutbox'
 # Well-known SIDs, never localized names: SYSTEM and Administrators (F27).
 $script:AULockAclSids = @('S-1-5-18', 'S-1-5-32-544')
 
@@ -5627,22 +5645,25 @@ function Invoke-AUWithLock
 .SYNOPSIS
     Runs Body while holding the App Usage run lock, so two overlapping inventory runs never both run App Usage.
 .DESCRIPTION
-    Waits up to TimeoutSeconds for mutex Global\PowerStacksAppUsage, runs Body on this thread, and
-    releases the mutex in finally (a mutex must be released by the thread that took it, so Body is
-    never moved to a job or runspace). Returns Acquired, Abandoned, Result (Body's output), and Error
-    (the message when Body threw, else $null).
+    Waits up to TimeoutSeconds for the mutex Name (the run lock Global\PowerStacksAppUsage by
+    default), runs Body on this thread, and releases the mutex in finally (a mutex must be released
+    by the thread that took it, so Body is never moved to a job or runspace). Returns Acquired,
+    Abandoned, Result (Body's output), and Error (the message when Body threw, else $null).
     A mutex left abandoned by a run that ended without releasing it counts as acquired, with
     Abandoned true. A timeout, an UnauthorizedAccessException, or any other failure to open or wait
-    gives Acquired false and Body never runs; the caller reports AppUsageBusy (Review Focus 1, F27).
-    Never throws, even when Body throws.
+    gives Acquired false and Body never runs; for the run lock the caller reports AppUsageBusy
+    (Review Focus 1, F27). Never throws, even when Body throws.
 .PARAMETER Body
     The work to run under the lock.
 .PARAMETER TimeoutSeconds
     How long to wait for the lock.
+.PARAMETER Name
+    The mutex: $script:AULockName (the run lock) by default, or $script:AUOutboxLockName.
 #>
     param (
         [scriptblock]$Body,
-        [int]$TimeoutSeconds = 60
+        [int]$TimeoutSeconds = 60,
+        [string]$Name = $script:AULockName
     )
 
     $Outcome = [pscustomobject]@{ Acquired = $false; Abandoned = $false; Result = $null; Error = $null }
@@ -5651,14 +5672,14 @@ function Invoke-AUWithLock
     {
         try
         {
-            $Mutex = Open-AULockMutex -Name $script:AULockName
+            $Mutex = Open-AULockMutex -Name $Name
             try { $Outcome.Acquired = [bool]$Mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)) }
             catch
             {
                 if (-not (Test-AUExceptionType $_.Exception ([Threading.AbandonedMutexException]))) { throw }
                 $Outcome.Acquired = $true
                 $Outcome.Abandoned = $true
-                Write-CMTraceLog -Message "App Usage: an earlier run ended without releasing lock $($script:AULockName); this run took it over." -Component 'AppUsage' -Type 2
+                Write-CMTraceLog -Message "App Usage: an earlier run ended without releasing lock $Name; this run took it over." -Component 'AppUsage' -Type 2
             }
         }
         catch
@@ -5666,24 +5687,24 @@ function Invoke-AUWithLock
             $Outcome.Acquired = $false
             if (Test-AUExceptionType $_.Exception ([UnauthorizedAccessException])) { $Reason = 'access was denied' }
             else { $Reason = 'it could not be opened or waited on' }
-            Write-CMTraceLog -Message "App Usage: skipped this run (AppUsageBusy) because $Reason on lock $($script:AULockName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+            Write-CMTraceLog -Message "App Usage: skipped this run because $Reason on lock ${Name}: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
             return $Outcome
         }
         if (-not $Outcome.Acquired)
         {
-            Write-CMTraceLog -Message "App Usage: skipped this run (AppUsageBusy) because another run held lock $($script:AULockName) for $TimeoutSeconds seconds." -Component 'AppUsage' -Type 2
+            Write-CMTraceLog -Message "App Usage: skipped this run because another run held lock $Name for $TimeoutSeconds seconds." -Component 'AppUsage' -Type 2
             return $Outcome
         }
         try { $Outcome.Result = & $Body }
         catch
         {
             $Outcome.Error = $_.Exception.Message
-            Write-CMTraceLog -Message "App Usage: the work under lock $($script:AULockName) failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: the work under lock $Name failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
         }
         finally
         {
             try { $Mutex.ReleaseMutex() }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't release lock $($script:AULockName): $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't release lock ${Name}: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         }
         return $Outcome
     }
@@ -5692,7 +5713,7 @@ function Invoke-AUWithLock
         if ($null -ne $Mutex)
         {
             try { $Mutex.Dispose() }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't close lock $($script:AULockName): $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't close lock ${Name}: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         }
     }
 }#endfunction
@@ -5701,11 +5722,13 @@ function Invoke-AUWithLock
 # folder C:\Windows\PowerStacksAppUsage\<RunId> (D18, F28); the live SRUDB.dat and live hives are
 # never opened.
 # Next to the ledger: standard users can't create items in C:\Windows, so nobody else can make it first.
-$script:AUWorkRoot = [IO.Path]::Combine($env:SystemRoot, 'PowerStacksAppUsage')
-$script:AUEsentPath = [IO.Path]::Combine($env:SystemRoot, 'Microsoft.NET\assembly\GAC_MSIL\microsoft.isam.esent.interop\v4.0_10.0.0.0__31bf3856ad364e35\Microsoft.Isam.Esent.Interop.dll')
-$script:AUEsentutlPath = [IO.Path]::Combine($env:SystemRoot, 'System32\esentutl.exe')
-$script:AUCmdPath = [IO.Path]::Combine($env:SystemRoot, 'System32\cmd.exe')
-$script:AULiveSrumPath = [IO.Path]::Combine($env:SystemRoot, 'System32\sru\SRUDB.dat')
+# Plain strings, not [IO.Path]::Combine, so the region loads without an error record in Constrained
+# Language Mode, where App Usage skips (D37).
+$script:AUWorkRoot = "$env:SystemRoot\PowerStacksAppUsage"
+$script:AUEsentPath = "$env:SystemRoot\Microsoft.NET\assembly\GAC_MSIL\microsoft.isam.esent.interop\v4.0_10.0.0.0__31bf3856ad364e35\Microsoft.Isam.Esent.Interop.dll"
+$script:AUEsentutlPath = "$env:SystemRoot\System32\esentutl.exe"
+$script:AUCmdPath = "$env:SystemRoot\System32\cmd.exe"
+$script:AULiveSrumPath = "$env:SystemRoot\System32\sru\SRUDB.dat"
 $script:AUTimelineTable = '{5C8CF1C7-7257-4F13-B223-970EF5939312}'
 $script:AUResourceTable = '{D10CA2FE-6FCF-4F6D-848E-B2E99266FA89}'
 # Task 0.1: focus is InFocusS and input is UserInputS, in seconds; null means 0. DurationMS isn't focus.
@@ -7938,7 +7961,7 @@ function Get-AUServiceBinaries
 # All-profile discovery and the inventory list (Task 13). App Usage reads HKEY_USERS through .NET
 # registry keys and its own AU_<SID> mount names, never a PSDrive named HKU (F34): the D36 fallback,
 # Get-InstalledApplications, mounts and removes that drive.
-$script:AURegPath = [IO.Path]::Combine($env:SystemRoot, 'System32\reg.exe')
+$script:AURegPath = "$env:SystemRoot\System32\reg.exe"
 $script:AUSystemSid = 'S-1-5-18'
 # LocalService and NetworkService: their per-user installs are discovered with their own SID as
 # Scope (install status needs them), but they aren't anyone's profile, so ConvertTo-AUInventoryApps
@@ -8959,12 +8982,14 @@ $script:AUOutboxFilePattern = '^(?<RunId>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-
 $script:AUOutboxTempMaxAgeHours = 24
 
 # The sender (F51): Send-AUOutbox and Send-AURunRows take it as a required scriptblock,
-# param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType), whose last output is $true only when
-# the row was accepted. The region never reads the inventory's connection settings, so Task 15 builds
-# it outside the region: it calls Send-LogIngestionAPI (or Send-DataCollectorAPI for the classic API)
-# with the inventory's connection variables, as the inline App Inventory upload does, so each row
-# keeps the inventory's existing retry (Invoke-LogSubmission), and returns whether the response is
-# the success status the summary line checks (204, or 200 for the classic API). Tests pass a mock.
+# param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType), whose last output is an object with
+# Ok ($true only when the row was accepted) and Permanent ($true only for a rejection a resend can't
+# fix, Test-AUPermanentStatus); a [bool] alone is read as Ok. The region never reads the inventory's
+# connection settings, so the inline App Inventory section builds it outside the region ($AUSender): it
+# calls Send-LogIngestionAPI (or Send-DataCollectorAPI for the classic API) with the inventory's
+# connection variables, as the inline App Inventory upload does, so each row keeps the inventory's
+# existing retry (Invoke-LogSubmission), and Ok is whether the response is the success status the
+# summary line checks (204, or 200 for the classic API). Tests pass a mock.
 
 function Get-AUColumnName
 {
@@ -9244,7 +9269,8 @@ function Get-AUOutboxFiles
     $Files = New-Object System.Collections.Generic.List[object]
     foreach ($Item in (New-Object IO.DirectoryInfo $OutboxDir).GetFileSystemInfos())
     {
-        if ($Item.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        # Temp files and sent rows that couldn't be deleted (Remove-AUOutboxFile) aren't pending.
+        if ($Item.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase) -or $Item.Name.EndsWith('.sent', [StringComparison]::OrdinalIgnoreCase)) { continue }
         if (($Item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Directory)) -ne 0)
         {
             Write-CMTraceLog -Message "App Usage: $($Item.FullName) in the outbox isn't a regular file, so it's left alone." -Component 'AppUsage' -Type 2
@@ -9286,24 +9312,72 @@ function Remove-AUOutboxFile
 {
     <#
 .SYNOPSIS
-    Deletes one outbox file. Returns $true when it's gone. Never throws.
+    Deletes one outbox file. Returns $true when it's gone, or no longer pending. Never throws.
+.DESCRIPTION
+    A read-only file has the attribute cleared and is deleted again. When a row that was sent still
+    can't be deleted (-Sent), it's renamed to <name>.sent, so the listing (Get-AUOutboxFiles) never
+    sends it again and Remove-AUStaleOutboxTemp deletes it later; that counts as gone.
 .PARAMETER Path
     A file from Get-AUOutboxFiles.
+.PARAMETER Sent
+    The row was sent, so renaming it is enough when it can't be deleted.
+#>
+    param (
+        [string]$Path,
+        [switch]$Sent
+    )
+
+    $Message = ''
+    try
+    {
+        Remove-AUFileItem -Path $Path
+        return $true
+    }
+    catch { $Message = $_.Exception.Message }
+    try
+    {
+        $Item = New-Object IO.FileInfo $Path
+        if ($Item.Exists -and $Item.IsReadOnly)
+        {
+            $Item.IsReadOnly = $false
+            Remove-AUFileItem -Path $Path
+            return $true
+        }
+    }
+    catch { $Message = $_.Exception.Message }
+    if (-not $Sent)
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't delete $Path from the outbox: $Message" -Component 'AppUsage' -Type 3
+        return $false
+    }
+    try
+    {
+        $Target = "$Path.sent"
+        if (Test-AUItemPresent -Path $Target) { $Target = "$Path.$([guid]::NewGuid().ToString('N')).sent" }
+        [IO.File]::Move($Path, $Target)
+        Write-CMTraceLog -Message "App Usage: couldn't delete the sent row $Path from the outbox ($Message), so it's renamed to $Target and never sent again." -Component 'AppUsage' -Type 2
+        return $true
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't delete or rename the sent row $Path in the outbox, so the next run sends it again: $Message; $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $false
+    }
+}#endfunction
+
+function Remove-AUFileItem
+{
+    <#
+.SYNOPSIS
+    Deletes a file ([IO.File]::Delete). A thin wrapper, so tests can make a delete fail.
+.PARAMETER Path
+    The file.
 #>
     param (
         [string]$Path
     )
 
-    try
-    {
-        [IO.File]::Delete($Path)
-        return $true
-    }
-    catch
-    {
-        Write-CMTraceLog -Message "App Usage: couldn't delete $Path from the outbox: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
-        return $false
-    }
+    [IO.File]::Delete($Path)
 }#endfunction
 
 function Limit-AUOutboxRuns
@@ -9451,10 +9525,13 @@ function Invoke-AUSend
 {
     <#
 .SYNOPSIS
-    Sends one body with the sender. Returns $true only when the sender's last output is $true. Never throws.
+    Sends one body with the sender. Returns Ok and Permanent. Never throws.
 .DESCRIPTION
-    A sender that throws, such as the inventory's size guard or a failed token request, counts as
-    a failed send.
+    The sender's last output is an object with Ok and Permanent (the contract the inventory's sender
+    keeps), or a [bool] for Ok alone. Ok is $true only when the row was accepted. Permanent is $true
+    only for a rejection that a resend can't fix: an HTTP 4xx other than 408 and 429. Anything else
+    counts as a failed send that may work later. A sender that throws, such as the inventory's size
+    guard or a failed token request, counts as a failed send that isn't permanent.
 .PARAMETER Sender
     The sender scriptblock: param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType).
 .PARAMETER Body
@@ -9471,27 +9548,51 @@ function Invoke-AUSend
         [string]$LogType
     )
 
+    $Outcome = [pscustomobject]@{ Ok = $false; Permanent = $false }
     try
     {
         $Output = & $Sender $Body $LogAPIMode $LogType
         $Last = @($Output) | Select-Object -Last 1
-        return ($Last -is [bool] -and $Last)
+        if ($Last -is [bool]) { $Outcome.Ok = $Last }
+        elseif ($null -ne $Last -and $null -ne $Last.PSObject.Properties['Ok'])
+        {
+            $Outcome.Ok = ($Last.Ok -eq $true)
+            $Outcome.Permanent = (-not $Outcome.Ok -and $null -ne $Last.PSObject.Properties['Permanent'] -and $Last.Permanent -eq $true)
+        }
     }
     catch
     {
         Write-CMTraceLog -Message "App Usage: the App Inventory row upload failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
-        return $false
     }
+    return $Outcome
+}#endfunction
+
+function Test-AUPermanentStatus
+{
+    <#
+.SYNOPSIS
+    Tests whether an HTTP status is a permanent rejection: a 4xx other than 408 (timeout) and 429 (throttled).
+.PARAMETER StatusCode
+    The HTTP status code, or $null when there was no response.
+#>
+    param (
+        $StatusCode
+    )
+
+    $Code = $StatusCode -as [int]
+    if ($null -eq $Code) { return $false }
+    return ($Code -ge 400 -and $Code -le 499 -and $Code -ne 408 -and $Code -ne 429)
 }#endfunction
 
 function Remove-AUStaleOutboxTemp
 {
     <#
 .SYNOPSIS
-    Deletes leftover *.tmp files in a trusted outbox that are older than MaxAgeHours. Returns how many were deleted. Never throws.
+    Deletes leftover *.tmp files older than MaxAgeHours, and *.sent files of any age, in a trusted outbox. Returns how many were deleted. Never throws.
 .DESCRIPTION
     A temp file is left only when a run stopped between creating it and swapping it in
-    (Save-AUOutboxRow). Only regular files owned by SYSTEM or Administrators are deleted; links,
+    (Save-AUOutboxRow). A *.sent file is a row that was sent but couldn't be deleted
+    (Remove-AUOutboxFile -Sent), so it's never needed again. Only regular files owned by SYSTEM or Administrators are deleted; links,
     folders, and files with another owner are left alone. The listing reads each entry's own
     attributes and doesn't follow links. Call it only for an outbox Get-AUOutboxState trusts.
 .PARAMETER OutboxDir
@@ -9510,9 +9611,10 @@ function Remove-AUStaleOutboxTemp
         $Cutoff = [datetime]::UtcNow.AddHours(-$MaxAgeHours)
         foreach ($Item in (New-Object IO.DirectoryInfo $OutboxDir).GetFileSystemInfos())
         {
-            if (-not $Item.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $IsSent = $Item.Name.EndsWith('.sent', [StringComparison]::OrdinalIgnoreCase)
+            if (-not $IsSent -and -not $Item.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
             if (($Item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Directory)) -ne 0) { continue }
-            if ($Item.LastWriteTimeUtc -ge $Cutoff) { continue }
+            if (-not $IsSent -and $Item.LastWriteTimeUtc -ge $Cutoff) { continue }
             $Trusted = $false
             try { $Trusted = Test-AUTrustedOwner -Security ([IO.File]::GetAccessControl($Item.FullName, [Security.AccessControl.AccessControlSections]::Owner)) }
             catch { $Trusted = $false }
@@ -9521,7 +9623,7 @@ function Remove-AUStaleOutboxTemp
         }
     }
     catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir for leftover temp files: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
-    if ($Deleted -gt 0) { Write-CMTraceLog -Message "App Usage: deleted $Deleted leftover temp file(s) older than $MaxAgeHours hours from the outbox $OutboxDir." -Component 'AppUsage' -Type 2 }
+    if ($Deleted -gt 0) { Write-CMTraceLog -Message "App Usage: deleted $Deleted leftover file(s) (temp files older than $MaxAgeHours hours, and sent rows) from the outbox $OutboxDir." -Component 'AppUsage' -Type 2 }
     return $Deleted
 }#endfunction
 
@@ -9538,13 +9640,18 @@ function Send-AUOutbox
     RetryBudget is shared with Send-AURunRows (F51): each send gets the sender's own retry (the
     inventory's Invoke-LogSubmission), and a send that still fails spends one unit. Once the budget
     is 0, nothing more is sent this run and the rows stay for the next run. The caller sets it to 1
-    per run, so an outage costs one retry cycle, not one per row.
-    In a trusted outbox, leftover temp files older than 24 hours are deleted first
+    per run, so an outage costs one retry cycle, not one per row. A row the service rejects
+    permanently (Invoke-AUSend's Permanent: a 4xx other than 408 and 429) is deleted unsent and
+    counted in Discarded, without spending the budget, because resending can't fix it. A sent row
+    that can't be deleted is renamed to *.sent (Remove-AUOutboxFile -Sent), so it's never sent again.
+    In a trusted outbox, leftover temp files older than 24 hours, and *.sent files, are deleted first
     (Remove-AUStaleOutboxTemp). An outbox that isn't trusted (Get-AUOutboxState) is never read,
     sent, or deleted from; OutboxSkipped is then $true, as it is when the folder can't be listed.
-    Concurrent runs: Task 15 calls Send-AUOutbox, New-AURunRows, and Send-AURunRows under the
-    Global\PowerStacksAppUsage lock (Invoke-AUWithLock), so two runs never use the outbox at once.
-    Returns Sent, Remaining, PendingRows, and OutboxSkipped. Throws only when Sender is missing.
+    A blank OutboxDir (no outbox this run) sends nothing.
+    Concurrent runs: Send-AUInventoryRun calls Send-AUOutbox, New-AURunRows, and Send-AURunRows
+    under the outbox lock, so two runs never use the outbox at once.
+    Returns Sent, Remaining, Discarded, PendingRows, and OutboxSkipped. Throws only when Sender is
+    missing.
 .PARAMETER OutboxDir
     The outbox folder (Get-AUOutboxPath).
 .PARAMETER RetryBudget
@@ -9572,7 +9679,8 @@ function Send-AUOutbox
     )
 
     if ($null -eq $Sender) { throw 'Send-AUOutbox needs -Sender.' }
-    $Result = [pscustomobject]@{ Sent = 0; Remaining = 0; PendingRows = $false; OutboxSkipped = $false }
+    $Result = [pscustomobject]@{ Sent = 0; Remaining = 0; Discarded = 0; PendingRows = $false; OutboxSkipped = $false }
+    if ([string]::IsNullOrWhiteSpace($OutboxDir)) { return $Result }
     $State = Get-AUOutboxState -OutboxDir $OutboxDir
     if ($State -eq 'Absent') { return $Result }
     if ($State -eq 'Untrusted')
@@ -9607,9 +9715,17 @@ function Send-AUOutbox
             if (Remove-AUOutboxFile -Path $File.Path) { $Remaining-- }
             continue
         }
-        if (Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType)
+        $Send = Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType
+        if ($Send.Ok)
         {
             $Result.Sent++
+            if (Remove-AUOutboxFile -Path $File.Path -Sent) { $Remaining-- }
+        }
+        elseif ($Send.Permanent)
+        {
+            # Resending can't fix it, so the row is discarded and the budget is kept for the rest.
+            $Result.Discarded++
+            Write-CMTraceLog -Message "App Usage: row $($File.RowIndex) of run $($File.RunId) from the outbox was rejected permanently, so it's deleted unsent." -Component 'AppUsage' -Type 3
             if (Remove-AUOutboxFile -Path $File.Path) { $Remaining-- }
         }
         else
@@ -9638,10 +9754,13 @@ function Send-AURunRows
     supersedes them (D44). The outbox then keeps only the MaxRuns most recent runs. A missing
     outbox is created with the protected DACL (New-AUProtectedFolder); one that isn't trusted is
     never written or deleted from, and OutboxSkipped is $true. Returns Sent, Pending (rows not
-    sent), Saved (rows saved to the outbox), SentBytes, and OutboxSkipped. Throws only when Sender
-    is missing or a row lacks the run columns (pass New-AURunRows' result as it is, not wrapped in
-    @()). Concurrent runs: Task 15 calls it under the Global\PowerStacksAppUsage lock, with
-    Send-AUOutbox, so two runs never use the outbox at once.
+    sent), Saved (rows saved to the outbox), SentBytes, and OutboxSkipped. A blank OutboxDir means
+    there's no outbox this run: unsent rows aren't saved, and OutboxSkipped is $true when there are
+    any. A permanent rejection (Invoke-AUSend) of this run's row is handled like any failed send: it
+    spends the budget and the row is saved, so the next run tries it once more and discards it if
+    it's still rejected. Throws only when Sender is missing or a row lacks the run columns (pass
+    New-AURunRows' result as it is, not wrapped in @()). Concurrent runs: Send-AUInventoryRun calls
+    it under the outbox lock, with Send-AUOutbox, so two runs never use the outbox at once.
 .PARAMETER Rows
     The rows, from New-AURunRows.
 .PARAMETER OutboxDir
@@ -9691,7 +9810,7 @@ function Send-AURunRows
         }
         if ($RetryBudget.Value -gt 0)
         {
-            if (Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType)
+            if ((Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType).Ok)
             {
                 $Result.Sent++
                 $Result.SentBytes += $Body.Length
@@ -9704,6 +9823,15 @@ function Send-AURunRows
         $Result.Pending++
     }
     if ($null -eq $RunId) { return $Result }
+    if ([string]::IsNullOrWhiteSpace($OutboxDir))
+    {
+        if ($Result.Pending -gt 0)
+        {
+            $Result.OutboxSkipped = $true
+            Write-CMTraceLog -Message "App Usage: there's no outbox this run, so $($Result.Pending) unsent row(s) of run $RunId aren't saved." -Component 'AppUsage' -Type 3
+        }
+        return $Result
+    }
 
     $State = Get-AUOutboxState -OutboxDir $OutboxDir
     if ($Result.Pending -eq 0)
@@ -9774,6 +9902,8 @@ $script:AUStatusTokens = @(
     'MappingsUnavailable:Invalid'       # Our rules didn't load or validate: App Usage skipped.
     'AppUsageBusy'                      # Another run held the lock for 60 seconds: App Usage skipped (D23).
     'AppUsageFailed'                    # An unexpected error (see the log): usage fields blank.
+    'AppUsageFailed:Serial'             # The serial number couldn't be read, so the ledger can't be named: App Usage skipped.
+    'AppUsageFailed:OsBuild'            # The Windows build number couldn't be read: App Usage skipped.
     'ShadowCopyFailed'                  # No shadow copy of the system drive: App Usage skipped.
     'SrumReadFailed:WorkDirUntrusted'   # C:\Windows\PowerStacksAppUsage isn't safe to use: App Usage skipped.
     'SrumReadFailed:CopyFailed'         # SRUDB.dat didn't copy from the shadow copy.
@@ -9798,10 +9928,10 @@ $script:AUStatusTokens = @(
     'InvalidCustomerMappings:TooLarge'  # The customer file is over 1 MB: ignored this run (D45).
     'InvalidCustomerMappings:UnsafePath'    # The customer file path was refused: ignored this run.
     'InvalidCustomerMappings:ReparsePoint'  # The customer file is a link: ignored this run.
-    'CustomerMappingsAbsent'            # No customer file: no customer rules this run (D41).
     'PendingRows'                       # Rows from an earlier run still wait in the outbox (D44).
-    'OutboxSkipped'                     # The outbox couldn't be used this run.
+    'OutboxSkipped'                     # The outbox couldn't be used this run: rows that weren't sent may be lost.
 )
+# No customer file isn't a problem, so it has no token: CustomerMappingsHash_s is blank then.
 # Below this build App Usage doesn't run (D42).
 $script:AUMinOsBuild = 26200
 # How long Invoke-AppUsage waits for the run lock.
@@ -9912,15 +10042,18 @@ function Get-AUSerial
 {
     <#
 .SYNOPSIS
-    Returns the device's BIOS serial number (Win32_BIOS), or '' when it can't be read. Never throws.
+    Returns the device's BIOS serial number (Win32_BIOS), trimmed: '' when the BIOS has none, so the
+    computer name names the ledger (F44), and $null when it can't be read (AppUsageFailed:Serial).
+    Never throws.
 #>
     try
     {
         $Bios = @(Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop)
         if ($Bios.Count -gt 0) { return ([string]$Bios[0].SerialNumber).Trim() }
+        Write-CMTraceLog -Message 'App Usage: Win32_BIOS returned nothing, so the serial number is unknown.' -Component 'AppUsage' -Type 3
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't read the serial number, so the computer name names the ledger: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
-    return ''
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read the serial number: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    return $null
 }#endfunction
 
 function Get-AULedgerPath
@@ -10225,7 +10358,10 @@ function Invoke-AUCollection
             foreach ($Row in @($Srum.Timeline))
             {
                 if ($null -eq $Row) { continue }
-                $Number = ([string]$Row.AutoIncId).Trim() -as [long]
+                # A blank AutoIncId isn't an ID ('' -as [long] would be 0).
+                $IdText = ([string]$Row.AutoIncId).Trim()
+                $Number = $null
+                if ($IdText) { $Number = $IdText -as [long] }
                 if ($null -ne $Number -and ($null -eq $Lowest -or $Number -lt $Lowest)) { $Lowest = $Number }
                 if (-not $Run.IncludeStore)
                 {
@@ -10340,12 +10476,14 @@ function Invoke-AURun
 .SYNOPSIS
     Checks the OS build, loads the mappings, and runs Invoke-AUCollection under the run lock.
 .DESCRIPTION
-    Below build 26200 the run stops with UnsupportedOS and no snapshot is taken (D42). The ledger and
-    outbox paths come from the serial (Get-AUSerial unless the caller gave one). When our embedded
+    An unreadable build number stops the run with AppUsageFailed:OsBuild; below build 26200 it stops
+    with UnsupportedOS. Either way no snapshot is taken (D42). The ledger and outbox paths come from
+    the serial (Get-AUSerial unless the caller gave one); an unreadable serial stops the run with
+    AppUsageFailed:Serial, and a blank one falls back to the computer name (F44). When our embedded
     rules are missing (MappingsUnavailable:Missing) or invalid (MappingsUnavailable:Invalid), the run
-    stops before the lock, so stored targets and the ledger are untouched. The customer file's state
-    is reported (CustomerMappingsAbsent, InvalidCustomerMappings with TooLarge, UnsafePath, or
-    ReparsePoint when that's the reason). Lock not acquired: AppUsageBusy. The work under the lock
+    stops before the lock, so stored targets and the ledger are untouched. An invalid customer file
+    is reported (InvalidCustomerMappings, with TooLarge, UnsafePath, or ReparsePoint when that's the
+    reason); a missing one isn't a problem and is only logged. Lock not acquired: AppUsageBusy. The work under the lock
     failed: AppUsageFailed, and the results are cleared.
 .PARAMETER Run
     The run built by Invoke-AppUsage.
@@ -10356,6 +10494,12 @@ function Invoke-AURun
 
     $Tokens = $Run.Tokens
     $Build = [int](Get-AUOsBuild)
+    if ($Build -le 0)
+    {
+        Add-AUStatusToken $Tokens 'AppUsageFailed:OsBuild'
+        Write-CMTraceLog -Message "App Usage: skipped, because the Windows build number couldn't be read." -Component 'AppUsage' -Type 3
+        return
+    }
     if ($Build -lt $script:AUMinOsBuild)
     {
         Add-AUStatusToken $Tokens 'UnsupportedOS'
@@ -10363,8 +10507,17 @@ function Invoke-AURun
         return
     }
 
-    $Serial = [string]$Run.Serial
+    $Serial = $Run.Serial
     if (-not $Run.SerialGiven) { $Serial = Get-AUSerial }
+    if ($null -eq $Serial)
+    {
+        # A blank serial falls back to the computer name (F44); an unread one could name a second
+        # ledger for the same device, so the run stops.
+        Add-AUStatusToken $Tokens 'AppUsageFailed:Serial'
+        Write-CMTraceLog -Message "App Usage: skipped, because the serial number couldn't be read, so the ledger can't be named." -Component 'AppUsage' -Type 3
+        return
+    }
+    $Serial = [string]$Serial
     $Run.LedgerPath = Get-AULedgerPath -Serial $Serial -ComputerName $Run.ComputerName
     $Run.Result.LedgerPath = $Run.LedgerPath
     $Run.Result.OutboxPath = Get-AUOutboxPath -Serial $Serial -ComputerName $Run.ComputerName
@@ -10374,7 +10527,7 @@ function Invoke-AURun
     $Run.Result.CustomerMappingsHash = [string]$Mappings.CustomerHash
     switch ([string]$Mappings.CustomerSource)
     {
-        'Absent' { Add-AUStatusToken $Tokens 'CustomerMappingsAbsent' }
+        'Absent' { Write-CMTraceLog -Message 'App Usage: no customer mapping file, so only our rules apply.' -Component 'AppUsage' }
         'TooLarge' { Add-AUStatusToken $Tokens 'InvalidCustomerMappings:TooLarge' }
         'Invalid'
         {
@@ -10508,8 +10661,8 @@ function Invoke-AppUsage
 .DESCRIPTION
     The caller runs it only when $CollectAppMetering is on. It reads the script settings
     $MinFocusSecondsForUse, $CollectUWPInventory (Store and MSIX apps and their usage, D46),
-    $AppUsageCustomerMappingsPath, $ScriptVersion, and $script:AppUsageMappingsEmbedded, and passes
-    them down (F3).
+    $AppUsageCustomerMappingsPath, $ScriptVersion, $LogAPIMode (the device column names), and
+    $script:AppUsageMappingsEmbedded, and passes them down (F3).
     Order: the language mode first, because Constrained Language Mode blocks the .NET calls the rest
     needs (anything but FullLanguage: LanguageMode:<mode>; skipped, D37); then the OS build (below
     26200: UnsupportedOS, no snapshot, D42); then the mappings (Invoke-AURun); then, under the run
@@ -10547,8 +10700,6 @@ function Invoke-AppUsage
       Timings            Ordered dictionary of stage name to milliseconds, and Total.
 .PARAMETER RunId
     The run's GUID; a new one when it's blank or isn't a GUID.
-.PARAMETER LogAPIMode
-    The inventory's $LogAPIMode, for the device column names.
 .PARAMETER Serial
     The device's serial number for the ledger and outbox names; read from Win32_BIOS when not given.
 .PARAMETER ComputerName
@@ -10556,12 +10707,13 @@ function Invoke-AppUsage
 #>
     param (
         [string]$RunId,
-        [string]$LogAPIMode = 'LogIngestionAPI',
         [string]$Serial,
         [string]$ComputerName = $env:COMPUTERNAME
     )
 
     $Version = [string]$ScriptVersion
+    # The inventory's setting names the device columns (Get-AUColumnName).
+    $ApiMode = [string]$LogAPIMode
     try
     {
         # Constrained Language Mode first: only plain types and cmdlets until it's known to be Full.
@@ -10573,7 +10725,7 @@ function Invoke-AppUsage
             $Result = New-AUResult -RunId $RunId
             $Result.StatusTokens = @("LanguageMode:$Mode", 'skipped')
             $Result.Status = "LanguageMode:$Mode; skipped"
-            $Result.DeviceColumns = New-AUDeviceColumns -Result $Result -LogAPIMode $LogAPIMode -ScriptVersion $Version
+            $Result.DeviceColumns = New-AUDeviceColumns -Result $Result -LogAPIMode $ApiMode -ScriptVersion $Version
             Write-CMTraceLog -Message "App Usage: skipped, because the language mode is $Mode, not FullLanguage (D37)." -Component 'AppUsage' -Type 2
             return $Result
         }
@@ -10630,7 +10782,7 @@ function Invoke-AppUsage
             $Result.StatusTokens = @('AppUsageFailed')
             $Result.Status = 'AppUsageFailed'
         }
-        $Result.DeviceColumns = New-AUDeviceColumns -Result $Result -LogAPIMode $LogAPIMode -ScriptVersion $Version
+        $Result.DeviceColumns = New-AUDeviceColumns -Result $Result -LogAPIMode $ApiMode -ScriptVersion $Version
         $Result.Timings['Total'] = [long]$Total.ElapsedMilliseconds
         $Exes = 0
         if ($null -ne $Result.ExeEntries) { $Exes = @($Result.ExeEntries).Count }
@@ -10648,9 +10800,227 @@ function Invoke-AppUsage
                 UnmatchedExeCount = $null; WatchingSince = $null; ProfilesFound = $null; ProfilesRead = $null; MappingsVersion = ''; CustomerMappingsHash = ''
                 DeviceColumns = $null; LedgerPath = $null; OutboxPath = $null; Timings = [ordered]@{}
             })
-        try { $Fallback.DeviceColumns = New-AUDeviceColumns -Result $Fallback -LogAPIMode $LogAPIMode -ScriptVersion $Version } catch { }
+        try { $Fallback.DeviceColumns = New-AUDeviceColumns -Result $Fallback -LogAPIMode $ApiMode -ScriptVersion $Version } catch { }
         return $Fallback
     }
+}#endfunction
+
+# Inventory wiring (Task 15). The inline App Inventory section calls these when $CollectAppMetering is
+# on; with it off, that section runs exactly version 19's code and calls none of them.
+
+# The usage fields on each installed-app entry, in the spec's order (Get-AUAppUsage).
+$script:AUAppFieldNames = @('AppLastUsedDate', 'AppUsageStatus', 'AppLastRanDate', 'AppInFocusSeconds', 'AppUsersWithUse', 'AppMatchedExeCount', 'AppRunsAsService')
+
+function New-AUFailedResult
+{
+    <#
+.SYNOPSIS
+    Returns an Invoke-AppUsage result for a run where Invoke-AppUsage itself failed: AppUsageFailed, no usage data, and the device columns.
+.PARAMETER RunId
+    The run's GUID.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER ScriptVersion
+    The inventory's $ScriptVersion.
+#>
+    param (
+        [string]$RunId,
+        [string]$LogAPIMode,
+        [string]$ScriptVersion
+    )
+
+    $Guid = [guid]::Empty
+    if (-not [guid]::TryParse($RunId, [ref]$Guid)) { $Guid = [guid]::NewGuid() }
+    $Result = New-AUResult -RunId $Guid.ToString()
+    $Result.Status = 'AppUsageFailed'
+    $Result.StatusTokens = @('AppUsageFailed')
+    $Result.DeviceColumns = New-AUDeviceColumns -Result $Result -LogAPIMode $LogAPIMode -ScriptVersion $ScriptVersion
+    return $Result
+}#endfunction
+
+function Add-AUAppFields
+{
+    <#
+.SYNOPSIS
+    Adds the usage fields ($script:AUAppFieldNames) to each App Inventory entry, from AppFields by AppName.
+.DESCRIPTION
+    Every entry gets all seven fields, after its version 19 fields. An entry with no AppFields value
+    (App Usage failed, was skipped, or the inventory used its own read) gets them blank ($null), so
+    the entries are otherwise unchanged (spec: Fields on Each Installed-App Entry).
+.PARAMETER AppArray
+    The App Inventory entries (ConvertTo-AUAppArray or Invoke-AppUsage's InventoryApps).
+.PARAMETER AppFields
+    Invoke-AppUsage's AppFields: AppName to the field values, or $null.
+#>
+    param (
+        [object[]]$AppArray,
+        [hashtable]$AppFields
+    )
+
+    foreach ($App in @($AppArray))
+    {
+        if ($null -eq $App) { continue }
+        $Values = $null
+        $Name = [string]$App.AppName
+        if ($null -ne $AppFields -and $Name -and $AppFields.ContainsKey($Name)) { $Values = $AppFields[$Name] }
+        foreach ($Field in $script:AUAppFieldNames)
+        {
+            $Value = $null
+            if ($null -ne $Values) { $Value = $Values.$Field }
+            $App | Add-Member -MemberType NoteProperty -Name $Field -Value $Value -Force
+        }
+    }
+}#endfunction
+
+function ConvertTo-AUExeUsageJson
+{
+    <#
+.SYNOPSIS
+    Returns the ExeUsage blob's JSON: an array of Invoke-AppUsage's ExeEntries, or '' when there are none to send.
+.DESCRIPTION
+    '' (no pieces, so no ExeUsage columns) when ExeEntries is $null: App Usage failed or was
+    skipped. An empty list is "[]". Always an array, even for one entry, compressed, with depth for
+    CandidateTargets.
+.PARAMETER ExeEntries
+    Invoke-AppUsage's ExeEntries.
+#>
+    param (
+        [object[]]$ExeEntries
+    )
+
+    if ($null -eq $ExeEntries) { return '' }
+    return (ConvertTo-Json -InputObject @($ExeEntries) -Depth 5 -Compress)
+}#endfunction
+
+function Send-AUInventoryRun
+{
+    <#
+.SYNOPSIS
+    Sends the run's App Inventory data with metering on: the outbox first, then this run's rows (D44, F45, F51 to F53).
+.DESCRIPTION
+    Under the outbox lock ($script:AUOutboxLockName, waited for up to LockTimeoutSeconds): Send-AUOutbox,
+    then row 1's AppUsageCollectionStatus_s set to Format-AUStatus of StatusTokens plus PendingRows
+    and OutboxSkipped from the flush, then New-AURunRows and Send-AURunRows, with one retry budget for
+    the whole run. The run lock isn't held here, so a send that backs off for minutes never makes an
+    overlapping run's App Usage AppUsageBusy; the outbox lock keeps two runs from using the outbox at
+    once. When the outbox lock isn't acquired, the outbox isn't used this run (OutboxSkipped): the
+    rows are still sent, and rows that aren't sent are lost. A blank OutboxDir (App Usage stopped
+    before naming it) also means no outbox.
+    MainColumns gets the final status, so the caller's $MainApp shows what row 1 sent. Returns
+    RowCount, Sent, Pending, Saved, SentBytes, AllSent (every row of this run was sent), Status, and
+    OutboxSent. Throws when the rows can't be built (New-AURunRows) or the work under the lock
+    fails; the caller then uses its own upload.
+.PARAMETER MainColumns
+    Row 1's columns: the inventory's $MainApp (ComputerName, ManagedDeviceID, and the device columns), without pieces.
+.PARAMETER InstalledAppsJson
+    The InstalledApps JSON.
+.PARAMETER ExeUsageJson
+    The ExeUsage JSON (ConvertTo-AUExeUsageJson).
+.PARAMETER StatusTokens
+    Invoke-AppUsage's StatusTokens.
+.PARAMETER RunId
+    The run's GUID (Invoke-AppUsage's RunId).
+.PARAMETER OutboxDir
+    Invoke-AppUsage's OutboxPath, or blank.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER LogType
+    The App Inventory log type.
+.PARAMETER Sender
+    The inventory's row sender (see the note above Get-AUColumnName).
+.PARAMETER LockTimeoutSeconds
+    How long to wait for the outbox lock.
+#>
+    param (
+        $MainColumns,
+        [string]$InstalledAppsJson,
+        [string]$ExeUsageJson,
+        [string[]]$StatusTokens,
+        [string]$RunId,
+        [string]$OutboxDir,
+        [string]$LogAPIMode,
+        [string]$LogType,
+        [scriptblock]$Sender,
+        [int]$LockTimeoutSeconds = $script:AULockTimeoutSeconds
+    )
+
+    if ($null -eq $Sender) { throw 'Send-AUInventoryRun needs -Sender.' }
+    $State = [pscustomobject]@{
+        Tokens     = New-Object 'System.Collections.Generic.List[string]'
+        OutboxDir  = [string]$OutboxDir
+        Flush      = $null
+        Rows       = $null
+        Sent       = $null
+        Status     = $null
+    }
+    foreach ($Token in @($StatusTokens)) { if (-not [string]::IsNullOrWhiteSpace($Token)) { Add-AUStatusToken $State.Tokens $Token } }
+    $StatusColumn = Get-AUColumnName 'AppUsageCollectionStatus' 's' $LogAPIMode
+    # One retry budget for the whole run (F51), shared by the outbox flush and this run's rows.
+    $Budget = [ref]1
+    $Work = {
+        $State.Flush = Send-AUOutbox -OutboxDir $State.OutboxDir -RetryBudget $Budget -LogAPIMode $LogAPIMode -LogType $LogType -Sender $Sender
+        if ($State.Flush.PendingRows) { Add-AUStatusToken $State.Tokens 'PendingRows' }
+        if ($State.Flush.OutboxSkipped) { Add-AUStatusToken $State.Tokens 'OutboxSkipped' }
+        try { $State.Status = Format-AUStatus $State.Tokens.ToArray() }
+        catch { $State.Status = 'AppUsageFailed' }
+        $MainColumns.$StatusColumn = $State.Status
+        $State.Rows = New-AURunRows -MainColumns $MainColumns -InstalledAppsJson $InstalledAppsJson -ExeUsageJson $ExeUsageJson -LogAPIMode $LogAPIMode -RunId $RunId
+        $State.Sent = Send-AURunRows -Rows $State.Rows -OutboxDir $State.OutboxDir -RetryBudget $Budget -LogAPIMode $LogAPIMode -LogType $LogType -Sender $Sender
+    }
+
+    $Lock = Invoke-AUWithLock -Name $script:AUOutboxLockName -TimeoutSeconds $LockTimeoutSeconds -Body $Work
+    if ($Lock.Acquired -ne $true)
+    {
+        Write-CMTraceLog -Message 'App Usage: the outbox lock is held by another run, so this run sends its rows without the outbox.' -Component 'AppUsage' -Type 2
+        Add-AUStatusToken $State.Tokens 'OutboxSkipped'
+        $State.OutboxDir = ''
+        & $Work
+    }
+    elseif ($null -ne $Lock.Error) { throw "The App Inventory rows weren't sent: $($Lock.Error)" }
+
+    $RowCount = 0
+    if ($null -ne $State.Rows) { $RowCount = @($State.Rows).Count }
+    $Sent = $State.Sent
+    $OutboxSent = 0
+    if ($null -ne $State.Flush) { $OutboxSent = [int]$State.Flush.Sent }
+    $Outcome = [pscustomobject]@{
+        RowCount   = $RowCount
+        Sent       = [int]$Sent.Sent
+        Pending    = [int]$Sent.Pending
+        Saved      = [int]$Sent.Saved
+        SentBytes  = [long]$Sent.SentBytes
+        AllSent    = ($RowCount -gt 0 -and [int]$Sent.Sent -eq $RowCount)
+        Status     = $State.Status
+        OutboxSent = $OutboxSent
+    }
+    Write-CMTraceLog -Message "App Usage: run $RunId sent $($Outcome.Sent) of $RowCount App Inventory row(s), $($Outcome.SentBytes) bytes; $($Outcome.Saved) saved to the outbox; $OutboxSent outbox row(s) sent first. Status: $($Outcome.Status)" -Component 'AppUsage'
+    return $Outcome
+}#endfunction
+
+function Format-AUInventoryResponse
+{
+    <#
+.SYNOPSIS
+    Returns the App Inventory upload response for the summary line with metering on (D40, F41).
+.DESCRIPTION
+    When every row of the run was sent, it has the success status the summary line checks (204, or
+    200 for the classic API), then the total size and the row count, in version 19's form:
+    "204 : Upload payload size is 41.2Kb (1 row) ". Otherwise it says how many rows were sent, which
+    the summary line reports as Fail.
+.PARAMETER Outcome
+    The Send-AUInventoryRun result.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+#>
+    param (
+        [pscustomobject]$Outcome,
+        [string]$LogAPIMode
+    )
+
+    $Code = if ($LogAPIMode -eq 'LogIngestionAPI') { 204 } else { 200 }
+    $Rows = if ($Outcome.RowCount -eq 1) { '1 row' } else { "$($Outcome.RowCount) rows" }
+    if ($Outcome.AllSent) { return "$Code : Upload payload size is " + ($Outcome.SentBytes / 1024).ToString('#.#') + "Kb ($Rows) " }
+    return "Sent $($Outcome.Sent) of $Rows "
 }#endfunction
 #endregion APPUSAGE
 
@@ -11331,100 +11701,226 @@ if ($CollectAppInventory)
         }
     }
 
-    Write-CMTraceLog "Calling Get-InstalledApplications for Win32 apps..."
-    $MyApps = Get-InstalledApplications -UserSid $UserSid
-    Write-CMTraceLog "Retrieved $($MyApps.Count) Win32 applications"
-    $MyApps | ForEach-Object { $_ | Add-Member -NotePropertyName AppType -NotePropertyValue 'Win32' -Force }
-
-    if ($CollectUWPInventory)
+    # App Usage (software metering) runs only with $CollectAppMetering on. With it off, this section
+    # runs exactly version 19's code. No App Usage failure stops or changes the inventory, and the
+    # exit code is the inventory's (D28); App Usage's result goes in AppUsageCollectionStatus_s.
+    $AUResult = $null
+    if ($CollectAppMetering)
     {
-        Write-CMTraceLog "UWP inventory enabled, calling Get-AppxInstalledApplications..."
-        $MyAppsAppx = Get-AppxInstalledApplications # Due to limitations of Get-AppxPackage on AADJ devices we don't use the SID
-        Write-CMTraceLog "Retrieved $($MyAppsAppx.Count) UWP applications"
-        $MyApps += $MyAppsAppx
-        Write-CMTraceLog "Combined total: $($MyApps.Count) applications (Win32 + UWP)"
+        Write-CMTraceLog "App Usage is on, calling Invoke-AppUsage..."
+        try
+        {
+            $AUResult = Invoke-AppUsage -RunId ([guid]::NewGuid().ToString()) -ComputerName $ComputerName
+        }
+        catch
+        {
+            Write-CMTraceLog "App Usage failed, so the inventory uses its own read: $($_.Exception.Message)" -ErrorMsg
+            $AUResult = $null
+        }
+        if ($null -eq $AUResult -or $null -eq $AUResult.DeviceColumns)
+        {
+            try
+            {
+                $AUResult = New-AUFailedResult -RunId $(if ($AUResult) { $AUResult.RunId } else { '' }) -LogAPIMode $LogAPIMode -ScriptVersion $ScriptVersion
+            }
+            catch
+            {
+                Write-CMTraceLog "App Usage result could not be built: $($_.Exception.Message)" -ErrorMsg
+                $AUResult = $null
+            }
+        }
+        if ($AUResult)
+        {
+            Write-CMTraceLog "App Usage status: $($AUResult.Status)"
+        }
+    }
+
+    if ($AUResult -and $null -ne $AUResult.InventoryApps)
+    {
+        # App Usage read every profile's apps (D20); its entries are version 19's, built the same way.
+        $AppArray = @($AUResult.InventoryApps)
+        Write-CMTraceLog "Using the App Usage all-profile app read: $($AppArray.Count) applications"
     }
     else
     {
-        Write-CMTraceLog "UWP inventory disabled, skipping"
+        Write-CMTraceLog "Calling Get-InstalledApplications for Win32 apps..."
+        $MyApps = Get-InstalledApplications -UserSid $UserSid
+        Write-CMTraceLog "Retrieved $($MyApps.Count) Win32 applications"
+        $MyApps | ForEach-Object { $_ | Add-Member -NotePropertyName AppType -NotePropertyValue 'Win32' -Force }
+
+        if ($CollectUWPInventory)
+        {
+            Write-CMTraceLog "UWP inventory enabled, calling Get-AppxInstalledApplications..."
+            $MyAppsAppx = Get-AppxInstalledApplications # Due to limitations of Get-AppxPackage on AADJ devices we don't use the SID
+            Write-CMTraceLog "Retrieved $($MyAppsAppx.Count) UWP applications"
+            $MyApps += $MyAppsAppx
+            Write-CMTraceLog "Combined total: $($MyApps.Count) applications (Win32 + UWP)"
+        }
+        else
+        {
+            Write-CMTraceLog "UWP inventory disabled, skipping"
+        }
+
+        $AppArray = @(ConvertTo-AUAppArray -Apps $MyApps)
     }
 
-    $AppArray = @(ConvertTo-AUAppArray -Apps $MyApps)
+    if ($AUResult)
+    {
+        # The usage fields on each entry; blank when App Usage has none for this run.
+        try
+        {
+            Add-AUAppFields -AppArray $AppArray -AppFields $AUResult.AppFields
+        }
+        catch
+        {
+            Write-CMTraceLog "App Usage fields could not be added: $($_.Exception.Message)" -ErrorMsg
+        }
+    }
 
     Write-CMTraceLog 'Converting app array to JSON...'
     $InstalledAppJson = $AppArray | ConvertTo-Json
     Write-CMTraceLog "App inventory JSON size: $($InstalledAppJson.Length) characters"
 
-    Write-CMTraceLog "Compressing app inventory JSON with GZip and splitting it into chunks..."
-    try
+    # With metering on, the run's rows go through the outbox and split runs (D44): one row when it
+    # fits, more when it doesn't, so a large device never hits the 10-chunk limit below (F45).
+    $AUInventorySent = $false
+    if ($AUResult)
     {
-        $InstalledAppJsonArr = ConvertTo-AUChunks -Json $InstalledAppJson -ChunkSize $(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})
-        $InstalledAppBase64Length = 0
-        foreach ($InstalledApp in $InstalledAppJsonArr) { $InstalledAppBase64Length += $InstalledApp.Length }
-        Write-CMTraceLog "App inventory compressed successfully, Base64 size: $InstalledAppBase64Length characters"
-    }
-    catch
-    {
-        Write-CMTraceLog "Error compressing app inventory: $($_.Exception.Message)" -ErrorMsg
-        throw
-    }
-
-    Write-CMTraceLog "Building main app upload object..."
-    $MainApp = New-Object -TypeName PSObject
-    $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
-    $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
-
-    Write-CMTraceLog "Adding app inventory chunks to the upload object..."
-    $i = 0
-    foreach ($InstalledApp in $InstalledAppJsonArr)
-    {
-        if ($InstalledApp.Length -gt 0 )
+        Write-CMTraceLog "Building the App Inventory rows with App Usage..."
+        try
         {
-            $i++
-            $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $InstalledApp -Force
+            $MainApp = New-Object -TypeName PSObject
+            $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
+            $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
+            foreach ($AUColumn in $AUResult.DeviceColumns.Keys)
+            {
+                $MainApp | Add-Member -MemberType NoteProperty -Name $AUColumn -Value $AUResult.DeviceColumns[$AUColumn] -Force
+            }
+
+            # Each row is sent with the inventory's own upload, and its retry, using the connection
+            # settings above. Ok: the success status the summary line checks. Permanent: a 4xx other
+            # than 408 and 429, which a resend can't fix.
+            $AUSender = {
+                param ([byte[]]$Body, [string]$Mode, [string]$Type)
+                $ErrorActionPreference = 'Stop'
+                $script:LastSubmissionStatusCode = $null
+                $Code = $null
+                $Response = ''
+                try
+                {
+                    if ($Mode -eq "LogIngestionAPI")
+                    {
+                        $Response = Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body $Body -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $Type
+                        $Code = $script:LastSubmissionStatusCode
+                    }
+                    else
+                    {
+                        $Response = Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body $Body -logType $Type
+                    }
+                }
+                catch
+                {
+                    if ($_.Exception.Response)
+                    {
+                        try
+                        {
+                            $Code = [int]$_.Exception.Response.StatusCode
+                        }
+                        catch
+                        {
+                        }
+                    }
+                    Write-CMTraceLog "App inventory row upload failed: $($_.Exception.Message)" -WarningMsg
+                }
+                Write-CMTraceLog "App inventory row upload response: $Response"
+                $Ok = ("$Response" -match "^$(if($Mode -eq 'LogIngestionAPI'){204}else{200}) :")
+                New-Object PSObject -Property @{ Ok = $Ok; Permanent = ((-not $Ok) -and (Test-AUPermanentStatus $Code)) }
+            }
+
+            $AUOutcome = Send-AUInventoryRun -MainColumns $MainApp -InstalledAppsJson $InstalledAppJson -ExeUsageJson (ConvertTo-AUExeUsageJson -ExeEntries $AUResult.ExeEntries) -StatusTokens $AUResult.StatusTokens -RunId $AUResult.RunId -OutboxDir $AUResult.OutboxPath -LogAPIMode $LogAPIMode -LogType $AppLog -Sender $AUSender
+            $ResponseAppInventory = Format-AUInventoryResponse -Outcome $AUOutcome -LogAPIMode $LogAPIMode
+            $AUInventorySent = $true
+            Write-CMTraceLog "App inventory upload response: $ResponseAppInventory"
+        }
+        catch
+        {
+            Write-CMTraceLog "App Inventory rows could not be sent with App Usage, so the inventory uses its own upload: $($_.Exception.Message)" -ErrorMsg
         }
     }
-    Write-CMTraceLog "App inventory split into $i chunk(s)"
 
-    if ($InstalledAppBase64Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+    if (-not $AUInventorySent)
+    {
+        Write-CMTraceLog "Compressing app inventory JSON with GZip and splitting it into chunks..."
+        try
+        {
+            $InstalledAppJsonArr = ConvertTo-AUChunks -Json $InstalledAppJson -ChunkSize $(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})
+            $InstalledAppBase64Length = 0
+            foreach ($InstalledApp in $InstalledAppJsonArr) { $InstalledAppBase64Length += $InstalledApp.Length }
+            Write-CMTraceLog "App inventory compressed successfully, Base64 size: $InstalledAppBase64Length characters"
+        }
+        catch
+        {
+            Write-CMTraceLog "Error compressing app inventory: $($_.Exception.Message)" -ErrorMsg
+            throw
+        }
+
+        Write-CMTraceLog "Building main app upload object..."
+        $MainApp = New-Object -TypeName PSObject
+        $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
+        $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
+
+        Write-CMTraceLog "Adding app inventory chunks to the upload object..."
+        $i = 0
+        foreach ($InstalledApp in $InstalledAppJsonArr)
+        {
+            if ($InstalledApp.Length -gt 0 )
             {
-                10 * 63 * 1024
+                $i++
+                $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $InstalledApp -Force
             }
-            else
-            {
-                10 * 31 * 1024
-            }))
-    {
-        $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppBase64Length / 1024).ToString("#.#") + "Kb"
-        Write-CMTraceLog $errorMsg -ErrorMsg
-        throw($errorMsg)
-    }
+        }
+        Write-CMTraceLog "App inventory split into $i chunk(s)"
 
-    Write-CMTraceLog "Converting main app object to JSON for upload..."
-    $AppJson = if ($LogAPIMode -eq "LogIngestionAPI")
-    {
-        "[$($MainApp | ConvertTo-Json -Compress)]"
-    }
-    else
-    {
-        $MainApp | ConvertTo-Json
-    }
-    Write-CMTraceLog "Final app JSON payload size: $($AppJson.Length) characters"
+        if ($InstalledAppBase64Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+                {
+                    10 * 63 * 1024
+                }
+                else
+                {
+                    10 * 31 * 1024
+                }))
+        {
+            $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppBase64Length / 1024).ToString("#.#") + "Kb"
+            Write-CMTraceLog $errorMsg -ErrorMsg
+            throw($errorMsg)
+        }
 
-    # Submit the data to the API endpoint
-    Write-CMTraceLog "Uploading app inventory to Log Analytics (Mode: $LogAPIMode)..."
-    $ResponseAppInventory =
-    if ($LogAPIMode -eq "LogIngestionAPI")
-    {
-        Write-CMTraceLog "Calling Send-LogIngestionAPI for app inventory..."
-        Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $AppLog
+        Write-CMTraceLog "Converting main app object to JSON for upload..."
+        $AppJson = if ($LogAPIMode -eq "LogIngestionAPI")
+        {
+            "[$($MainApp | ConvertTo-Json -Compress)]"
+        }
+        else
+        {
+            $MainApp | ConvertTo-Json
+        }
+        Write-CMTraceLog "Final app JSON payload size: $($AppJson.Length) characters"
+
+        # Submit the data to the API endpoint
+        Write-CMTraceLog "Uploading app inventory to Log Analytics (Mode: $LogAPIMode)..."
+        $ResponseAppInventory =
+        if ($LogAPIMode -eq "LogIngestionAPI")
+        {
+            Write-CMTraceLog "Calling Send-LogIngestionAPI for app inventory..."
+            Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $AppLog
+        }
+        else
+        {
+            Write-CMTraceLog "Calling Send-DataCollectorAPI for app inventory..."
+            Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
+        }
+        Write-CMTraceLog "App inventory upload response: $ResponseAppInventory"
     }
-    else
-    {
-        Write-CMTraceLog "Calling Send-DataCollectorAPI for app inventory..."
-        Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
-    }
-    Write-CMTraceLog "App inventory upload response: $ResponseAppInventory"
 }
 # end region APPINVENTORY
 

@@ -159,9 +159,27 @@ Describe 'Row-size limit (F48)' {
             $ManagedDeviceID = $null
         }
 
-        It 'checks the body against $script:AUMaxRowBytes' {
-            $script:SendFunction.Extent.Text | Should -Match ([regex]::Escape('if ($body.Length -gt $script:AUMaxRowBytes)'))
+        It 'checks the body against $script:AUMaxRowBytes, or 943718 when it is not defined' {
+            $script:SendFunction.Extent.Text | Should -Match ([regex]::Escape('$maxBodyBytes = $script:AUMaxRowBytes'))
+            $script:SendFunction.Extent.Text | Should -Match ([regex]::Escape('$maxBodyBytes = 943718'))
+            $script:SendFunction.Extent.Text | Should -Match ([regex]::Escape('if ($body.Length -gt $maxBodyBytes)'))
             $script:SendFunction.Extent.Text | Should -Not -Match ([regex]::Escape('0.9 * 1024 * 1024'))
+        }
+
+        It 'keeps the same limit when $script:AUMaxRowBytes is not defined' {
+            $Saved = $script:AUMaxRowBytes
+            try
+            {
+                Remove-Variable -Name AUMaxRowBytes -Scope Script
+                foreach ($Length in 943718, 943719)
+                {
+                    $Threw = $false
+                    try { [void](Send-LogIngestionAPI -tenantId 't' -clientId 'c' -clientSecret 's' -body (New-Object byte[] $Length) -dceURI 'https://dce' -dcrImmutableId 'dcr-1' -logType 'PowerStacksAppInventory_CL') }
+                    catch { $Threw = $true; $_.Exception.Message | Should -Match 'Upload payload is too big' }
+                    $Threw | Should -Be ($Length -gt 943718) -Because "a body of $Length bytes"
+                }
+            }
+            finally { $script:AUMaxRowBytes = $Saved }
         }
 
         It 'accepts a body of exactly the limit and refuses one byte more, as version 19 did' {
@@ -812,5 +830,166 @@ Describe 'Send-AURunRows and Send-AUOutbox (D44, F50 to F53)' {
             $Flush.OutboxSkipped | Should -BeTrue
             Test-Path -LiteralPath $Planted | Should -BeTrue
         }
+    }
+}
+
+Describe 'The sender contract: Ok and Permanent (Task 17 follow-ups)' {
+    BeforeAll {
+        $script:RunB = '22222222-2222-4222-8222-222222222222'
+
+        # A sender in the inventory's contract: each call's outcome comes from $Outcomes in turn
+        # ('Ok', 'Fail', or 'Permanent'), then 'Ok'.
+        function New-TestContractSender([string[]]$Outcomes = @())
+        {
+            $State = [pscustomobject]@{ Bodies = (New-Object Collections.Generic.List[byte[]]); Calls = 0; Outcomes = $Outcomes }
+            $Block = {
+                param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType)
+                $State.Calls++
+                $State.Bodies.Add($Body)
+                $Outcome = 'Ok'
+                if ($State.Calls -le $State.Outcomes.Count) { $Outcome = $State.Outcomes[$State.Calls - 1] }
+                [pscustomobject]@{ Ok = ($Outcome -eq 'Ok'); Permanent = ($Outcome -eq 'Permanent') }
+            }.GetNewClosure()
+            return [pscustomobject]@{ State = $State; Block = $Block }
+        }
+
+        # Two runs waiting in the outbox, one row each: RunA first (older), then RunB.
+        function Save-TestTwoRuns
+        {
+            $Failing = New-TestSender -AlwaysFail
+            $Budget = 1
+            [void](Send-AURunRows -Rows (New-AURunRows -MainColumns (New-TestMain) -LogAPIMode 'LogIngestionAPI' -RunId $script:RunA) -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Failing.Block)
+            $First = Join-Path $script:Outbox "$($script:RunA)-1.json"
+            [IO.File]::SetLastWriteTimeUtc($First, [datetime]::UtcNow.AddMinutes(-10))
+            $Budget = 1
+            [void](Send-AURunRows -Rows (New-AURunRows -MainColumns (New-TestMain) -LogAPIMode 'LogIngestionAPI' -RunId $script:RunB) -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Failing.Block)
+            return [pscustomobject]@{ First = $First; Second = (Join-Path $script:Outbox "$($script:RunB)-1.json") }
+        }
+    }
+
+    BeforeEach {
+        $script:Outbox = Join-Path $TestDrive ("AppUsage_SN{0}_outbox" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+    }
+
+    It 'reads the sender''s last output: <Case>' -ForEach @(
+        @{ Case = 'true'; Output = { $true }; Ok = $true; Permanent = $false }
+        @{ Case = 'false'; Output = { $false }; Ok = $false; Permanent = $false }
+        @{ Case = 'Ok'; Output = { [pscustomobject]@{ Ok = $true; Permanent = $false } }; Ok = $true; Permanent = $false }
+        @{ Case = 'transient failure'; Output = { [pscustomobject]@{ Ok = $false; Permanent = $false } }; Ok = $false; Permanent = $false }
+        @{ Case = 'permanent rejection'; Output = { 'log line'; [pscustomobject]@{ Ok = $false; Permanent = $true } }; Ok = $false; Permanent = $true }
+        @{ Case = 'Ok wins over Permanent'; Output = { [pscustomobject]@{ Ok = $true; Permanent = $true } }; Ok = $true; Permanent = $false }
+        @{ Case = 'text'; Output = { '204 : Upload payload size is 1Kb' }; Ok = $false; Permanent = $false }
+        @{ Case = 'nothing'; Output = { }; Ok = $false; Permanent = $false }
+        @{ Case = 'a throw'; Output = { throw 'token request failed' }; Ok = $false; Permanent = $false }
+    ) {
+        $Send = Invoke-AUSend -Sender $Output -Body ([byte[]](1, 2)) -LogAPIMode 'LogIngestionAPI' -LogType 'PowerStacksAppInventory_CL'
+        $Send.Ok | Should -Be $Ok
+        $Send.Permanent | Should -Be $Permanent
+    }
+
+    It 'treats only a 4xx other than 408 and 429 as permanent' {
+        foreach ($Code in 400, 401, 403, 404, 413, 422) { Test-AUPermanentStatus $Code | Should -BeTrue -Because "$Code" }
+        foreach ($Code in 200, 204, 408, 429, 500, 502, 503, $null, '', 'x') { Test-AUPermanentStatus $Code | Should -BeFalse -Because "'$Code'" }
+    }
+
+    It 'discards an outbox row the service rejects permanently, without spending the retry budget' {
+        $Files = Save-TestTwoRuns
+        $Contract = New-TestContractSender @('Permanent')
+        $Budget = 1
+        $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Contract.State.Calls | Should -Be 2
+        $Flush.Discarded | Should -Be 1
+        $Flush.Sent | Should -Be 1
+        $Flush.Remaining | Should -Be 0
+        $Flush.PendingRows | Should -BeFalse
+        $Budget | Should -Be 1
+        Test-Path -LiteralPath $Files.First | Should -BeFalse
+        Test-Path -LiteralPath $Files.Second | Should -BeFalse
+    }
+
+    It 'still spends the budget, and keeps the row, on a transient failure' {
+        $Files = Save-TestTwoRuns
+        $Contract = New-TestContractSender @('Fail')
+        $Budget = 1
+        $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Contract.State.Calls | Should -Be 1
+        $Budget | Should -Be 0
+        $Flush.Discarded | Should -Be 0
+        $Flush.Remaining | Should -Be 2
+        $Flush.PendingRows | Should -BeTrue
+        Test-Path -LiteralPath $Files.First | Should -BeTrue
+    }
+
+    It 'saves this run''s permanently rejected row, so the next run tries it once more' {
+        $Contract = New-TestContractSender @('Permanent')
+        $Budget = 1
+        $Result = Send-AURunRows -Rows (New-AURunRows -MainColumns (New-TestMain) -LogAPIMode 'LogIngestionAPI' -RunId $script:RunA) -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Result.Saved | Should -Be 1
+        $Budget | Should -Be 0
+    }
+
+    It 'deletes a sent row that is read-only' {
+        $Files = Save-TestTwoRuns
+        [IO.File]::SetAttributes($Files.First, [IO.FileAttributes]::ReadOnly)
+        $Contract = New-TestContractSender
+        $Budget = 1
+        $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Flush.Remaining | Should -Be 0
+        Test-Path -LiteralPath $Files.First | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:Outbox -Force) | Should -BeNullOrEmpty
+    }
+
+    Context 'a sent row that cannot be deleted' {
+        BeforeEach {
+            $script:Files = Save-TestTwoRuns
+            $script:Blocked = $script:Files.First
+            Mock Remove-AUFileItem { if ($Path -eq $script:Blocked) { throw 'The process cannot access the file.' } else { [IO.File]::Delete($Path) } }
+        }
+
+        It 'is renamed to *.sent, is not pending, and is never sent again' {
+            $Contract = New-TestContractSender
+            $Budget = 1
+            $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+            $Flush.Sent | Should -Be 2
+            $Flush.Remaining | Should -Be 0
+            $Flush.PendingRows | Should -BeFalse
+            Test-Path -LiteralPath $script:Files.First | Should -BeFalse
+            Test-Path -LiteralPath "$($script:Files.First).sent" | Should -BeTrue
+            @(Get-AUOutboxFiles -OutboxDir $script:Outbox) | Should -BeNullOrEmpty
+
+            $Again = New-TestContractSender
+            $Budget = 1
+            $Next = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Again.Block
+            $Again.State.Calls | Should -Be 0
+            $Next.PendingRows | Should -BeFalse
+        }
+
+        It 'is swept with the leftover temp files, whatever its age' {
+            $Contract = New-TestContractSender
+            $Budget = 1
+            [void](Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block)
+            $script:Blocked = $null
+            Remove-AUStaleOutboxTemp -OutboxDir $script:Outbox | Should -Be 1
+            @(Get-ChildItem -LiteralPath $script:Outbox -Force) | Should -BeNullOrEmpty
+        }
+
+        It 'stays and counts as pending when it was not sent' {
+            Remove-AUOutboxFile -Path $script:Files.First | Should -BeFalse
+            Test-Path -LiteralPath $script:Files.First | Should -BeTrue
+            Test-Path -LiteralPath "$($script:Files.First).sent" | Should -BeFalse
+        }
+    }
+
+    It 'sends nothing and saves nothing without an outbox folder' {
+        $Contract = New-TestContractSender @('Fail')
+        $Budget = 1
+        $Flush = Send-AUOutbox -OutboxDir '' -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Flush.PendingRows | Should -BeFalse
+        $Flush.OutboxSkipped | Should -BeFalse
+        $Contract.State.Calls | Should -Be 0
+        $Result = Send-AURunRows -Rows (New-AURunRows -MainColumns (New-TestMain) -LogAPIMode 'LogIngestionAPI' -RunId $script:RunA) -OutboxDir '' -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Result.Pending | Should -Be 1
+        $Result.Saved | Should -Be 0
+        $Result.OutboxSkipped | Should -BeTrue
     }
 }

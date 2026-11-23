@@ -190,6 +190,7 @@ BeforeAll {
         $script:CollectUWPInventory = $false
         $script:MinFocusSecondsForUse = 1
         $script:ScriptVersion = '20 - test'
+        $script:LogAPIMode = 'LogIngestionAPI'
         $script:Discovery = New-TestDiscovery
         $script:Srum = New-TestSrum @((New-TestRow $script:UserA 'alpha.exe' 100))
         $script:Users = New-TestUsers
@@ -231,7 +232,7 @@ Describe 'Format-AUStatus and the status token list (F42)' {
     }
 
     It 'keeps first-seen order and gives a repeated token once' {
-        Format-AUStatus @('LedgerReset', 'CustomerMappingsAbsent', 'LedgerReset') | Should -BeExactly 'LedgerReset; CustomerMappingsAbsent'
+        Format-AUStatus @('LedgerReset', 'PendingRows', 'LedgerReset') | Should -BeExactly 'LedgerReset; PendingRows'
     }
 
     It 'throws for a token not on the list: <Token>' -ForEach @(
@@ -268,7 +269,7 @@ Describe 'Format-AUStatus and the status token list (F42)' {
             $Token.Contains(';') | Should -BeFalse
         }
         foreach ($Name in @('OK', 'UnsupportedOS', 'AppUsageBusy', 'ShadowCopyFailed', 'LedgerReset', 'LedgerWriteFailed', 'DiscoveryFailed', 'InvalidCustomerMappings',
-                'CustomerMappingsAbsent', 'PendingRows', 'OutboxSkipped', 'AppUsageFailed', 'MsiFileMapFailed', 'skipped'))
+                'AppUsageFailed:Serial', 'AppUsageFailed:OsBuild', 'PendingRows', 'OutboxSkipped', 'AppUsageFailed', 'MsiFileMapFailed', 'skipped'))
         {
             $script:AUStatusTokens | Should -Contain $Name
         }
@@ -301,6 +302,20 @@ Describe 'The embedded mappings markers (F43)' {
     }
 }
 
+Describe 'Get-AUSerial' {
+    It 'returns the trimmed serial, blank when the BIOS has none, and $null when it cannot be read' {
+        Mock Get-CimInstance { [pscustomobject]@{ SerialNumber = ' SN-123 ' } }
+        Get-AUSerial | Should -BeExactly 'SN-123'
+        Mock Get-CimInstance { [pscustomobject]@{ SerialNumber = '   ' } }
+        Get-AUSerial | Should -BeExactly ''
+        Mock Get-CimInstance { throw 'WMI is broken' }
+        Get-AUSerial | Should -BeNullOrEmpty
+        $null -eq (Get-AUSerial) | Should -BeTrue
+        Mock Get-CimInstance { }
+        $null -eq (Get-AUSerial) | Should -BeTrue
+    }
+}
+
 Describe 'Get-AUOsBuild and Get-AULanguageMode (F40)' {
     It 'reads the build number and the language mode' {
         Get-AUOsBuild | Should -BeGreaterThan 0
@@ -325,6 +340,35 @@ Describe 'Invoke-AppUsage skips' {
         $Result.DeviceColumns['AppUsageEnabled_b'] | Should -BeTrue
     }
 
+    It 'reports AppUsageFailed:OsBuild, not UnsupportedOS, when the build number cannot be read' {
+        Mock Get-AUOsBuild { 0 }
+        $Result = Invoke-AppUsage -RunId $script:Run
+        $Result.Status | Should -BeExactly 'AppUsageFailed:OsBuild'
+        Should -Invoke New-AUSnapshot -Times 0 -Exactly
+        Should -Invoke Invoke-AUWithLock -Times 0 -Exactly
+        $Result.DeviceColumns['AppUsageCollectionStatus_s'] | Should -BeExactly 'AppUsageFailed:OsBuild'
+    }
+
+    It 'reports AppUsageFailed:Serial and skips when the serial number cannot be read' {
+        Mock Get-AUSerial { $null }
+        $Before = [IO.File]::ReadAllBytes($script:LedgerPath)
+        $Result = Invoke-AppUsage -RunId $script:Run
+        $Result.Status | Should -BeExactly 'AppUsageFailed:Serial'
+        Should -Invoke Get-AULedgerPath -Times 0 -Exactly
+        Should -Invoke Invoke-AUWithLock -Times 0 -Exactly
+        $Result.LedgerPath | Should -BeNullOrEmpty
+        $Result.OutboxPath | Should -BeNullOrEmpty
+        [IO.File]::ReadAllBytes($script:LedgerPath) | Should -Be $Before
+    }
+
+    It 'names the ledger after the computer name when the serial is blank (F44)' {
+        Mock Get-AUSerial { '' }
+        $Result = Invoke-AppUsage -RunId $script:Run -ComputerName 'PC-BLANK'
+        $Result.Status | Should -BeExactly 'OK'
+        Should -Invoke Get-AULedgerPath -Times 1 -Exactly -ParameterFilter { $Serial -eq '' -and $ComputerName -eq 'PC-BLANK' }
+        $Result.OutboxPath | Should -Match 'AppUsage_PC-BLANK_outbox$'
+    }
+
     It 'reports the language mode and skips before the OS check (D37)' {
         Mock Get-AULanguageMode { 'ConstrainedLanguage' }
         $Result = Invoke-AppUsage -RunId $script:Run
@@ -337,8 +381,7 @@ Describe 'Invoke-AppUsage skips' {
     }
 
     It 'skips in a real Constrained Language session, with one result and its device columns' {
-        # The region's own constants fail to load in this mode (D37 covers the whole script); the
-        # functions still load, and Invoke-AppUsage must build its result from plain types only.
+        # Invoke-AppUsage must build its result from plain types only in this mode.
         $Region = Join-Path $TestDrive 'clm-region.ps1'
         [IO.File]::WriteAllText($Region, $AURegionText)
         $Child = Join-Path $TestDrive 'clm-child.ps1'
@@ -346,7 +389,9 @@ Describe 'Invoke-AppUsage skips' {
 `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'
 function Write-CMTraceLog { param (`$Message, `$Component, `$Type) }
 `$ScriptVersion = 'clm'
-. '$Region' 2>`$null
+`$LogAPIMode = 'LogIngestionAPI'
+`$LoadRecords = @(. '$Region' *>&1)
+"loadrecords=`$(`$LoadRecords.Count)"
 `$All = @(Invoke-AppUsage -RunId '$($script:Run)' *>&1)
 "outputs=`$(`$All.Count)"
 "status=`$(`$All[0].Status)"
@@ -354,6 +399,8 @@ function Write-CMTraceLog { param (`$Message, `$Component, `$Type) }
 "runid=`$(`$All[0].RunId)"
 "@)
         $Lines = @(& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Child 2>&1 | ForEach-Object { "$_" })
+        # The region itself loads cleanly in this mode: no error record or other output.
+        $Lines | Should -Contain 'loadrecords=0'
         $Lines | Should -Contain 'outputs=1'
         $Lines | Should -Contain 'status=LanguageMode:ConstrainedLanguage; skipped'
         $Lines | Should -Contain 'column=LanguageMode:ConstrainedLanguage; skipped'
@@ -473,7 +520,8 @@ Describe 'Invoke-AppUsage results' {
     }
 
     It 'names the device columns without suffixes for the classic API' {
-        $Result = Invoke-AppUsage -RunId $script:Run -LogAPIMode 'DataCollectorAPI'
+        $script:LogAPIMode = 'DataCollectorAPI'
+        $Result = Invoke-AppUsage -RunId $script:Run
         @($Result.DeviceColumns.Keys) | Should -Contain 'AppUsageCollectionStatus'
         @($Result.DeviceColumns.Keys) | Should -Not -Contain 'AppUsageCollectionStatus_s'
     }
@@ -538,7 +586,6 @@ Describe 'Invoke-AppUsage results' {
     }
 
     It 'reports the customer file: <Case>' -ForEach @(
-        @{ Case = 'absent'; Token = 'CustomerMappingsAbsent'; Setup = { Remove-Item -LiteralPath $script:CustomerPath } }
         @{ Case = 'invalid'; Token = 'InvalidCustomerMappings'; Setup = { [IO.File]::WriteAllText($script:CustomerPath, '{ not json') } }
         @{ Case = 'too large'; Token = 'InvalidCustomerMappings:TooLarge'; Setup = { [IO.File]::WriteAllText($script:CustomerPath, (' ' * 1048577)) } }
         @{ Case = 'unsafe path'; Token = 'InvalidCustomerMappings:UnsafePath'; Setup = { $script:AppUsageCustomerMappingsPath = 'relative\customer-mappings.json' } }
@@ -548,6 +595,15 @@ Describe 'Invoke-AppUsage results' {
         Get-TestTokens $Result | Should -Contain $Token
         $Result.ExeEntries | Should -Not -BeNullOrEmpty
         $Result.DeviceColumns['CustomerMappingsHash_s'] | Should -BeExactly ''
+    }
+
+    It 'reports OK when there is no customer file: the blank hash says so' {
+        Remove-Item -LiteralPath $script:CustomerPath
+        $Result = Invoke-AppUsage -RunId $script:Run
+        $Result.Status | Should -BeExactly 'OK'
+        $Result.ExeEntries | Should -Not -BeNullOrEmpty
+        $Result.DeviceColumns['CustomerMappingsHash_s'] | Should -BeExactly ''
+        $Result.DeviceColumns['AppUsageCollectionStatus_s'] | Should -BeExactly 'OK'
     }
 
     It 'reports LedgerReset for an unreadable ledger' {
@@ -660,6 +716,18 @@ Describe 'Invoke-AppUsage and SRUM (F10, F35, carries)' {
         @($script:Merged.Rows).Count | Should -Be 1
         $script:Merged.Lowest | Should -Be 50
         Should -Invoke Get-AUInstalledApps -Times 1 -Exactly -ParameterFilter { -not $IncludeStore }
+    }
+
+    It 'skips a blank AutoIncId when it finds the read''s lowest ID' {
+        $Blank = New-TestRow $script:UserA 'alpha.exe' 1
+        $Blank.AutoIncId = ''
+        $Spaces = New-TestRow $script:UserA 'alpha.exe' 1
+        $Spaces.AutoIncId = '  '
+        $script:Srum = New-TestSrum @((New-TestRow $script:UserA 'alpha.exe' 200), $Blank, (New-TestRow $script:UserA 'alpha.exe' 150), $Spaces)
+        $script:Merged = $null
+        Mock Merge-AUSrumRecords { $script:Merged = [pscustomobject]@{ Rows = $Rows; Lowest = $LowestAutoIncId } }
+        $null = Invoke-AppUsage -RunId $script:Run
+        $script:Merged.Lowest | Should -Be 150
     }
 
     It 'passes Store and MSIX rows and discovery on when Store inventory is on (D46)' {

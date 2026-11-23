@@ -2,6 +2,32 @@
 
 App Usage (software metering) records which installed apps people actually use, from the Windows System Resource Usage Monitor (SRUM). It's off by default. To turn it on, set `$CollectAppMetering = $true` in `Intune_Windows_Inventory.ps1`.
 
+## Turn On App Usage
+
+App Usage runs only where it's supported. On any other device, the inventory runs as before, and App Usage reports why it skipped in `AppUsageCollectionStatus_s`.
+
+- **Windows:** Windows 11 25H2 (build 26200) or later. Windows 10 and earlier Windows 11 releases report `UnsupportedOS`.
+- **PowerShell:** 64-bit Windows PowerShell 5.1, running as SYSTEM, the way Intune runs the script. In Constrained Language mode, for example under an application control policy, App Usage reports `LanguageMode:ConstrainedLanguage; skipped`.
+
+Before you turn it on:
+
+1. Install the BI for Intune release that reads split runs. With App Usage on, a large device can send its App Inventory data as several rows (see [How the Data Is Sent](#how-the-data-is-sent)), and earlier releases don't read those rows.
+1. Add the App Usage columns to the `PowerStacksAppInventory_CL` table and its data collection rule.
+1. Wait 30 minutes after the data collection rule changes. A change reaches the service's ingestion points unevenly, and a row that arrives before the change has reached them all can lose its run columns. Reports ignore that row and its run.
+
+Then set `$CollectAppMetering = $true` in `Intune_Windows_Inventory.ps1` and deploy the script as before.
+
+These settings, at the top of the script, control App Usage:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `$CollectAppMetering` | `$false` | Turns App Usage on. |
+| `$CollectUWPInventory` | `$false` | The existing Store app inventory setting. Store and MSIX apps are discovered, and their usage collected, only when it's `$true`, so their inventory and usage are on or off together. |
+| `$MinFocusSecondsForUse` | `1` | How many seconds of focus or input count as use. |
+| `$AppUsageCustomerMappingsPath` | `C:\ProgramData\PowerStacks\AppUsage\customer-mappings.json` | Where the script looks for your mapping rules. |
+
+To turn App Usage off, set `$CollectAppMetering = $false`. The next run sends exactly the App Inventory row it sent before App Usage, and the usage history stays on the device. If you also roll back the data collection rule, change the script first and the rule only after devices stop sending App Usage rows.
+
 ## Usage History on the Device
 
 SRUM keeps only about 30 to 60 days of usage, so the script keeps its own history on each device, in `C:\Windows\AppUsage_<Serial>.json`. `<Serial>` is the device's serial number, with any character that isn't allowed in a file name replaced by `_`. When the device reports no serial number, the computer name is used instead. The file holds each user's usage of each executable build. Each run adds the usage SRUM recorded since the last run. SRUM records the script has already counted add nothing when they're read again, and usage moves into the history once SRUM drops it, so the history outlasts SRUM.
@@ -129,7 +155,67 @@ Each row gets the script's usual upload retries. A row that still fails is saved
 - A run spends one round of retries in total. Once a row still fails after its retries, every row left to send, saved or new, waits in the folder for the next run. A network or service outage costs one round of retries, not one for each row.
 - The folder keeps the rows of the 5 most recent runs. Once every row of a newer run is sent, the saved rows of older runs are deleted, because the newer run replaces them.
 - While rows wait, row 1's `AppUsageCollectionStatus_s` includes `PendingRows`. The status is set after the saved rows are sent, so a run that empties the folder doesn't report it.
+- A row the service rejects outright, with an HTTP 4xx error other than 408 (request timeout) or 429 (too many requests), can't succeed later. A saved row rejected that way is deleted without using the run's retries, and the run goes on to the next row. A new row rejected that way is saved like any other, so the next run tries it once more.
+- A saved row that was sent but can't be deleted is renamed to `<RunId>-<RowIndex>.json.sent`, so it's never sent again, and a later run deletes it.
+- Two inventory runs never use the folder at the same time. A run that finds another run using it for 60 seconds sends its own rows without the folder and reports `OutboxSkipped`; any of its rows that fail are lost.
 - When App Usage is off, the folder stays on the device and its rows aren't sent.
+
+## Device Columns
+
+Row 1 of every run with App Usage on carries these columns, next to the App Inventory columns:
+
+| Column | Meaning |
+|---|---|
+| `AppUsageEnabled_b` | `true`: App Usage was on for this run. |
+| `WatchingSince_t` | The earliest usage App Usage has for the device, in UTC. Blank until the device has some. |
+| `AppUsageScriptVersion_s` | The script version. |
+| `MappingsVersion_s` | The version of the PowerStacks mapping rules built into the script. Blank when App Usage skipped before it loaded them. |
+| `CustomerMappingsHash_s` | The SHA-256 of the customer mapping file the run used. Blank when there's no file or it's invalid. |
+| `UnmatchedExeCount_d` | How many executables no rule matched. Executables that ignore rules match aren't counted. |
+| `ProfilesFound_d`, `ProfilesRead_d` | How many profiles Windows lists, and how many the script read. The difference is the coverage gap. |
+| `AppUsageCollectionStatus_s` | `OK`, or what went wrong. See [Collection Status](#collection-status). |
+
+## Collection Status
+
+`AppUsageCollectionStatus_s` is `OK` when there's nothing to report. Otherwise it lists problems as tokens in the form `Token` or `Token:detail`, separated by `; `, for example `SrumReadFailed:EsentMissing; ProfileUnread:1`. No App Usage problem stops or changes the inventory: when App Usage skips or fails, the App Inventory data is still sent, with its usage fields blank.
+
+| Token | Meaning |
+|---|---|
+| `OK` | Nothing to report. |
+| `UnsupportedOS` | Windows is older than Windows 11 25H2 (build 26200). App Usage skipped. |
+| `LanguageMode:<mode>; skipped` | PowerShell isn't in Full Language mode, for example `LanguageMode:ConstrainedLanguage; skipped`. App Usage skipped. |
+| `AppUsageFailed:OsBuild` | The Windows build number couldn't be read. App Usage skipped. |
+| `AppUsageFailed:Serial` | The serial number couldn't be read, so the usage history can't be named. App Usage skipped. A device with no serial number uses its computer name instead and isn't affected. |
+| `MappingsUnavailable:Missing` | The PowerStacks mapping rules aren't in the script. App Usage skipped. |
+| `MappingsUnavailable:Invalid` | The PowerStacks mapping rules in the script didn't load. App Usage skipped. |
+| `AppUsageBusy` | Another inventory run on the device held the App Usage lock for 60 seconds. App Usage skipped this run. |
+| `AppUsageFailed` | An unexpected error. The script log has the details. The usage fields are blank for this run. |
+| `ShadowCopyFailed` | No shadow copy of the system drive could be taken. App Usage skipped. |
+| `SrumReadFailed:WorkDirUntrusted` | The work folder `C:\Windows\PowerStacksAppUsage` isn't a folder that only SYSTEM and administrators control, so the script left it alone and App Usage skipped. Delete the folder as an administrator; the next run creates it again. |
+| `SrumReadFailed:<reason>` | The SRUM database couldn't be read this run, so no new usage was added. The history on the device is unchanged. The reason is `CopyFailed`, `EsentMissing`, `NoDatabase`, `LiveDatabase`, `HeaderFailed`, `RepairFailed`, `OpenFailed`, `IdMapFailed`, `NoTimeline`, `TimelineFailed`, `ReadFailed`, or `NoRows` (the read worked but held no usage). |
+| `LedgerReset` | The usage history on the device couldn't be read. It was renamed and a new one started. |
+| `LedgerWriteFailed` | The usage history couldn't be saved. The earlier file is unchanged, and this run's results were still sent. |
+| `DiscoveryFailed` | The all-profile app read was incomplete, so the App Inventory used the earlier read: the device's apps and the signed-in user's apps. |
+| `ProfileUnread:<count>` | How many profiles couldn't be read. Their apps are never `NotInstalled`. |
+| `HiveUnloadFailed:<count>` | How many copied user hives were still loaded at the end of the run. |
+| `MsiFileMapFailed` | The Windows Installer component records couldn't be read, so they didn't help match executables to apps. |
+| `InvalidCustomerMappings` | The customer mapping file isn't valid, so it was ignored this run. With `:TooLarge`, it's over 1 MB. With `:UnsafePath` or `:ReparsePoint`, its path was refused. |
+| `PendingRows` | Rows from an earlier run are still waiting to be sent. See [Rows That Fail to Send](#rows-that-fail-to-send). |
+| `OutboxSkipped` | The folder for unsent rows couldn't be used this run, so rows that weren't sent may be lost. |
+
+A device without a customer mapping file reports `OK`; its blank `CustomerMappingsHash_s` shows that it has none.
+
+## Script Output and Exit Code
+
+App Usage writes nothing to the console. The script's only output is still the one-line upload summary that Intune shows in its output column, for example:
+
+```text
+InventoryDate: 11-23 02:10 DeviceInventory: OK 204 : Upload payload size is 12.4Kb  AppInventory: OK 204 : Upload payload size is 41.2Kb (1 row)  DriverInventory: OK 204 : Upload payload size is 30.1Kb
+```
+
+With App Usage on, the App Inventory part reports `OK` only when every row of the run was sent, with the total size and the number of rows, and `Fail` otherwise. App Usage adds nothing else to the line. Its result is in `AppUsageCollectionStatus_s` and the script log.
+
+App Usage never changes the script's exit code: a run whose inventory succeeds exits the same way whether App Usage worked or not.
 
 ## Mapping Rules
 
@@ -408,7 +494,7 @@ Run both scripts in 64-bit PowerShell, and leave **Run this script using the log
 
 A missing or invalid file never stops inventory collection.
 
-- **Absent:** the run uses PowerStacks rules only. Executables that your rules matched before are matched again from PowerStacks rules on that run. The run reports `CustomerMappingsAbsent`, and `CustomerMappingsHash_s` is blank, so a delivery that didn't arrive shows in reports.
+- **Absent:** the run uses PowerStacks rules only. Executables that your rules matched before are matched again from PowerStacks rules on that run. `CustomerMappingsHash_s` is blank, so a delivery that didn't arrive shows in reports. A missing file isn't a problem on its own, so the run's status stays `OK`.
 - **Invalid or larger than 1 MB:** the script ignores the whole file for that run; it never uses part of a file. Executables that already have a target keep it, including targets from your rules, so a typo doesn't move apps back to PowerStacks matches. New executables match on PowerStacks rules until a valid file arrives. The run reports `InvalidCustomerMappings`, and `CustomerMappingsHash_s` is blank.
 
 Usage keeps accumulating either way.

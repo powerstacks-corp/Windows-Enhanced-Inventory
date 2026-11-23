@@ -192,3 +192,13 @@ Describe 'Open-AULockMutex' {
         finally { $Mutex.Dispose() }
     }
 }
+
+Describe 'Invoke-AUWithLock -Name' {
+    It 'takes the run lock by default, and the outbox lock when named' {
+        $script:Opened = New-Object System.Collections.Generic.List[string]
+        Mock Open-AULockMutex { $script:Opened.Add($Name); New-Object System.Threading.Mutex($false) }
+        (Invoke-AUWithLock -Body { 'default' } -TimeoutSeconds 1).Result | Should -BeExactly 'default'
+        (Invoke-AUWithLock -Name $script:AUOutboxLockName -Body { 'outbox' } -TimeoutSeconds 1).Result | Should -BeExactly 'outbox'
+        $script:Opened.ToArray() | Should -Be @('Global\PowerStacksAppUsage', 'Global\PowerStacksAppUsageOutbox')
+    }
+}
