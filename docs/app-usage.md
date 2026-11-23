@@ -178,7 +178,7 @@ The installed apps (`InstalledApps1_s` to `InstalledApps10_s`) and the executabl
 
 To rebuild a list, take its pieces from every row of the run, ordered by `RowIndex_d` and then by column number, join them, and decode them as before. A run is complete when all `RowCount_d` rows with its `RunId_g` are present. Reports use each device's latest complete run and never show part of a run. Rows 2 and on aren't devices, so a query that takes each device's latest row has to take its latest complete run instead.
 
-Turning App Usage on requires the BI for Intune release that reads split runs. When App Usage is off, the script sends exactly the row it always sent, with no run columns.
+Turning App Usage on requires the BI for Intune release that reads split runs. When App Usage is off, the script sends the same App Inventory row as version 19, with no run columns, minus one empty entry: version 19 added an entry with a blank name and the `Win32` type, made from its own log lines. Version 20 also no longer sends the driver inventory entries with every field blank that version 19 made the same way.
 
 ### Rows That Fail to Send
 
