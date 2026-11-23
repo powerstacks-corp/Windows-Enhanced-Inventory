@@ -8,7 +8,7 @@ The script provides granular control over the type of inventory collected, inclu
 
 For implementation guidance and integration with the BI for Intune reporting solution, refer to the documentation below.
 
-🔗 [Windows Inventory Collection Script – PowerStacks BI for Intune Documentation](https://docs.powerstacks.com/bi-for-intune/installation/custom-inventory/windows-inventory-collection-script/)
+[Windows Inventory Collection Script: PowerStacks BI for Intune Documentation](https://docs.powerstacks.com/bi-for-intune/installation/custom-inventory/windows-inventory-collection-script/)
 
 ## Features
 
@@ -41,13 +41,13 @@ For implementation guidance and integration with the BI for Intune reporting sol
 
 `$LogAPIMode` (top of the script) selects how data reaches Log Analytics:
 
-- **`DataCollectorAPI`** – the legacy HTTP Data Collector API (workspace ID + shared key).
-- **`LogIngestionAPI`** (recommended) – the modern Logs Ingestion API, posting to a Data Collection Endpoint (DCE) / Data Collection Rule (DCR).
+- **`DataCollectorAPI`**: the legacy HTTP Data Collector API (workspace ID + shared key).
+- **`LogIngestionAPI`** (recommended): the modern Logs Ingestion API, posting to a Data Collection Endpoint (DCE) / Data Collection Rule (DCR).
 
 Under `LogIngestionAPI`, the token used to post to the DCR can be obtained two ways:
 
 1. **Client secret (classic).** An Entra app registration client id + secret embedded in the script (`$ClientId` / `$ClientSecret`). Simple, but every device carries a reusable secret.
-2. **PowerStacks Entra Token Broker (secretless, recommended).** When `$BrokerUrl` is set, the device authenticates to the broker with its **Entra Join certificate** (mutual TLS), receives a short-lived signed assertion, and exchanges it for the inventory managed identity's token — **no secret on the device and no relay hop**. The upload to the DCR is otherwise identical.
+2. **PowerStacks Entra Token Broker (secretless, recommended).** When `$BrokerUrl` is set, the device authenticates to the broker with its **Entra Join certificate** (mutual TLS), receives a short-lived signed assertion, and exchanges it for the inventory managed identity's token, with **no secret on the device and no relay hop**. The upload to the DCR is otherwise identical.
 
 ### Broker settings
 
@@ -59,7 +59,7 @@ Under `LogIngestionAPI`, the token used to post to the DCR can be obtained two w
 Precedence: if `$BrokerUrl` is set it is used; otherwise the script falls back to `$ClientId` / `$ClientSecret`. `$TenantId`, `$DceURI`, and `$DcrImmutableId` are required in both cases.
 
 Requirements for broker mode:
-- The device must be **Entra joined** (or hybrid-joined) and the script must run as **SYSTEM / elevated** — the Entra Join certificate's private key is TPM-bound and machine-scoped.
+- The device must be **Entra joined** (or hybrid-joined) and the script must run as **SYSTEM / elevated**, because the Entra Join certificate's private key is TPM-bound and machine-scoped.
 - The broker's inventory managed identity must hold **Monitoring Metrics Publisher** on the target DCR.
 
 ```powershell
@@ -75,9 +75,9 @@ $BrokerClientId = "<inventoryIdentityClientId>"
 
 ## Usage
 
-```powershell
-.\InventoryCollector.ps1 -CustomerId "<YourWorkspaceID>" -SharedKey "<YourPrimaryKey>"
-```
+Set the variables at the top of `Intune_Windows_Inventory.ps1`, and then deploy it. With Intune, deploy it as the detection script of a remediation that runs as SYSTEM in 64-bit PowerShell, once a day.
+
+**Deploy the release build, not the file in this repository.** Download `Intune_Windows_Inventory.ps1` from a release of this repository. The file in the repository is the source: it's over the 512 KB size limit Intune puts on a remediation script, and it doesn't have the PowerStacks App Usage mapping rules built in. PowerStacks makes the release build from it with `Build-InventoryRelease.ps1`, which builds the rules in and removes the comments inside functions. Each release also has `Test-AppUsageMappings.ps1` and `customer-mappings.example.json`; keep them with the script. See [What a Release Contains](docs/app-usage.md#what-a-release-contains).
 
 ### Optional Vendor Configuration
 
@@ -105,12 +105,20 @@ The script prints one line, the upload summary, with each table's result and pay
 
 App Usage (software metering) records which installed apps people actually use, from the Windows System Resource Usage Monitor (SRUM), and adds that to the App Inventory data in `PowerStacksAppInventory_CL`. It's off by default. [docs/app-usage.md](docs/app-usage.md) covers it in full: what it reports, every field and status token, and the mapping rules.
 
-- **Turn it on:** set `$CollectAppMetering = $true`. First install the BI for Intune release that reads split runs, add the App Usage columns to the `PowerStacksAppInventory_CL` table and its data collection rule, and wait 30 minutes after the rule changes before devices send App Usage rows.
+- **Turn it on:** set `$CollectAppMetering = $true` in the release build, after these steps, in order:
+  1. Install the BI for Intune release that reads split runs.
+  1. Add the App Usage columns to the `PowerStacksAppInventory_CL` table and its data collection rule with `Update-PowerStacksAppInventorySchema.ps1` from the `postdeploy` folder of [EnhancedInventoryDeploy](https://github.com/powerstacks-corp/EnhancedInventoryDeploy). Until it reaches the main branch, the updater is on the repository's release branch, `release/app-usage-v1`. [Add the App Usage columns to an existing deployment](https://github.com/powerstacks-corp/EnhancedInventoryDeploy/blob/release/app-usage-v1/README.md#add-the-app-usage-columns-to-an-existing-deployment) has the steps, the backup, and the rollback.
+  1. Wait the full 30 minutes after the data collection rule changes. Until the change reaches the whole service, uploads still succeed, but rows can lose the new columns without any error.
+  1. Deploy the release build (see [Usage](#usage)), not the file in this repository.
 - **Supported devices:** Windows 11 25H2 (build 26200) or later, in 64-bit Windows PowerShell 5.1 as SYSTEM. On other devices App Usage skips and reports why (for example `UnsupportedOS`); the inventory runs as before.
-- **Store apps:** Store and MSIX app usage follows `$CollectUWPInventory`. It's collected only when Store app inventory is.
+- **Application control:** on devices that enforce App Control for Business (WDAC) script rules, some customers might need to sign the script. In Constrained Language Mode, App Usage is skipped, and the script behaves as version 19 does in that mode; the script log records `LanguageMode:ConstrainedLanguage; skipped`. See [Application Control](docs/app-usage.md#application-control).
+- **Privacy:** usage reporting is activity monitoring, and some organizations need approval first, for example from a works council. Everyone with access to the BI for Intune app sees all of its data, because template apps don't support row-level security. The data sent counts users and never names them. See [Privacy](docs/app-usage.md#privacy).
+- **Store apps:** Store and MSIX app usage follows `$CollectUWPInventory`, which is off by default. It's collected only when Store app inventory is.
 - **Expanded inventory:** with App Usage on, the App Inventory lists the installed apps of every profile on the device, including users who aren't signed in, still one entry per app name with the newest version. If that read fails on a run, the run uses the earlier read.
+- **Mapping rules:** PowerStacks rules are built into the release build. Your own rules go in a separate `customer-mappings.json` that you deliver to devices yourself; your rules always win. Check the file with `Test-AppUsageMappings.ps1` before you deploy it, and use `CustomerMappingsHash_s` to see which devices have it. See [Mapping Rules](docs/app-usage.md#mapping-rules).
 - **Status:** each run reports `AppUsageCollectionStatus_s`: `OK`, or tokens such as `SrumReadFailed:EsentMissing; ProfileUnread:1`. The full list, with what each one means, is in [Collection Status](docs/app-usage.md#collection-status).
-- **On the device:** the usage history is in `C:\Windows\AppUsage_<Serial>.json`, unsent rows wait in `C:\Windows\AppUsage_<Serial>_outbox\`, and the work folder is `C:\Windows\PowerStacksAppUsage`. Only SYSTEM and administrators can open them. If the work folder was made by someone else, App Usage reports `SrumReadFailed:WorkDirUntrusted` and skips; delete `C:\Windows\PowerStacksAppUsage` as an administrator, and the next run creates it again.
+- **On the device:** the usage history is in `C:\Windows\AppUsage_<Serial>.json`, unsent rows wait in `C:\Windows\AppUsage_<Serial>_outbox\`, and the work folder is `C:\Windows\PowerStacksAppUsage`. Only SYSTEM and administrators can open them. If the work folder isn't one the script made with those permissions, even one an administrator made, App Usage reports `SrumReadFailed:WorkDirUntrusted` and skips on every run until an administrator deletes `C:\Windows\PowerStacksAppUsage`. The next run creates it again.
+- **Locks:** App Usage and its unsent rows each use a lock, `Global\PowerStacksAppUsage` and `Global\PowerStacksAppUsageOutbox`. Any process on the device can hold one. A run that can't get a lock within 60 seconds reports `AppUsageBusy` or `OutboxSkipped`.
 - **No effect on the inventory:** no App Usage problem stops or changes the inventory, its exit code, or the one-line summary, apart from the App Inventory part reporting `OK` only when every row of the run was sent. With App Usage off, the script sends exactly the App Inventory row it sent before.
 
 ## Requirements
