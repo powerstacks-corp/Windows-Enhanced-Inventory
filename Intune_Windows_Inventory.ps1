@@ -8627,7 +8627,7 @@ if ($CollectAppInventory)
     Write-CMTraceLog "Compressing app inventory JSON with GZip and splitting it into chunks..."
     try
     {
-        $InstalledAppJsonArr = @(ConvertTo-AUChunks -Json $InstalledAppJson -ChunkSize $(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744}))
+        $InstalledAppJsonArr = ConvertTo-AUChunks -Json $InstalledAppJson -ChunkSize $(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})
         $InstalledAppBase64Length = 0
         foreach ($InstalledApp in $InstalledAppJsonArr) { $InstalledAppBase64Length += $InstalledApp.Length }
         Write-CMTraceLog "App inventory compressed successfully, Base64 size: $InstalledAppBase64Length characters"

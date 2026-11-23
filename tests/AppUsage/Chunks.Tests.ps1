@@ -5,7 +5,8 @@ Describe 'ConvertTo-AUChunks' {
         # Version 19's inline InstalledApps sequence, copied as the reference (F32): GZip with the
         # default level, a default StreamWriter (UTF-8, no BOM), Base64, then the regex split with the
         # empty strings between captures dropped, as the column loop did.
-        function Invoke-V19Chunks([string]$InstalledAppJson, [int]$ChunkSize)
+        # Untyped, as in version 19, so a null list reaches $sw.Write($null) as it did there.
+        function Invoke-V19Chunks($InstalledAppJson, [int]$ChunkSize)
         {
             $ms = New-Object System.IO.MemoryStream
             $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
@@ -152,23 +153,164 @@ Describe 'ConvertTo-AUChunks' {
     }
 }
 
-Describe 'Version 19 InstalledApps path' {
+Describe 'InstalledApps upload with metering off (F32)' {
     BeforeAll {
+        # The script's own InstalledApps sequence, from compression to the upload JSON, taken from the
+        # script text as written and run with a recording logger.
         $Text = [IO.File]::ReadAllText((Resolve-Path "$PSScriptRoot\..\..\Intune_Windows_Inventory.ps1").Path)
-        $Start = $Text.IndexOf("Write-CMTraceLog 'Converting app array to JSON...'")
-        $End = $Text.IndexOf('Write-CMTraceLog "Converting main app object to JSON for upload..."')
-        $script:InlinePath = $Text.Substring($Start, $End - $Start)
+        $Start = $Text.IndexOf('    Write-CMTraceLog "Compressing app inventory JSON with GZip')
+        $End = -1
+        if ($Start -ge 0) { $End = $Text.IndexOf('    # Submit the data to the API endpoint', $Start) }
+        if ($Start -lt 0 -or $End -lt 0) { throw 'InstalledApps sequence not found in the script.' }
+        $script:ScriptSequence = $Text.Substring($Start, $End - $Start)
+
+        # Version 19's sequence, copied verbatim from 457bc6f (Intune_Windows_Inventory.ps1:8578-8636).
+        $script:V19Sequence = @'
+    Write-CMTraceLog "Compressing app inventory JSON with GZip..."
+    try
+    {
+        $ms = New-Object System.IO.MemoryStream
+        $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
+        $sw = New-Object System.IO.StreamWriter($cs)
+        $sw.Write($InstalledAppJson)
+        $sw.Close()
+        $InstalledAppJson = [System.Convert]::ToBase64String($ms.ToArray())
+        Write-CMTraceLog "App inventory compressed successfully, Base64 size: $($InstalledAppJson.Length) characters"
+    }
+    catch
+    {
+        Write-CMTraceLog "Error compressing app inventory: $($_.Exception.Message)" -ErrorMsg
+        throw
     }
 
-    It 'compresses and splits with ConvertTo-AUChunks, the one copy (F32)' {
-        $script:InlinePath | Should -Match 'ConvertTo-AUChunks -Json \$InstalledAppJson'
-        $script:InlinePath | Should -Not -Match 'GZipStream'
-        $script:InlinePath | Should -Not -Match '-split'
+    Write-CMTraceLog "Building main app upload object..."
+    $MainApp = New-Object -TypeName PSObject
+    $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
+    $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
+
+    Write-CMTraceLog "Splitting app inventory into chunks..."
+    $InstalledAppJsonArr = $InstalledAppJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
+    $i = 0
+    foreach ($InstalledApp in $InstalledAppJsonArr)
+    {
+        if ($InstalledApp.Length -gt 0 )
+        {
+            $i++
+            $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $InstalledApp -Force
+        }
+    }
+    Write-CMTraceLog "App inventory split into $i chunk(s)"
+
+    if ($InstalledAppJson.Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+            {
+                10 * 63 * 1024
+            }
+            else
+            {
+                10 * 31 * 1024
+            }))
+    {
+        $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "Kb"
+        Write-CMTraceLog $errorMsg -ErrorMsg
+        throw($errorMsg)
     }
 
-    It 'keeps the more-than-10-chunks throw' {
-        $script:InlinePath | Should -Match ([regex]::Escape('10 * 63 * 1024'))
-        $script:InlinePath | Should -Match ([regex]::Escape('10 * 31 * 1024'))
-        $script:InlinePath | Should -Match 'throw\(\$errorMsg\)'
+    Write-CMTraceLog "Converting main app object to JSON for upload..."
+    $AppJson = if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        "[$($MainApp | ConvertTo-Json -Compress)]"
+    }
+    else
+    {
+        $MainApp | ConvertTo-Json
+    }
+    Write-CMTraceLog "Final app JSON payload size: $($AppJson.Length) characters"
+
+'@
+
+        # Runs a sequence in its own scope with a recording logger. Returns the upload JSON, the
+        # column names, the Base64-size and too-big log lines, and the error message, if any.
+        function Invoke-Sequence([string]$Sequence, $InstalledAppJson, [string]$LogAPIMode)
+        {
+            $Prologue = @'
+param ($InstalledAppJson, $LogAPIMode)
+$Log = New-Object System.Collections.Generic.List[string]
+function Write-CMTraceLog { param ([string]$Message, [switch]$ErrorMsg) $Log.Add($Message) }
+$ComputerName = 'PC-0001'
+$ManagedDeviceID = '0b6c1a2e-3f4d-4e5f-8a9b-0c1d2e3f4a5b'
+$AppJson = $null
+$MainApp = $null
+$Failure = $null
+try
+{
+
+'@
+            $Epilogue = @'
+
+}
+catch { $Failure = $_.Exception.Message }
+[pscustomobject]@{
+    AppJson = $AppJson
+    Columns = @(if ($MainApp) { $MainApp.PSObject.Properties | ForEach-Object Name })
+    Log     = @($Log | Where-Object { $_ -match 'Base64 size|too big' })
+    Error   = $Failure
+}
+'@
+            $Block = [scriptblock]::Create($Prologue + $Sequence + $Epilogue)
+            return & $Block $InstalledAppJson $LogAPIMode
+        }
+
+        function New-SequenceJson([int]$Bytes, [int]$Seed)
+        {
+            $Buffer = New-Object byte[] $Bytes
+            (New-Object System.Random($Seed)).NextBytes($Buffer)
+            return '[{"Blob":"' + [Convert]::ToBase64String($Buffer) + '"}]'
+        }
+
+        $script:SequenceInputs = [ordered]@{
+            'no apps' = (@() | ConvertTo-Json)
+            'empty'   = ''
+            '[]'      = '[]'
+            'small'   = '[{"AppName":"7-Zip 24.08 (x64)","AppVersion":"24.08","AppPublisher":"Igor Pavlov"}]'
+            '100 KB'  = New-SequenceJson 100000 21
+            '700 KB'  = New-SequenceJson 700000 22
+        }
+    }
+
+    It 'calls ConvertTo-AUChunks, the one copy' {
+        $script:ScriptSequence | Should -Match 'ConvertTo-AUChunks -Json \$InstalledAppJson'
+        $script:ScriptSequence | Should -Not -Match 'GZipStream|-split'
+    }
+
+    It 'builds version 19''s upload, columns, Base64 size, and too-big throw, in both modes' {
+        foreach ($Mode in 'LogIngestionAPI', 'ClientSecret')
+        {
+            foreach ($Name in $script:SequenceInputs.Keys)
+            {
+                $Because = "input '$Name' in $Mode"
+                $V19 = Invoke-Sequence $script:V19Sequence $script:SequenceInputs[$Name] $Mode
+                $Now = Invoke-Sequence $script:ScriptSequence $script:SequenceInputs[$Name] $Mode
+                $Now.Error | Should -BeExactly $V19.Error -Because $Because
+                $Now.Log -join "`n" | Should -BeExactly ($V19.Log -join "`n") -Because $Because
+                $Now.Columns -join ',' | Should -BeExactly ($V19.Columns -join ',') -Because $Because
+                $Now.AppJson -ceq $V19.AppJson | Should -BeTrue -Because $Because
+            }
+        }
+    }
+
+    It 'covers one-piece, multi-piece, and too-big uploads' {
+        $Small = Invoke-Sequence $script:ScriptSequence $script:SequenceInputs['small'] 'LogIngestionAPI'
+        @($Small.Columns -match '^InstalledApps').Count | Should -Be 1
+        $Small.AppJson | Should -Match '"InstalledApps1_s":"H4sI'
+        $Mid = Invoke-Sequence $script:ScriptSequence $script:SequenceInputs['100 KB'] 'LogIngestionAPI'
+        @($Mid.Columns -match '^InstalledApps\d+_s$').Count | Should -Be 3
+        $Classic = Invoke-Sequence $script:ScriptSequence $script:SequenceInputs['100 KB'] 'ClientSecret'
+        @($Classic.Columns -match '^InstalledApps\d+$').Count | Should -Be 5
+        foreach ($Mode in 'LogIngestionAPI', 'ClientSecret')
+        {
+            $Big = Invoke-Sequence $script:ScriptSequence $script:SequenceInputs['700 KB'] $Mode
+            $Big.Error | Should -Match '^InstallApp is too big' -Because $Mode
+            $Big.AppJson | Should -BeNullOrEmpty -Because $Mode
+        }
     }
 }
