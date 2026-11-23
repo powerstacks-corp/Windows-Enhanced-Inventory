@@ -4587,6 +4587,11 @@ function Merge-AUSrumRecords
     Archives nothing this run; every counted key stays in Counted. The caller sets it when the SRUM
     copy needed repair (esentutl /p) or the read was incomplete, because rows missing from such a
     read may still exist in SRUM.
+.PARAMETER LowestAutoIncId
+    The lowest AutoIncId of the whole SRUM read, when Rows is a subset of it (Invoke-AppUsage drops
+    Store and MSIX rows when Store inventory is off, D46). The aging-out test then uses the read's
+    real low end, not the subset's, so a filtered read archives exactly what an unfiltered one would.
+    $null (the default) uses the lowest AutoIncId in Rows.
 #>
     param (
         [pscustomobject]$Ledger,
@@ -4594,7 +4599,8 @@ function Merge-AUSrumRecords
         [string]$Epoch,
         [hashtable]$UserTypes,
         [double]$MinFocusSeconds,
-        [switch]$NoArchive
+        [switch]$NoArchive,
+        [Nullable[long]]$LowestAutoIncId = $null
     )
 
     $Epoch = ([string]$Epoch).Trim()
@@ -4680,6 +4686,7 @@ function Merge-AUSrumRecords
         return
     }
 
+    if ($null -ne $LowestAutoIncId -and ($null -eq $LowestId -or $LowestAutoIncId -lt $LowestId)) { $LowestId = [long]$LowestAutoIncId }
     $Archived = 0
     $EpochPrefix = "$Epoch|"
     foreach ($Key in @($Entries.Keys))
@@ -8418,7 +8425,8 @@ function Read-AUUserApps
     when both Uninstall views were read. Never throws.
 .DESCRIPTION
     A Copied user's copy is loaded at HKU\AU_<SID>, read, and unloaded in finally after a garbage
-    collection. A copy that won't load sets the user's ProfileState to CopyFailed. RegPath always shows
+    collection. A copy that won't load sets the user's ProfileState to CopyFailed; a loaded copy sets
+    the user's HiveUnloadFailed to whether it wouldn't unload afterwards. RegPath always shows
     HKEY_USERS\<SID>, never the mount name. SYSTEM's (S-1-5-18) entries are machine scope; other
     entries have the user's SID as Scope and ProfilePath. HKEY_CURRENT_USER\Software is shared between
     32-bit and 64-bit programs, so a per-user entry's Architecture is 32 only from Wow6432Node and
@@ -8496,7 +8504,7 @@ function Read-AUUserApps
                 {
                     if ($null -ne $Base) { $Base.Close() }
                     $Base = $null
-                    [void](Dismount-AUHive -MountName $Mount)
+                    $User | Add-Member -NotePropertyName HiveUnloadFailed -NotePropertyValue (-not (Dismount-AUHive -MountName $Mount)) -Force
                 }
             }
             default { return $false }
@@ -8509,12 +8517,61 @@ function Read-AUUserApps
     }
 }#endfunction
 
+# Version 19's Windows 11 24H2 fix for Get-AppxPackage (Get-AppxInstalledApplications): these
+# PowerShell DLLs must be in the global assembly cache, or Get-AppxPackage fails.
+$script:AUAppxGacDlls = @('System.Memory.dll', 'System.Numerics.Vectors.dll', 'System.Runtime.CompilerServices.Unsafe.dll', 'System.Security.Principal.Windows.dll')
+$script:AUAppxSupportChecked = $false
+
+function Initialize-AUAppxSupport
+{
+    <#
+.SYNOPSIS
+    Applies version 19's Windows 11 24H2 fix before Get-AppxPackage, once per run. Never throws.
+.DESCRIPTION
+    The same fix as version 19's Get-AppxInstalledApplications: each DLL in $script:AUAppxGacDlls
+    that isn't in the global assembly cache is installed there from
+    C:\Windows\System32\WindowsPowerShell\v1.0 with System.EnterpriseServices'
+    Publish.GacInstall. Both are in-box; nothing is compiled or downloaded (D25). Version 19 searches
+    the whole cache for each file name; this looks only in the folders an assembly of that name can
+    be in (GAC_MSIL, GAC_64, GAC_32), which gives the same answer without the recursive search.
+    Failures are logged, and Get-AppxPackage is still tried.
+#>
+    if ($script:AUAppxSupportChecked) { return }
+    $script:AUAppxSupportChecked = $true
+    try
+    {
+        Add-Type -AssemblyName 'System.EnterpriseServices' -ErrorAction Stop
+        $Publish = New-Object System.EnterpriseServices.Internal.Publish
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't load System.EnterpriseServices for the 24H2 Get-AppxPackage fix: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        return
+    }
+    $Cache = [IO.Path]::Combine($env:SystemRoot, 'Microsoft.NET\assembly')
+    foreach ($Dll in $script:AUAppxGacDlls)
+    {
+        try
+        {
+            $Name = [IO.Path]::GetFileNameWithoutExtension($Dll)
+            $Present = $false
+            foreach ($Folder in @('GAC_MSIL', 'GAC_64', 'GAC_32')) { if ([IO.Directory]::Exists([IO.Path]::Combine([IO.Path]::Combine($Cache, $Folder), $Name))) { $Present = $true } }
+            if ($Present) { continue }
+            $Publish.GacInstall([IO.Path]::Combine($env:SystemRoot, "System32\WindowsPowerShell\v1.0\$Dll"))
+            Write-CMTraceLog -Message "App Usage: installed $Dll in the global assembly cache (24H2 Get-AppxPackage fix)." -Component 'AppUsage'
+        }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't install $Dll in the global assembly cache: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    }
+}#endfunction
+
 function Get-AUAppxPackages
 {
     <#
 .SYNOPSIS
-    Returns every user's Store and MSIX packages (Get-AppxPackage -AllUsers). Throws on failure.
+    Returns every user's Store and MSIX packages (Get-AppxPackage -AllUsers), after version 19's
+    24H2 fix (Initialize-AUAppxSupport). Throws on failure.
 #>
+    Initialize-AUAppxSupport
     return Get-AppxPackage -AllUsers -ErrorAction Stop
 }#endfunction
 
@@ -8642,7 +8699,10 @@ function Get-AUInstalledApps
     back to it (D20, D36). Per-user installs of LocalService and NetworkService (S-1-5-19, S-1-5-20)
     are in Apps with their SID as Scope, ARP and Store alike; ConvertTo-AUInventoryApps leaves them
     out of the inventory.
-    ProfilesFound is the number of users given; ProfilesRead, how many are Read. Never throws.
+    ProfilesFound is the number of users given; ProfilesRead, how many are Read. MsiFileMapRead is
+    false when Windows Installer UserData couldn't be read (MsiFileMap is then incomplete), and
+    HiveUnloadFailures counts the hive copies left loaded at HKU\AU_<SID>; Invoke-AppUsage reports
+    both. Never throws.
 .PARAMETER Users
     The Get-AUUsers entries. A failed hive load changes the entry's ProfileState.
 .PARAMETER Snapshot
@@ -8658,6 +8718,7 @@ function Get-AUInstalledApps
 
     $ScopeRead = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
     $MsiFileMap = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $MsiRead = $false
     $Native = New-Object 'System.Collections.Generic.List[object]'
     $Wow = New-Object 'System.Collections.Generic.List[object]'
     $Store = New-Object 'System.Collections.Generic.List[object]'
@@ -8676,7 +8737,7 @@ function Get-AUInstalledApps
             $NativeRead = Read-AUArpEntries -Base $Machine -ShownBase 'HKEY_LOCAL_MACHINE' -SubPath $script:AUUninstallNative -Scope 'Machine' -Architecture 64 -Into $Native
             $WowRead = Read-AUArpEntries -Base $Machine -ShownBase 'HKEY_LOCAL_MACHINE' -SubPath $script:AUUninstallWow -Scope 'Machine' -Architecture 32 -Into $Wow
             $MachineRead = ($NativeRead -and $WowRead)
-            [void](Read-AUMsiFileMap -Base $Machine -Into $MsiFileMap)
+            $MsiRead = [bool](Read-AUMsiFileMap -Base $Machine -Into $MsiFileMap)
         }
         catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine's apps: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         finally { if ($null -ne $Machine) { $Machine.Close() } }
@@ -8708,13 +8769,16 @@ function Get-AUInstalledApps
     $Apps.AddRange($Wow)
     $Apps.AddRange($Store)
     $Read = @($UserList | Where-Object { $ScopeRead[[string]$_.Sid] -eq 'Read' }).Count
+    $Unloaded = @($UserList | Where-Object { $null -ne $_.PSObject.Properties['HiveUnloadFailed'] -and $_.HiveUnloadFailed -eq $true }).Count
     Write-CMTraceLog -Message "App Usage: found $($Apps.Count) installed apps ($($Store.Count) Store); machine $($ScopeRead['Machine']); $Read of $($UserList.Count) profiles read." -Component 'AppUsage'
     return [pscustomobject]@{
-        Apps          = $Apps.ToArray()
-        ScopeRead     = $ScopeRead
-        MsiFileMap    = $MsiFileMap
-        ProfilesFound = $UserList.Count
-        ProfilesRead  = $Read
+        Apps               = $Apps.ToArray()
+        ScopeRead          = $ScopeRead
+        MsiFileMap         = $MsiFileMap
+        ProfilesFound      = $UserList.Count
+        ProfilesRead       = $Read
+        MsiFileMapRead     = $MsiRead
+        HiveUnloadFailures = $Unloaded
     }
 }#endfunction
 
@@ -9687,6 +9751,906 @@ function Send-AURunRows
     try { [void](Limit-AUOutboxRuns -Files (Get-AUOutboxFiles -OutboxDir $OutboxDir) -MaxRuns $MaxRuns) }
     catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir to keep it to $MaxRuns runs: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
     return $Result
+}#endfunction
+
+# Orchestration (Task 15). Invoke-AppUsage runs every App Usage step in order, under the run lock, and
+# never throws. It's the only App Usage function that reads the script settings (F3).
+
+# Our mapping rules, Base64 of GZip-compressed JSON. The build fills this in (Task 18, F43); keep the
+# three lines together and the markers exactly as they are.
+# BEGIN APPUSAGE MAPPINGS
+$script:AppUsageMappingsEmbedded = ''
+# END APPUSAGE MAPPINGS
+
+# The status tokens (F42). AppUsageCollectionStatus_s is OK, or these tokens joined by '; '. In a
+# token, <count> is a whole number from 1 and <mode> a PowerShell language mode name. Every status App
+# Usage reports is on this list, and Format-AUStatus refuses anything else. John sends it to Julien.
+$script:AUStatusTokens = @(
+    'OK'                                # Nothing to report.
+    'UnsupportedOS'                     # Below Windows 11 25H2 (build 26200): App Usage skipped (D42).
+    'LanguageMode:<mode>'               # Not Full Language; always followed by skipped (D37).
+    'skipped'                           # Follows LanguageMode: App Usage didn't run.
+    'MappingsUnavailable:Missing'       # Our rules aren't in the script: App Usage skipped.
+    'MappingsUnavailable:Invalid'       # Our rules didn't load or validate: App Usage skipped.
+    'AppUsageBusy'                      # Another run held the lock for 60 seconds: App Usage skipped (D23).
+    'AppUsageFailed'                    # An unexpected error (see the log): usage fields blank.
+    'ShadowCopyFailed'                  # No shadow copy of the system drive: App Usage skipped.
+    'SrumReadFailed:WorkDirUntrusted'   # C:\Windows\PowerStacksAppUsage isn't safe to use: App Usage skipped.
+    'SrumReadFailed:CopyFailed'         # SRUDB.dat didn't copy from the shadow copy.
+    'SrumReadFailed:EsentMissing'       # The ManagedEsent assembly isn't there.
+    'SrumReadFailed:NoDatabase'         # No SRUM copy to read.
+    'SrumReadFailed:LiveDatabase'       # The live SRUM database was refused.
+    'SrumReadFailed:HeaderFailed'       # esentutl /mh gave no database signature.
+    'SrumReadFailed:RepairFailed'       # Recovery and repair left the copy unclean.
+    'SrumReadFailed:OpenFailed'         # The copy wouldn't open.
+    'SrumReadFailed:IdMapFailed'        # The id map couldn't be read.
+    'SrumReadFailed:NoTimeline'         # The AppTimelineProvider table isn't there.
+    'SrumReadFailed:TimelineFailed'     # The AppTimelineProvider read stopped.
+    'SrumReadFailed:ReadFailed'         # Any other SRUM read failure.
+    'SrumReadFailed:NoRows'             # The read worked but held no usage rows.
+    'LedgerReset'                       # The ledger was unreadable: moved aside and rebuilt.
+    'LedgerWriteFailed'                 # The ledger couldn't be written; the file is unchanged.
+    'DiscoveryFailed'                   # The all-profile app read failed: the inventory used its own read (D36).
+    'ProfileUnread:<count>'             # Profiles whose apps weren't read.
+    'HiveUnloadFailed:<count>'          # Hive copies left loaded at HKU\AU_<SID>.
+    'MsiFileMapFailed'                  # Windows Installer UserData couldn't be read.
+    'InvalidCustomerMappings'           # The customer file isn't valid: ignored this run (D45).
+    'InvalidCustomerMappings:TooLarge'  # The customer file is over 1 MB: ignored this run (D45).
+    'InvalidCustomerMappings:UnsafePath'    # The customer file path was refused: ignored this run.
+    'InvalidCustomerMappings:ReparsePoint'  # The customer file is a link: ignored this run.
+    'CustomerMappingsAbsent'            # No customer file: no customer rules this run (D41).
+    'PendingRows'                       # Rows from an earlier run still wait in the outbox (D44).
+    'OutboxSkipped'                     # The outbox couldn't be used this run.
+)
+# Below this build App Usage doesn't run (D42).
+$script:AUMinOsBuild = 26200
+# How long Invoke-AppUsage waits for the run lock.
+$script:AULockTimeoutSeconds = 60
+
+function Test-AUStatusToken
+{
+    <#
+.SYNOPSIS
+    Tests whether a status token is on $script:AUStatusTokens, case-sensitively.
+.PARAMETER Token
+    The token, such as SrumReadFailed:EsentMissing or ProfileUnread:2.
+#>
+    param (
+        [string]$Token
+    )
+
+    foreach ($Entry in $script:AUStatusTokens)
+    {
+        $Pattern = '^' + [regex]::Escape($Entry).Replace('<count>', '[1-9][0-9]{0,8}').Replace('<mode>', '[A-Za-z]+') + '$'
+        if ($Token -cmatch $Pattern) { return $true }
+    }
+    return $false
+}#endfunction
+
+function Format-AUStatus
+{
+    <#
+.SYNOPSIS
+    Returns AppUsageCollectionStatus_s: the tokens joined by '; ', or OK when there are none (F42).
+.DESCRIPTION
+    Blank tokens and OK are left out, and a repeated token appears once, in first-seen order. Throws
+    when a token isn't on $script:AUStatusTokens (Test-AUStatusToken).
+.PARAMETER Tokens
+    The status tokens.
+#>
+    param (
+        [string[]]$Tokens
+    )
+
+    $Kept = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($Token in @($Tokens))
+    {
+        if ([string]::IsNullOrWhiteSpace($Token)) { continue }
+        $Text = $Token.Trim()
+        if (-not (Test-AUStatusToken $Text)) { throw "Format-AUStatus: '$Text' isn't on the App Usage status token list." }
+        if ($Text -ceq 'OK' -or $Kept.Contains($Text)) { continue }
+        $Kept.Add($Text)
+    }
+    if ($Kept.Count -eq 0) { return 'OK' }
+    return ($Kept.ToArray() -join '; ')
+}#endfunction
+
+function Add-AUStatusToken
+{
+    <#
+.SYNOPSIS
+    Adds a status token to the run's list; a token that isn't on the list is logged and added as AppUsageFailed.
+.PARAMETER Tokens
+    The run's token list.
+.PARAMETER Token
+    The token.
+#>
+    param (
+        [System.Collections.Generic.List[string]]$Tokens,
+        [string]$Token
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Token)) { return }
+    $Text = $Token.Trim()
+    if (-not (Test-AUStatusToken $Text))
+    {
+        Write-CMTraceLog -Message "App Usage: '$Text' isn't a status token, so AppUsageFailed is reported instead." -Component 'AppUsage' -Type 3
+        $Text = 'AppUsageFailed'
+    }
+    if (-not $Tokens.Contains($Text)) { $Tokens.Add($Text) }
+}#endfunction
+
+function Get-AUOsBuild
+{
+    <#
+.SYNOPSIS
+    Returns the Windows build number (CurrentBuildNumber), or 0 when it can't be read (F40). Never throws.
+#>
+    $Key = $null
+    try
+    {
+        $Key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion')
+        if ($null -eq $Key) { return 0 }
+        $Build = 0
+        if ([int]::TryParse([string]$Key.GetValue('CurrentBuildNumber'), [ref]$Build)) { return $Build }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read the Windows build number: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    finally { if ($null -ne $Key) { $Key.Close() } }
+    return 0
+}#endfunction
+
+function Get-AULanguageMode
+{
+    <#
+.SYNOPSIS
+    Returns the session's language mode, such as FullLanguage or ConstrainedLanguage (F40).
+#>
+    return [string]$ExecutionContext.SessionState.LanguageMode
+}#endfunction
+
+function Get-AUSerial
+{
+    <#
+.SYNOPSIS
+    Returns the device's BIOS serial number (Win32_BIOS), or '' when it can't be read. Never throws.
+#>
+    try
+    {
+        $Bios = @(Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop)
+        if ($Bios.Count -gt 0) { return ([string]$Bios[0].SerialNumber).Trim() }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read the serial number, so the computer name names the ledger: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    return ''
+}#endfunction
+
+function Get-AULedgerPath
+{
+    <#
+.SYNOPSIS
+    Returns the ledger path, C:\Windows\AppUsage_<Serial>.json (F44).
+.DESCRIPTION
+    The serial is sanitized by Get-AUFileNameSerial, as the outbox's is (Get-AUOutboxPath): a
+    character that isn't allowed in a file name becomes _, and a blank serial falls back to the
+    computer name.
+.PARAMETER Serial
+    The device's serial number.
+.PARAMETER ComputerName
+    The computer name, used when the serial is blank.
+.PARAMETER Root
+    The folder that holds it, C:\Windows by default.
+#>
+    param (
+        [string]$Serial,
+        [string]$ComputerName,
+        [string]$Root = $env:SystemRoot
+    )
+
+    return [IO.Path]::Combine($Root, "AppUsage_$(Get-AUFileNameSerial -Serial $Serial -ComputerName $ComputerName).json")
+}#endfunction
+
+function Add-AUDeletedScopes
+{
+    <#
+.SYNOPSIS
+    Marks each SID that's no longer in ProfileList Deleted in ScopeRead, and returns how many (F29).
+.DESCRIPTION
+    A SID already in ScopeRead keeps its state. With no users (ProfileList couldn't be read),
+    nothing is marked, because a profile can't be known to be gone.
+.PARAMETER ScopeRead
+    The discovery's ScopeRead.
+.PARAMETER Users
+    The Get-AUUsers entries (every profile in ProfileList).
+.PARAMETER Sids
+    The SIDs to check: the ledger's users.
+#>
+    param (
+        [hashtable]$ScopeRead,
+        [object[]]$Users,
+        [string[]]$Sids
+    )
+
+    $Profiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($User in @($Users)) { if ($null -ne $User -and $User.Sid) { [void]$Profiles.Add(([string]$User.Sid).Trim()) } }
+    if ($Profiles.Count -eq 0) { return 0 }
+    $Count = 0
+    foreach ($Sid in @($Sids))
+    {
+        $Value = ([string]$Sid).Trim()
+        if (-not $Value -or $Profiles.Contains($Value)) { continue }
+        $Known = $false
+        foreach ($Name in $ScopeRead.Keys) { if ([string]::Equals([string]$Name, $Value, [StringComparison]::OrdinalIgnoreCase)) { $Known = $true; break } }
+        if ($Known) { continue }
+        $ScopeRead[$Value] = 'Deleted'
+        $Count++
+    }
+    return $Count
+}#endfunction
+
+function Get-AUEntryFacts
+{
+    <#
+.SYNOPSIS
+    Returns the facts to use for a ledger entry this run (D24, D30, F13).
+.DESCRIPTION
+    Verified facts already in the ledger are kept, because a build's facts don't change (D24); only
+    IsServiceBinary is refreshed from this run's service map, and the file isn't read again. Otherwise,
+    when this run's SRUM read gives the entry's user and exe name candidate kernel paths, the path
+    (Find-AUExePath) is read with Get-AUExeFacts. Without a path, the stored facts are kept, and an
+    entry with none gets the facts its ExeInfo alone gives (its exe name, or a package's family), so
+    an entry missing from this run's SRUM read is still recalculated (D13). Unverified facts never
+    replace stored verified ones.
+.PARAMETER Entry
+    The ledger entry.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER Context
+    The run context: ResourcePaths, VolumeCache, ReadBudget, MsiFileMap, and ServiceBinaries.
+#>
+    param (
+        [pscustomobject]$Entry,
+        [pscustomobject]$ExeInfo,
+        [pscustomobject]$Context
+    )
+
+    $Stored = $Entry.Facts
+    if ($null -ne $Stored -and $Stored.FactsVerified -eq $true)
+    {
+        $RunPath = ([string]$Stored.RunPath).Trim()
+        if ($RunPath -and $null -ne $Stored.PSObject.Properties['IsServiceBinary'] -and $null -ne $Context.ServiceBinaries)
+        {
+            $Stored.IsServiceBinary = $Context.ServiceBinaries.ContainsKey($RunPath.ToLowerInvariant())
+        }
+        return $Stored
+    }
+
+    $Found = $null
+    if ($ExeInfo.Kind -eq 'Win32')
+    {
+        $Paths = $Context.ResourcePaths["$(([string]$Entry.UserSid).Trim())|$($ExeInfo.ExeName)"]
+        if ($null -ne $Paths) { $Found = Find-AUExePath -KernelPaths $Paths.ToArray() -ExeInfo $ExeInfo -VolumeCache $Context.VolumeCache -ReadBudget $Context.ReadBudget }
+    }
+    if ($null -eq $Found -and $null -ne $Stored) { return $Stored }
+    $Path = $null
+    if ($null -ne $Found) { $Path = [string]$Found.Path }
+    return Get-AUExeFacts -Path $Path -ExeInfo $ExeInfo -MsiFileMap $Context.MsiFileMap -ServiceBinaries $Context.ServiceBinaries -UserSid ([string]$Entry.UserSid) -ExeInfoText ([string]$Entry.ExeInfo) -ReadBudget $Context.ReadBudget
+}#endfunction
+
+function Set-AUEntryResult
+{
+    <#
+.SYNOPSIS
+    Recalculates one ledger entry for this run and attaches the results (D13, F16, F17).
+.DESCRIPTION
+    In order: the facts (Get-AUEntryFacts), Resolve-AUIdentity, Resolve-AUTarget, then
+    Get-AUClassification, with MatchSection Customer when the target is a customer match or a
+    retained customer target (so PowerStacks rules don't apply to it, D38), then Get-AURole (F17).
+    The entry's StoredTarget is replaced only when ConvertTo-AUStoredTarget gives a value (F16); a
+    stored target that no longer counts (its rule is gone, Get-AUStoredTargetSection) is cleared.
+    Attaches Target, Classification, Role, UserType (from the entry's own SID, so a deleted user
+    keeps credited use), and InstallStatus (Get-AUInstallStatus for the entry's user), and sets Facts
+    and FactsVerified.
+.PARAMETER Entry
+    The ledger entry.
+.PARAMETER Context
+    The run context: Mappings, CustomerRulesUnavailable, Apps, ScopeRead, UserTypes,
+    MachineDomainSid, and what Get-AUEntryFacts needs.
+#>
+    param (
+        [pscustomobject]$Entry,
+        [pscustomobject]$Context
+    )
+
+    $ExeInfo = ConvertFrom-AUExeInfo ([string]$Entry.ExeInfo)
+    $Facts = Get-AUEntryFacts -Entry $Entry -ExeInfo $ExeInfo -Context $Context
+    $Entry.Facts = $Facts
+    $Entry.FactsVerified = ($null -ne $Facts -and $Facts.FactsVerified -eq $true)
+
+    $Mappings = $Context.Mappings
+    $Unavailable = [bool]$Context.CustomerRulesUnavailable
+    $Identity = Resolve-AUIdentity -Facts $Facts -Mappings $Mappings -InstalledApps $Context.Apps
+    $Target = Resolve-AUTarget -Identity $Identity -StoredTarget $Entry.StoredTarget -Mappings $Mappings -CustomerRulesUnavailable:$Unavailable
+    $Stored = ConvertTo-AUStoredTarget $Target
+    if ($null -ne $Stored) { $Entry.StoredTarget = $Stored }
+    elseif ($null -ne $Entry.StoredTarget -and $null -eq (Get-AUStoredTargetSection $Entry.StoredTarget $Mappings $Unavailable))
+    {
+        Write-CMTraceLog -Message "App Usage: cleared the stored target $($Entry.StoredTarget.MatchRuleId) of $($Entry.ExeName): its rule no longer exists." -Component 'AppUsage'
+        $Entry.StoredTarget = $null
+    }
+
+    $Section = [string]$Target.MatchSection
+    if ($Target.MatchSection -ceq 'Customer' -or $Target.RetainedFrom -ceq 'Customer') { $Section = 'Customer' }
+    $Classification = Get-AUClassification -Facts $Facts -Mappings $Mappings -MatchSection $Section
+    $Role = Get-AURole -Facts $Facts -Target $Target -Classification $Classification -InstalledApps $Context.Apps
+
+    $Sid = ([string]$Entry.UserSid).Trim()
+    $UserType = $Context.UserTypes[$Sid]
+    if ($null -eq $UserType)
+    {
+        $UserType = Get-AUUserType -Sid $Sid -MachineDomainSid $Context.MachineDomainSid
+        $Context.UserTypes[$Sid] = $UserType
+    }
+    $InstallStatus = Get-AUInstallStatus -Target $Target -InstalledApps $Context.Apps -ScopeRead $Context.ScopeRead -UserSid $Sid
+    $Entry | Add-Member -Force -NotePropertyMembers ([ordered]@{
+            Target         = $Target
+            Classification = $Classification
+            Role           = $Role
+            UserType       = [string]$UserType
+            InstallStatus  = $InstallStatus
+        })
+}#endfunction
+
+function Invoke-AUCollection
+{
+    <#
+.SYNOPSIS
+    The App Usage work done under the run lock: snapshot, discovery, ledger, SRUM, matching,
+    aggregation, and the ledger write (D23, Task 11).
+.DESCRIPTION
+    In order (F10, F16, F17, F29, F35, F36):
+    1. New-AUWorkDir and New-AUSnapshot. An untrusted work root (New-AUWorkDir throws
+       SrumReadFailed:WorkDirUntrusted) or ShadowCopyFailed skips the rest of the run.
+    2. Get-AUUsers and Get-AUInstalledApps -IncludeStore. A Machine scope that isn't Read, or a
+       signed-in user who isn't, is DiscoveryFailed: InventoryApps and AppFields stay $null, and the
+       inventory uses its own read (D20, D36). Unread profiles, hive copies left loaded, and an
+       unread Windows Installer map are reported.
+    3. Read-AULedger.
+    4. Read-AUSrum. With IncludeStore off, Package-kind rows are dropped (D46, F35), and the merge
+       gets the whole read's lowest AutoIncId, so the drop doesn't change what ages out.
+       Merge-AUSrumRecords runs only when the read is OK with rows (F10), with UserTypes from the
+       rows' own SIDs (case-insensitive), and with -NoArchive when the copy was repaired or the read
+       is incomplete.
+    5. Ledger SIDs missing from ProfileList become Deleted in ScopeRead (F29), after the merge so a
+       deleted user's new rows count too.
+    6. Every ledger entry is recalculated (Set-AUEntryResult; Package-kind entries only with
+       IncludeStore), with one read budget and one service map for the run (F36).
+    7. Invoke-AULedgerFold, then Get-AUKnownExes, Get-AUAppUsage, ConvertTo-AUExeUsage, and
+       Get-AUUnmatchedExeCount over the folded ledger, so the output matches what's stored.
+    8. The results go into Run.Result, then Write-AULedger; a failed write is LedgerWriteFailed.
+    The read budget is closed and Remove-AUSnapshot runs in finally. Each stage's time is logged
+    and kept in Run.Timings. Throws on an unexpected error (Invoke-AUWithLock catches it).
+.PARAMETER Run
+    The run built by Invoke-AppUsage.
+#>
+    param (
+        [pscustomobject]$Run
+    )
+
+    $Tokens = $Run.Tokens
+    $WorkDir = $null
+    $Snapshot = $null
+    $ReadBudget = $null
+    $Clock = [Diagnostics.Stopwatch]::StartNew()
+    $EndStage = {
+        param ([string]$Name)
+        $Run.Timings[$Name] = [long]$Clock.ElapsedMilliseconds
+        Write-CMTraceLog -Message "App Usage: stage $Name took $($Clock.ElapsedMilliseconds) ms." -Component 'AppUsage'
+        $Clock.Reset()
+        $Clock.Start()
+    }
+
+    try
+    {
+        # 1. The protected work folder and the snapshot.
+        try { $WorkDir = New-AUWorkDir -RunId $Run.RunId }
+        catch
+        {
+            $Message = [string]$_.Exception.Message
+            if (-not $Message.StartsWith($script:AUWorkDirUntrustedStatus, [StringComparison]::Ordinal)) { throw }
+            Add-AUStatusToken $Tokens $script:AUWorkDirUntrustedStatus
+            Write-CMTraceLog -Message "App Usage: skipped this run. $Message An administrator must delete $($script:AUWorkRoot) so the next run can recreate it." -Component 'AppUsage' -Type 3
+            return
+        }
+        $Snapshot = New-AUSnapshot -WorkDir $WorkDir
+        & $EndStage 'Snapshot'
+        if ([string]$Snapshot.Status -eq 'ShadowCopyFailed')
+        {
+            Add-AUStatusToken $Tokens 'ShadowCopyFailed'
+            Write-CMTraceLog -Message 'App Usage: skipped this run, because no shadow copy could be taken.' -Component 'AppUsage' -Type 3
+            return
+        }
+
+        # 2. Users and installed apps, every profile.
+        $Users = @(Get-AUUsers -Snapshot $Snapshot | Where-Object { $null -ne $_ })
+        $Discovery = Get-AUInstalledApps -Users $Users -Snapshot $Snapshot -IncludeStore:([bool]$Run.IncludeStore)
+        $Apps = @($Discovery.Apps | Where-Object { $null -ne $_ })
+        $ScopeRead = $Discovery.ScopeRead
+        if ($null -eq $ScopeRead) { $ScopeRead = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase) }
+        $DiscoveryOk = ([string]$ScopeRead['Machine'] -eq 'Read')
+        foreach ($User in $Users)
+        {
+            if ([string]$User.ProfileState -eq 'Loaded' -and [string]$ScopeRead[[string]$User.Sid] -ne 'Read') { $DiscoveryOk = $false }
+        }
+        if (-not $DiscoveryOk)
+        {
+            Add-AUStatusToken $Tokens 'DiscoveryFailed'
+            Write-CMTraceLog -Message 'App Usage: the all-profile app read is incomplete, so the inventory uses its own read this run (D36).' -Component 'AppUsage' -Type 2
+        }
+        $Unread = [int]$Discovery.ProfilesFound - [int]$Discovery.ProfilesRead
+        if ($Unread -gt 0) { Add-AUStatusToken $Tokens "ProfileUnread:$Unread" }
+        if ([int]$Discovery.HiveUnloadFailures -gt 0) { Add-AUStatusToken $Tokens "HiveUnloadFailed:$([int]$Discovery.HiveUnloadFailures)" }
+        if ($Discovery.MsiFileMapRead -ne $true) { Add-AUStatusToken $Tokens 'MsiFileMapFailed' }
+        $MsiFileMap = $Discovery.MsiFileMap
+        if ($null -eq $MsiFileMap) { $MsiFileMap = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase) }
+        & $EndStage 'Discovery'
+
+        # 3. The ledger.
+        $Ledger = Read-AULedger -Path $Run.LedgerPath
+        foreach ($Token in @($Ledger.Status)) { Add-AUStatusToken $Tokens ([string]$Token) }
+        & $EndStage 'LedgerRead'
+
+        # 4. SRUM, merged only after a successful read with rows (F10).
+        $Srum = $null
+        $SrumOk = $false
+        if ([string]$Snapshot.Status -ne 'OK') { Add-AUStatusToken $Tokens ([string]$Snapshot.Status) }
+        else
+        {
+            $Srum = Read-AUSrum -DbPath $Snapshot.SrumDbPath
+            if ([string]$Srum.Status -ne 'OK') { Add-AUStatusToken $Tokens ([string]$Srum.Status) }
+            elseif (@($Srum.Timeline).Count -eq 0)
+            {
+                Add-AUStatusToken $Tokens 'SrumReadFailed:NoRows'
+                Write-CMTraceLog -Message 'App Usage: the SRUM read gave no usage rows, so the ledger is not merged this run.' -Component 'AppUsage' -Type 2
+            }
+            else { $SrumOk = $true }
+        }
+        & $EndStage 'SrumRead'
+
+        $UserTypes = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+        if ($SrumOk)
+        {
+            $Rows = New-Object 'System.Collections.Generic.List[object]'
+            $Kinds = New-Object Collections.Hashtable ([StringComparer]::Ordinal)
+            $Lowest = $null
+            $Dropped = 0
+            foreach ($Row in @($Srum.Timeline))
+            {
+                if ($null -eq $Row) { continue }
+                $Number = ([string]$Row.AutoIncId).Trim() -as [long]
+                if ($null -ne $Number -and ($null -eq $Lowest -or $Number -lt $Lowest)) { $Lowest = $Number }
+                if (-not $Run.IncludeStore)
+                {
+                    $Text = [string]$Row.ExeInfo
+                    $Kind = $Kinds[$Text]
+                    if ($null -eq $Kind) { $Kind = (ConvertFrom-AUExeInfo $Text).Kind; $Kinds[$Text] = $Kind }
+                    if ($Kind -eq 'Package') { $Dropped++; continue }
+                }
+                $Rows.Add($Row)
+                $Sid = ([string]$Row.UserSid).Trim()
+                if (-not $UserTypes.ContainsKey($Sid)) { $UserTypes[$Sid] = Get-AUUserType -Sid $Sid -MachineDomainSid $Snapshot.MachineDomainSid }
+            }
+            if ($Dropped -gt 0) { Write-CMTraceLog -Message "App Usage: left out $Dropped Store and MSIX usage rows, because Store inventory is off (D46)." -Component 'AppUsage' }
+            $NoArchive = ($Srum.Repaired -eq $true -or $Srum.Complete -ne $true)
+            if ($NoArchive) { Write-CMTraceLog -Message "App Usage: nothing is archived this run (repaired $($Srum.Repaired), complete $($Srum.Complete))." -Component 'AppUsage' }
+            Merge-AUSrumRecords -Ledger $Ledger -Rows $Rows.ToArray() -Epoch ([string]$Srum.Epoch) -UserTypes $UserTypes -MinFocusSeconds $Run.MinFocusSeconds -NoArchive:$NoArchive -LowestAutoIncId $Lowest
+        }
+        & $EndStage 'Merge'
+
+        # 5. Users whose profile is gone (F29).
+        $Sids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($Entry in $Ledger.Entries.Values) { if ($Entry.UserSid) { [void]$Sids.Add([string]$Entry.UserSid) } }
+        $Deleted = Add-AUDeletedScopes -ScopeRead $ScopeRead -Users $Users -Sids ([string[]]@($Sids))
+        if ($Deleted -gt 0) { Write-CMTraceLog -Message "App Usage: $Deleted ledger users are no longer in ProfileList (Deleted)." -Component 'AppUsage' }
+
+        # 6. Every entry, recalculated (D13).
+        $ResourcePaths = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+        if ($SrumOk)
+        {
+            foreach ($Item in @($Srum.Resource))
+            {
+                if ($null -eq $Item -or [string]::IsNullOrWhiteSpace([string]$Item.KernelPath)) { continue }
+                $Key = "$(([string]$Item.UserSid).Trim())|$(([string]$Item.ExeName).Trim().ToLowerInvariant())"
+                if (-not $ResourcePaths.ContainsKey($Key)) { $ResourcePaths[$Key] = New-Object 'System.Collections.Generic.List[string]' }
+                $ResourcePaths[$Key].Add([string]$Item.KernelPath)
+            }
+        }
+        $ReadBudget = New-AUReadBudget
+        $Context = [pscustomobject]@{
+            Mappings                 = $Run.Mappings
+            CustomerRulesUnavailable = [bool]$Run.CustomerRulesUnavailable
+            Apps                     = $Apps
+            ScopeRead                = $ScopeRead
+            MsiFileMap               = $MsiFileMap
+            ServiceBinaries          = (Get-AUServiceBinaries)
+            ResourcePaths            = $ResourcePaths
+            VolumeCache              = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+            ReadBudget               = $ReadBudget
+            UserTypes                = $UserTypes
+            MachineDomainSid         = [string]$Snapshot.MachineDomainSid
+        }
+        $Keys = [string[]]@($Ledger.Entries.Keys)
+        [Array]::Sort($Keys, [StringComparer]::Ordinal)
+        $Entries = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($Key in $Keys)
+        {
+            $Entry = $Ledger.Entries[$Key]
+            if (-not $Run.IncludeStore -and (ConvertFrom-AUExeInfo ([string]$Entry.ExeInfo)).Kind -eq 'Package') { continue }
+            Set-AUEntryResult -Entry $Entry -Context $Context
+            $Entries.Add($Entry)
+        }
+        Write-CMTraceLog -Message "App Usage: recalculated $($Entries.Count) of $($Keys.Count) ledger entries; $($ReadBudget.Reads) timed file reads, $($ReadBudget.TimedOut) timed out, $($ReadBudget.Skipped) skipped." -Component 'AppUsage'
+        & $EndStage 'Facts'
+
+        # 7. Fold aged-out builds, then the output, from the folded ledger.
+        Invoke-AULedgerFold -Ledger $Ledger
+        $Kept = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($Entry in $Entries)
+        {
+            if ([object]::ReferenceEquals($Ledger.Entries["$($Entry.UserSid)|$($Entry.ExeInfo)"], $Entry)) { $Kept.Add($Entry) }
+        }
+        $Entries = $Kept.ToArray()
+        $InventoryApps = $null
+        $AppFields = $null
+        if ($DiscoveryOk)
+        {
+            $InventoryApps = @(ConvertTo-AUInventoryApps -Apps $Apps)
+            $Known = Get-AUKnownExes -Apps $Apps -MsiFileMap $MsiFileMap -Mappings $Run.Mappings -Entries $Entries
+            $AppFields = Get-AUAppUsage -Entries $Entries -InventoryApps $InventoryApps -KnownExesByApp $Known -WatchingSince $Ledger.WatchingSince -ScopeRead $ScopeRead -Apps $Apps -CollectionOk $SrumOk
+        }
+        $ExeEntries = @(ConvertTo-AUExeUsage -Entries $Entries)
+        $UnmatchedCount = [int](Get-AUUnmatchedExeCount -Entries $Entries)
+        & $EndStage 'Aggregation'
+
+        # 8. The results, then the ledger (Task 9: a failed write leaves the file unchanged).
+        $Run.Result.InventoryApps = $InventoryApps
+        $Run.Result.AppFields = $AppFields
+        $Run.Result.ExeEntries = $ExeEntries
+        $Run.Result.UnmatchedExeCount = $UnmatchedCount
+        $Run.Result.WatchingSince = $Ledger.WatchingSince
+        $Run.Result.ProfilesFound = [int]$Discovery.ProfilesFound
+        $Run.Result.ProfilesRead = [int]$Discovery.ProfilesRead
+        try { Write-AULedger -Ledger $Ledger -Path $Run.LedgerPath }
+        catch
+        {
+            Add-AUStatusToken $Tokens 'LedgerWriteFailed'
+            Write-CMTraceLog -Message "App Usage: the ledger wasn't written this run: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        }
+        & $EndStage 'LedgerWrite'
+    }
+    finally
+    {
+        if ($null -ne $ReadBudget) { Close-AUReadBudget $ReadBudget }
+        if ($null -ne $Snapshot) { Remove-AUSnapshot -Snapshot $Snapshot }
+        elseif ($WorkDir) { Remove-AUSnapshot -Snapshot ([pscustomobject]@{ WorkDir = $WorkDir; ShadowId = $null }) }
+    }
+}#endfunction
+
+function Invoke-AURun
+{
+    <#
+.SYNOPSIS
+    Checks the OS build, loads the mappings, and runs Invoke-AUCollection under the run lock.
+.DESCRIPTION
+    Below build 26200 the run stops with UnsupportedOS and no snapshot is taken (D42). The ledger and
+    outbox paths come from the serial (Get-AUSerial unless the caller gave one). When our embedded
+    rules are missing (MappingsUnavailable:Missing) or invalid (MappingsUnavailable:Invalid), the run
+    stops before the lock, so stored targets and the ledger are untouched. The customer file's state
+    is reported (CustomerMappingsAbsent, InvalidCustomerMappings with TooLarge, UnsafePath, or
+    ReparsePoint when that's the reason). Lock not acquired: AppUsageBusy. The work under the lock
+    failed: AppUsageFailed, and the results are cleared.
+.PARAMETER Run
+    The run built by Invoke-AppUsage.
+#>
+    param (
+        [pscustomobject]$Run
+    )
+
+    $Tokens = $Run.Tokens
+    $Build = [int](Get-AUOsBuild)
+    if ($Build -lt $script:AUMinOsBuild)
+    {
+        Add-AUStatusToken $Tokens 'UnsupportedOS'
+        Write-CMTraceLog -Message "App Usage: skipped, because Windows build $Build is below $($script:AUMinOsBuild) (Windows 11 25H2, D42)." -Component 'AppUsage' -Type 2
+        return
+    }
+
+    $Serial = [string]$Run.Serial
+    if (-not $Run.SerialGiven) { $Serial = Get-AUSerial }
+    $Run.LedgerPath = Get-AULedgerPath -Serial $Serial -ComputerName $Run.ComputerName
+    $Run.Result.LedgerPath = $Run.LedgerPath
+    $Run.Result.OutboxPath = Get-AUOutboxPath -Serial $Serial -ComputerName $Run.ComputerName
+
+    $Mappings = Get-AUMappings -Embedded $Run.Embedded -BesideDir $Run.BesideDir -CustomerPath $Run.CustomerMappingsPath
+    $Run.Result.MappingsVersion = [string]$Mappings.PowerStacksVersion
+    $Run.Result.CustomerMappingsHash = [string]$Mappings.CustomerHash
+    switch ([string]$Mappings.CustomerSource)
+    {
+        'Absent' { Add-AUStatusToken $Tokens 'CustomerMappingsAbsent' }
+        'TooLarge' { Add-AUStatusToken $Tokens 'InvalidCustomerMappings:TooLarge' }
+        'Invalid'
+        {
+            $Detail = [string]$Mappings.CustomerDetail
+            if ($Detail -cin @('UnsafePath', 'ReparsePoint')) { Add-AUStatusToken $Tokens "InvalidCustomerMappings:$Detail" }
+            else { Add-AUStatusToken $Tokens 'InvalidCustomerMappings' }
+        }
+    }
+    if ([string]$Mappings.Source -eq 'None')
+    {
+        Add-AUStatusToken $Tokens 'MappingsUnavailable:Missing'
+        Write-CMTraceLog -Message 'App Usage: skipped, because our mapping rules are missing from the script.' -Component 'AppUsage' -Type 3
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Mappings.PowerStacksVersion))
+    {
+        Add-AUStatusToken $Tokens 'MappingsUnavailable:Invalid'
+        Write-CMTraceLog -Message "App Usage: skipped, because our mapping rules ($($Mappings.Source)) didn't load." -Component 'AppUsage' -Type 3
+        return
+    }
+    $Run.Mappings = $Mappings
+    $Run.CustomerRulesUnavailable = ([string]$Mappings.CustomerSource -in @('Invalid', 'TooLarge'))
+
+    $Lock = Invoke-AUWithLock -Body { Invoke-AUCollection -Run $Run } -TimeoutSeconds $script:AULockTimeoutSeconds
+    if ($Lock.Acquired -ne $true)
+    {
+        Add-AUStatusToken $Tokens 'AppUsageBusy'
+        return
+    }
+    if ($null -ne $Lock.Result) { Write-CMTraceLog -Message "App Usage: the work under the lock wrote unexpected output: $(@($Lock.Result) -join ' | ')" -Component 'AppUsage' -Type 2 }
+    if ($null -ne $Lock.Error)
+    {
+        Add-AUStatusToken $Tokens 'AppUsageFailed'
+        Clear-AUResultData $Run.Result
+        Write-CMTraceLog -Message "App Usage: the run failed, so its usage results are blank: $($Lock.Error)" -Component 'AppUsage' -Type 3
+    }
+}#endfunction
+
+function New-AUResult
+{
+    <#
+.SYNOPSIS
+    Returns an empty Invoke-AppUsage result (see Invoke-AppUsage for the fields). Uses only what
+    Constrained Language Mode allows: New-Object PSObject, because it refuses a [pscustomobject] cast.
+.PARAMETER RunId
+    The run's GUID.
+#>
+    param (
+        [string]$RunId
+    )
+
+    return New-Object PSObject -Property ([ordered]@{
+        RunId                = $RunId
+        Status               = 'OK'
+        StatusTokens         = @()
+        InventoryApps        = $null
+        AppFields            = $null
+        ExeEntries           = $null
+        UnmatchedExeCount    = $null
+        WatchingSince        = $null
+        ProfilesFound        = $null
+        ProfilesRead         = $null
+        MappingsVersion      = ''
+        CustomerMappingsHash = ''
+        DeviceColumns        = $null
+        LedgerPath           = $null
+        OutboxPath           = $null
+        Timings              = [ordered]@{}
+    })
+}#endfunction
+
+function Clear-AUResultData
+{
+    <#
+.SYNOPSIS
+    Clears a result's usage data after a failure, so no partial result reaches the inventory.
+.PARAMETER Result
+    The Invoke-AppUsage result.
+#>
+    param (
+        [pscustomobject]$Result
+    )
+
+    foreach ($Name in @('InventoryApps', 'AppFields', 'ExeEntries', 'UnmatchedExeCount', 'WatchingSince', 'ProfilesFound', 'ProfilesRead')) { $Result.$Name = $null }
+}#endfunction
+
+function New-AUDeviceColumns
+{
+    <#
+.SYNOPSIS
+    Returns the device columns for row 1, in the spec's order, named for the API mode (Get-AUColumnName).
+.DESCRIPTION
+    AppUsageEnabled_b (true: metering was on), WatchingSince_t (Format-AUDate text, or $null),
+    AppUsageScriptVersion_s, MappingsVersion_s, CustomerMappingsHash_s, UnmatchedExeCount_d,
+    ProfilesFound_d, ProfilesRead_d, and AppUsageCollectionStatus_s. The run columns RunId_g,
+    RowIndex_d, and RowCount_d are New-AURunRows's. Uses only what Constrained Language Mode allows.
+.PARAMETER Result
+    The Invoke-AppUsage result, with Status set.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER ScriptVersion
+    The inventory's $ScriptVersion.
+#>
+    param (
+        [pscustomobject]$Result,
+        [string]$LogAPIMode,
+        [string]$ScriptVersion
+    )
+
+    $Watching = $null
+    if ($Result.WatchingSince -is [datetime]) { $Watching = ConvertTo-AUOutputDate $Result.WatchingSince }
+    $Columns = [ordered]@{}
+    $Columns[(Get-AUColumnName 'AppUsageEnabled' 'b' $LogAPIMode)] = $true
+    $Columns[(Get-AUColumnName 'WatchingSince' 't' $LogAPIMode)] = $Watching
+    $Columns[(Get-AUColumnName 'AppUsageScriptVersion' 's' $LogAPIMode)] = $ScriptVersion
+    $Columns[(Get-AUColumnName 'MappingsVersion' 's' $LogAPIMode)] = [string]$Result.MappingsVersion
+    $Columns[(Get-AUColumnName 'CustomerMappingsHash' 's' $LogAPIMode)] = [string]$Result.CustomerMappingsHash
+    $Columns[(Get-AUColumnName 'UnmatchedExeCount' 'd' $LogAPIMode)] = $Result.UnmatchedExeCount
+    $Columns[(Get-AUColumnName 'ProfilesFound' 'd' $LogAPIMode)] = $Result.ProfilesFound
+    $Columns[(Get-AUColumnName 'ProfilesRead' 'd' $LogAPIMode)] = $Result.ProfilesRead
+    $Columns[(Get-AUColumnName 'AppUsageCollectionStatus' 's' $LogAPIMode)] = [string]$Result.Status
+    return $Columns
+}#endfunction
+
+function Invoke-AppUsage
+{
+    <#
+.SYNOPSIS
+    Runs App Usage for this inventory run and returns what the App Inventory upload needs. Never
+    throws, and writes nothing to the console (D28, D40).
+.DESCRIPTION
+    The caller runs it only when $CollectAppMetering is on. It reads the script settings
+    $MinFocusSecondsForUse, $CollectUWPInventory (Store and MSIX apps and their usage, D46),
+    $AppUsageCustomerMappingsPath, $ScriptVersion, and $script:AppUsageMappingsEmbedded, and passes
+    them down (F3).
+    Order: the language mode first, because Constrained Language Mode blocks the .NET calls the rest
+    needs (anything but FullLanguage: LanguageMode:<mode>; skipped, D37); then the OS build (below
+    26200: UnsupportedOS, no snapshot, D42); then the mappings (Invoke-AURun); then, under the run
+    lock Global\PowerStacksAppUsage, everything that reads or writes the ledger and the hive mounts
+    (Invoke-AUCollection; lock busy: AppUsageBusy). Every stage's elapsed time is logged.
+    Every output stream of the work is captured and logged, so nothing reaches the console. An
+    unexpected error becomes AppUsageFailed, and the usage results are $null; the inventory itself
+    is never affected.
+    Returns a PSCustomObject (the contract Task 15b's inventory wiring uses):
+      RunId              The run's GUID (the one given, or a new one when it isn't a GUID). Pass it
+                         to New-AURunRows so every row of the run carries it.
+      Status             AppUsageCollectionStatus_s for this run so far (Format-AUStatus of
+                         StatusTokens).
+      StatusTokens       The status tokens, string[]. The caller adds PendingRows and OutboxSkipped
+                         after the outbox flush and sets AppUsageCollectionStatus_s in DeviceColumns
+                         to Format-AUStatus of the whole list.
+      InventoryApps      The App Inventory entries (ConvertTo-AUInventoryApps: one per DisplayName,
+                         newest version, version 19's seven fields), or $null when discovery failed
+                         or App Usage didn't run; then the inventory uses its own read (D36).
+      AppFields          Hashtable keyed by AppName (ignoring case) of the usage fields for each
+                         InventoryApps entry (Get-AUAppUsage: AppLastUsedDate, AppUsageStatus,
+                         AppLastRanDate, AppInFocusSeconds, AppUsersWithUse, AppMatchedExeCount,
+                         AppRunsAsService), or $null whenever InventoryApps is $null.
+      ExeEntries         The ExeUsage blob entries (ConvertTo-AUExeUsage), or $null.
+      UnmatchedExeCount  UnmatchedExeCount_d (Get-AUUnmatchedExeCount), or $null.
+      WatchingSince      The ledger's WatchingSince (a Utc DateTime), or $null.
+      ProfilesFound      ProfilesFound_d, or $null.
+      ProfilesRead       ProfilesRead_d, or $null.
+      MappingsVersion    MappingsVersion_s ('' when our rules didn't load).
+      CustomerMappingsHash  CustomerMappingsHash_s ('' unless the customer file was used).
+      DeviceColumns      Ordered dictionary of row 1's device columns (New-AUDeviceColumns), named
+                         for LogAPIMode, without the run columns RunId_g, RowIndex_d, and RowCount_d.
+      LedgerPath         C:\Windows\AppUsage_<Serial>.json, or $null when App Usage didn't get that far.
+      OutboxPath         C:\Windows\AppUsage_<Serial>_outbox, the same serial (Get-AUOutboxPath), or $null.
+      Timings            Ordered dictionary of stage name to milliseconds, and Total.
+.PARAMETER RunId
+    The run's GUID; a new one when it's blank or isn't a GUID.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode, for the device column names.
+.PARAMETER Serial
+    The device's serial number for the ledger and outbox names; read from Win32_BIOS when not given.
+.PARAMETER ComputerName
+    The computer name, used when the serial is blank.
+#>
+    param (
+        [string]$RunId,
+        [string]$LogAPIMode = 'LogIngestionAPI',
+        [string]$Serial,
+        [string]$ComputerName = $env:COMPUTERNAME
+    )
+
+    $Version = [string]$ScriptVersion
+    try
+    {
+        # Constrained Language Mode first: only plain types and cmdlets until it's known to be Full.
+        $Mode = ''
+        try { $Mode = [string](Get-AULanguageMode) } catch { $Mode = '' }
+        if ($Mode -cne 'FullLanguage')
+        {
+            if ($Mode -notmatch '^[A-Za-z]+$') { $Mode = 'Unknown' }
+            $Result = New-AUResult -RunId $RunId
+            $Result.StatusTokens = @("LanguageMode:$Mode", 'skipped')
+            $Result.Status = "LanguageMode:$Mode; skipped"
+            $Result.DeviceColumns = New-AUDeviceColumns -Result $Result -LogAPIMode $LogAPIMode -ScriptVersion $Version
+            Write-CMTraceLog -Message "App Usage: skipped, because the language mode is $Mode, not FullLanguage (D37)." -Component 'AppUsage' -Type 2
+            return $Result
+        }
+
+        $Total = [Diagnostics.Stopwatch]::StartNew()
+        $Guid = [guid]::Empty
+        if (-not [guid]::TryParse([string]$RunId, [ref]$Guid))
+        {
+            if ($RunId) { Write-CMTraceLog -Message "App Usage: RunId '$RunId' isn't a GUID, so this run gets a new one." -Component 'AppUsage' -Type 2 }
+            $Guid = [guid]::NewGuid()
+        }
+        $Result = New-AUResult -RunId $Guid.ToString()
+        $MinFocus = $MinFocusSecondsForUse -as [double]
+        if ($null -eq $MinFocus) { $MinFocus = [double]1 }
+        $Run = [pscustomobject]@{
+            RunId                    = $Result.RunId
+            Serial                   = [string]$Serial
+            SerialGiven              = $PSBoundParameters.ContainsKey('Serial')
+            ComputerName             = [string]$ComputerName
+            IncludeStore             = ($CollectUWPInventory -eq $true)
+            MinFocusSeconds          = $MinFocus
+            CustomerMappingsPath     = [string]$AppUsageCustomerMappingsPath
+            Embedded                 = [string]$script:AppUsageMappingsEmbedded
+            BesideDir                = [string]$PSScriptRoot
+            Mappings                 = $null
+            CustomerRulesUnavailable = $false
+            LedgerPath               = $null
+            Tokens                   = New-Object 'System.Collections.Generic.List[string]'
+            Timings                  = $Result.Timings
+            Result                   = $Result
+        }
+        Write-CMTraceLog -Message "App Usage: starting run $($Run.RunId) (Store apps $($Run.IncludeStore), focus floor $MinFocus s)." -Component 'AppUsage'
+
+        try
+        {
+            # Every stream is captured, so a stray Write-Host, warning, or error never reaches the console (D40).
+            $Stray = Invoke-AURun -Run $Run *>&1
+            foreach ($Item in @($Stray))
+            {
+                if ($null -ne $Item) { Write-CMTraceLog -Message "App Usage: unexpected output: $Item" -Component 'AppUsage' -Type 2 }
+            }
+        }
+        catch
+        {
+            Add-AUStatusToken $Run.Tokens 'AppUsageFailed'
+            Clear-AUResultData $Result
+            Write-CMTraceLog -Message "App Usage: the run failed, so its usage results are blank: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        }
+
+        $Result.StatusTokens = $Run.Tokens.ToArray()
+        try { $Result.Status = Format-AUStatus $Result.StatusTokens }
+        catch
+        {
+            $Result.StatusTokens = @('AppUsageFailed')
+            $Result.Status = 'AppUsageFailed'
+        }
+        $Result.DeviceColumns = New-AUDeviceColumns -Result $Result -LogAPIMode $LogAPIMode -ScriptVersion $Version
+        $Result.Timings['Total'] = [long]$Total.ElapsedMilliseconds
+        $Exes = 0
+        if ($null -ne $Result.ExeEntries) { $Exes = @($Result.ExeEntries).Count }
+        $AppCount = 'none'
+        if ($null -ne $Result.InventoryApps) { $AppCount = @($Result.InventoryApps).Count }
+        Write-CMTraceLog -Message "App Usage: run $($Result.RunId) finished in $($Total.ElapsedMilliseconds) ms: $($Result.Status); inventory apps $AppCount, $Exes executable entries, $($Result.UnmatchedExeCount) unmatched." -Component 'AppUsage'
+        return $Result
+    }
+    catch
+    {
+        # Last resort: even the result couldn't be built normally. Plain types only, as in New-AUResult.
+        try { Write-CMTraceLog -Message "App Usage: failed before a result was built: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 } catch { }
+        $Fallback = New-Object PSObject -Property ([ordered]@{
+                RunId = $RunId; Status = 'AppUsageFailed'; StatusTokens = @('AppUsageFailed'); InventoryApps = $null; AppFields = $null; ExeEntries = $null
+                UnmatchedExeCount = $null; WatchingSince = $null; ProfilesFound = $null; ProfilesRead = $null; MappingsVersion = ''; CustomerMappingsHash = ''
+                DeviceColumns = $null; LedgerPath = $null; OutboxPath = $null; Timings = [ordered]@{}
+            })
+        try { $Fallback.DeviceColumns = New-AUDeviceColumns -Result $Fallback -LogAPIMode $LogAPIMode -ScriptVersion $Version } catch { }
+        return $Fallback
+    }
 }#endfunction
 #endregion APPUSAGE
 

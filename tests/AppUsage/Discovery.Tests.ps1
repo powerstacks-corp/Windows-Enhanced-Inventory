@@ -435,7 +435,7 @@ Describe 'Get-AUInstalledApps' -Skip:(-not $script:IsAdmin) {
     It 'returns one object and writes nothing else to the pipeline' {
         $Output = @(Get-AUInstalledApps -Users @(New-TestUser $script:LoadedSid 'Loaded' $script:AlicePath))
         $Output.Count | Should -Be 1
-        $Output[0].PSObject.Properties.Name | Should -Be @('Apps', 'ScopeRead', 'MsiFileMap', 'ProfilesFound', 'ProfilesRead')
+        $Output[0].PSObject.Properties.Name | Should -Be @('Apps', 'ScopeRead', 'MsiFileMap', 'ProfilesFound', 'ProfilesRead', 'MsiFileMapRead', 'HiveUnloadFailures')
     }
 }
 
