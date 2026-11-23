@@ -3197,6 +3197,34 @@ function Get-AUAppFolders
     return , $Folders.ToArray()
 }#endfunction
 
+function Get-AUOwnInstallFolder
+{
+    <#
+.SYNOPSIS
+    Returns an installed app's InstallLocation as a folder ending with \, or $null when it's blank,
+    not rooted, or a broad root.
+.DESCRIPTION
+    For Get-AUAppUsage's install-folder check, which must not take a shared folder for the app's
+    own: only InstallLocation counts (a DisplayIcon or UninstallString folder can be a shared
+    updater's, such as Click-to-Run's), and a broad root never does: a drive root, Program Files,
+    Program Files (x86), ProgramData, Windows, Users, a user profile root (Users\<name>), and a
+    user's AppData\Local\Programs, on any drive. Compared ignoring case, with trailing \ trimmed.
+.PARAMETER App
+    The installed-app entry.
+#>
+    param (
+        [pscustomobject]$App
+    )
+
+    $Folder = ([string]$App.InstallLocation).Trim().Trim('"').Replace('/', '\').TrimEnd('\')
+    if ($Folder -notmatch '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)\\[^\\]') { return $null }
+    if ($Folder -match $script:AUBroadInstallRoot) { return $null }
+    return $Folder + '\'
+}#endfunction
+
+# Folders that hold many apps, never one app's install folder (Get-AUOwnInstallFolder). -match ignores case.
+$script:AUBroadInstallRoot = '^[A-Za-z]:\\(Program Files|Program Files \(x86\)|ProgramData|Windows|Users(\\[^\\]+(\\AppData\\Local\\Programs)?)?)$'
+
 function Select-AUCandidate
 {
     <#
@@ -5509,8 +5537,9 @@ function Get-AUAppUsage
     WatchingSince), RanNotUsed (a matched exe ran since then), Ambiguous (an unresolved exe with this
     app among its CandidateTargets ran since then, or, for an app that would otherwise be NotUsed, an
     unmatched exe ran since then whose name is one of the app's known or matched exes, a wildcard known
-    exe compared with -like (D30), or whose RunPath is inside one of the app's install folders
-    (Get-AUAppFolders), as for a sibling under a target pattern that matches several apps), NotUsed
+    exe compared with -like (D30), or an unmatched exe with credited use since then whose RunPath is
+    inside the app's own InstallLocation (Get-AUOwnInstallFolder, never a broad root), as for a
+    sibling under a target pattern that matches several apps), NotUsed
     (the app has known exes, or matched exes, and none ran, matched or not), NotCovered (none known).
     An exe matched to a target that no installed app is counts as unmatched here, so a rule whose
     target isn't installed never makes another app NotUsed. An exe matched to another installed app
@@ -5585,14 +5614,16 @@ function Get-AUAppUsage
     # An app whose known exe ran unmatched (an unverified build, say) is Ambiguous, never NotUsed (D30).
     # An entry matched to a target that isn't installed counts as unmatched here.
     $UnmatchedRan = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    # Every folder above the RunPath of those entries, ending with \, so an app whose install folder
-    # holds one is Ambiguous, never NotUsed: a sibling under a target pattern knows the rule's exe, not
-    # its own unmatched one.
+    # Every folder above the RunPath of those entries that also have credited use since WatchingSince
+    # (Get-AUDerivedUse, the roll-up's own definition), ending with \, so an app whose own install
+    # folder (Get-AUOwnInstallFolder) holds one is Ambiguous, never NotUsed: a sibling under a target
+    # pattern knows the rule's exe, not its own unmatched one. Background, SYSTEM, and service runs
+    # don't count, so an updater or helper in the app's folder never hides a correct NotUsed.
     $UnmatchedFolders = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $AddUnmatched = {
-        param ([string]$Exe, $Facts)
+        param ([string]$Exe, $Facts, [bool]$Used)
         if ($Exe) { [void]$UnmatchedRan.Add($Exe) }
-        if ($null -eq $Facts) { return }
+        if (-not $Used -or $null -eq $Facts) { return }
         $RunPath = ([string]$Facts.RunPath).Trim().Replace('/', '\')
         for ($At = $RunPath.IndexOf('\'); $At -ge 0; $At = $RunPath.IndexOf('\', $At + 1)) { [void]$UnmatchedFolders.Add($RunPath.Substring(0, $At + 1)) }
     }
@@ -5615,7 +5646,7 @@ function Get-AUAppUsage
             if (-not $RanSince) { continue }
             $Exe = ([string]$Entry.ExeName).Trim()
             if (-not $Exe) { $Exe = ([string]$Entry.ExeInfo).Trim() }
-            & $AddUnmatched $Exe $Entry.Facts
+            & $AddUnmatched $Exe $Entry.Facts $UsedSince
             if ($null -eq $Target) { continue }
             $Candidates = [Collections.Generic.List[string]]::new()
             foreach ($Candidate in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Candidate)) { $Candidates.Add(([string]$Candidate).Trim()) } }
@@ -5634,7 +5665,7 @@ function Get-AUAppUsage
         $Names = @(Get-AUTargetAppNames $Target $Index)
         # A target that isn't installed (a rule whose app is absent, or an uninstalled retained target):
         # the exe may belong to an installed app that knows it, so it counts as unmatched (final review A2).
-        if ($Names.Count -eq 0 -and $RanSince) { & $AddUnmatched $Exe $Entry.Facts }
+        if ($Names.Count -eq 0 -and $RanSince) { & $AddUnmatched $Exe $Entry.Facts $UsedSince }
         foreach ($Name in $Names)
         {
             $State = $States[$Name]
@@ -5705,13 +5736,13 @@ function Get-AUAppUsage
                             if ($Hit) { $Status = 'Ambiguous'; break }
                         }
                     }
-                    # An unmatched exe that ran from inside one of the app's install folders (final review A1).
+                    # An unmatched exe with credited use from inside the app's own install folder (final review A1).
                     if ($Status -ceq 'NotUsed' -and $UnmatchedFolders.Count -gt 0 -and $null -ne $AppsByName[$Trimmed])
                     {
                         foreach ($App in $AppsByName[$Trimmed])
                         {
-                            foreach ($Folder in (Get-AUAppFolders $App)) { if ($UnmatchedFolders.Contains($Folder)) { $Status = 'Ambiguous'; break } }
-                            if ($Status -ceq 'Ambiguous') { break }
+                            $Folder = Get-AUOwnInstallFolder $App
+                            if ($Folder -and $UnmatchedFolders.Contains($Folder)) { $Status = 'Ambiguous'; break }
                         }
                     }
                 }

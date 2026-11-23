@@ -546,6 +546,24 @@ Describe 'Get-AUAppUsage with the shipped and example rules (final review A)' {
         $usage['Microsoft Office LTSC Professional Plus 2021 - en-us'].AppUsageStatus | Should -BeExactly 'NotCovered'
     }
 
+    It 'keeps Microsoft 365 Apps NotUsed when only OfficeClickToRun.exe ran as SYSTEM and sdxhelper.exe ran in the background from the Office folder (re-review)' {
+        $c2r = 'C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe'
+        $apps = @((New-TestApp 'Microsoft 365 Apps for enterprise - en-us' 'Microsoft Corporation' @{ InstallLocation = 'C:\Program Files\Microsoft Office'; DisplayIcon = $c2r; UninstallString = ('"' + $c2r + '" scenario=install scenariosubtype=ARP sourcetype=None productstoremove=O365ProPlusRetail.16_en-us_x-none culture=en-us version.16=16.0') }))
+        $service = New-TestEntry @{ UserSid = $script:SystemSid; UserType = 'System'; ExeInfo = '!!officeclicktorun.exe!2026/11/01:00:00:00!0c2r!'; ExeName = 'officeclicktorun.exe'; Role = 'Unmatched'; InstallStatus = 'Unmatched'; Target = (New-TestUnresolved); LastRanTime = $script:Today; Facts = (New-TestFacts @{ ExeName = 'officeclicktorun.exe'; RunPath = $c2r; FileCompanyName = 'Microsoft Corporation'; FileProductName = 'Microsoft Office'; FileDescription = 'Microsoft Office Click-to-Run (SxS)'; IsServiceBinary = $true }) }
+        $helper = New-TestEntry @{ ExeInfo = '!!sdxhelper.exe!2026/11/01:00:00:00!5d01!'; ExeName = 'sdxhelper.exe'; Role = 'Unmatched'; InstallStatus = 'Unmatched'; Target = (New-TestUnresolved); LastRanTime = $script:Today; LastInteractiveRunTime = $script:Today; Facts = (New-TestFacts @{ ExeName = 'sdxhelper.exe'; RunPath = 'C:\Program Files\Microsoft Office\root\Office16\sdxhelper.exe'; FileCompanyName = 'Microsoft Corporation'; FileProductName = 'Microsoft Office'; FileDescription = 'Microsoft Office SdxHelper' }) }
+        $usage = Get-TestRuleUsage @($service, $helper) $apps
+        $usage['Microsoft 365 Apps for enterprise - en-us'].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'still reports the review A sibling case Ambiguous: an Insiders build no rule matches, used from its install folder (re-review)' {
+        $apps = @($script:Stable, $script:Insiders)
+        $facts = New-TestCodeFacts 'Insiders Launcher.exe' 'Microsoft VS Code Insiders' 'Visual Studio Code - Insiders'
+        $facts.FactsVerified = $false; $facts.FileCompanyName = $null; $facts.FileProductName = $null; $facts.FileDescription = $null
+        $insiders = New-TestRuleEntry $facts $apps
+        $insiders.Target.MatchSection | Should -BeExactly 'None'
+        (Get-TestRuleUsage @($insiders) $apps)[$script:Insiders.DisplayName].AppUsageStatus | Should -BeExactly 'Ambiguous'
+    }
+
     It 'is NotCovered, never NotUsed, for an app whose only known exe the example file ignores, while that exe runs all day (A4)' {
         $code = '{11111111-2222-3333-4444-555555555555}'
         $apps = @((New-TestApp 'Contoso Kiosk' 'Contoso Ltd.' @{ ProductCode = $code; InstallLocation = 'C:\Program Files\Contoso\Kiosk\' }))
@@ -583,12 +601,40 @@ Describe 'Get-AUAppUsage siblings under a target pattern that matches several ap
         Get-TestSiblingStatus @($script:AlphaRun, (New-TestBetaRun)) | Should -BeExactly 'Ambiguous'
     }
 
-    It 'compares the install folder ignoring case, and also uses the DisplayIcon folder' {
+    It 'compares the install folder ignoring case, and uses InstallLocation only, not the DisplayIcon or UninstallString folder (re-review)' {
         Get-TestSiblingStatus @($script:AlphaRun, (New-TestBetaRun 'c:\PROGRAM FILES\contoso\beta\beta.exe')) | Should -BeExactly 'Ambiguous'
         $script:SiblingApps[1].InstallLocation = $null
         $script:SiblingApps[1].DisplayIcon = '"C:\Program Files\Contoso\Beta\beta.exe",0'
-        try { Get-TestSiblingStatus @($script:AlphaRun, (New-TestBetaRun)) | Should -BeExactly 'Ambiguous' }
-        finally { $script:SiblingApps[1].InstallLocation = 'C:\Program Files\Contoso\Beta'; $script:SiblingApps[1].DisplayIcon = $null }
+        $script:SiblingApps[1].UninstallString = '"C:\Program Files\Contoso\Beta\uninstall.exe" /x'
+        try { Get-TestSiblingStatus @($script:AlphaRun, (New-TestBetaRun)) | Should -BeExactly 'NotUsed' }
+        finally { $script:SiblingApps[1].InstallLocation = 'C:\Program Files\Contoso\Beta'; $script:SiblingApps[1].DisplayIcon = $null; $script:SiblingApps[1].UninstallString = $null }
+    }
+
+    It 'counts only an unmatched exe with credited use: one that ran only in the background, or only as SYSTEM, leaves NotUsed (re-review)' {
+        $background = New-TestBetaRun -Values @{ LastFocusOrInputTime = $null; FocusTotal = [double]0 }
+        $system = New-TestBetaRun -Values @{ UserSid = $script:SystemSid; UserType = 'System' }
+        foreach ($Entry in @($background, $system))
+        {
+            Get-TestSiblingStatus @($script:AlphaRun, $Entry) | Should -BeExactly 'NotUsed' -Because $Entry.UserType
+        }
+    }
+
+    It 'never treats a broad root as an install folder: <Root> (re-review)' -ForEach @(
+        @{ Root = 'C:\Program Files\'; Run = 'C:\Program Files\SomeVendor\tool.exe' }
+        @{ Root = 'c:\program files'; Run = 'C:\Program Files\SomeVendor\tool.exe' }
+        @{ Root = 'C:\Program Files (x86)\'; Run = 'C:\Program Files (x86)\SomeVendor\tool.exe' }
+        @{ Root = 'C:\ProgramData'; Run = 'C:\ProgramData\SomeVendor\tool.exe' }
+        @{ Root = 'C:\Windows\'; Run = 'C:\Windows\System32\tool.exe' }
+        @{ Root = 'C:\Users'; Run = 'C:\Users\alice\Downloads\tool.exe' }
+        @{ Root = 'C:\Users\alice\'; Run = 'C:\Users\alice\Downloads\tool.exe' }
+        @{ Root = 'C:\Users\alice\AppData\Local\Programs\\'; Run = 'C:\Users\alice\AppData\Local\Programs\Other\tool.exe' }
+        @{ Root = 'D:\'; Run = 'D:\Tools\tool.exe' }
+    ) {
+        $code = '{55555555-5555-5555-5555-555555555555}'
+        $apps = @((New-TestApp 'Fabrikam Legacy Tool' 'Fabrikam' @{ ProductCode = $code; InstallLocation = $Root }))
+        $tool = New-TestBetaRun $Run -Values @{ ExeName = 'tool.exe'; ExeInfo = '!!tool.exe!2026/11/01:00:00:00!f1f1!' }
+        $known = Get-AUKnownExes $apps @{ 'c:\program files\fabrikam\legacy.exe' = $code } $null @($tool)
+        (Invoke-TestAppUsage -Entries @($tool) -Apps $apps -Known $known)['Fabrikam Legacy Tool'].AppUsageStatus | Should -BeExactly 'NotUsed'
     }
 
     It 'stays NotUsed when the unmatched exe ran outside the folder, before WatchingSince, or is ignored' {
