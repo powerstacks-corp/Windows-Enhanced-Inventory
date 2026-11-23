@@ -7,7 +7,7 @@ App Usage (software metering) records which installed apps people actually use, 
 App Usage runs only where it's supported. On any other device, the inventory runs as before, and App Usage reports why it skipped in `AppUsageCollectionStatus_s`.
 
 - **Windows:** Windows 11 25H2 (build 26200) or later. Windows 10 and earlier Windows 11 releases report `UnsupportedOS`.
-- **PowerShell:** 64-bit Windows PowerShell 5.1, running as SYSTEM, the way Intune runs the script. In Constrained Language Mode, for example on a device whose application control policy doesn't allow the script, App Usage is skipped, and the inventory runs without App Usage. The reason, `LanguageMode:ConstrainedLanguage; skipped`, is in the script log; don't count on it reaching the workspace. See [Application Control](#application-control).
+- **PowerShell:** 64-bit Windows PowerShell 5.1, running as SYSTEM, the way Intune runs the script, in Full Language mode. App Usage can't run in Constrained Language Mode. See [Application Control](#application-control).
 
 Before you turn it on:
 
@@ -44,13 +44,17 @@ App Usage records which apps people use on their devices, and for how long. That
 
 ## Application Control
 
-App Control for Business (formerly WDAC) script rules apply to the whole inventory script, not only App Usage. On a device that enforces them, PowerShell runs any script the policy doesn't allow in Constrained Language Mode, and the inventory script might not run correctly in that mode. Some customers might need to sign the script:
+App Control for Business (formerly WDAC) script rules apply to the whole inventory script, not only App Usage. On a device that enforces them, PowerShell runs any script the policy doesn't allow in Constrained Language Mode.
+
+The inventory script doesn't work in Constrained Language Mode. It writes no log and uploads nothing, whether App Usage is on or off. App Usage can't run in that mode, and nothing about App Usage is logged.
+
+For the inventory script to run in Full Language mode, your application control policy must allow it:
 
 - If your policy doesn't already allow scripts that Intune deploys, sign `Intune_Windows_Inventory.ps1` with a code-signing certificate your policy trusts. The certificate's root must also be in the device's trusted root store.
 - Sign the script after you set its settings, and sign it again after any change, because editing the file invalidates the signature.
 - Your mapping rules are a separate file, so changing them doesn't mean signing the script again.
 
-In Constrained Language Mode, App Usage doesn't start, because it can't load the Windows components it needs. The inventory runs without App Usage. The reason, `LanguageMode:ConstrainedLanguage; skipped`, is in the script log; don't count on it reaching the workspace. For more information, see [Understand App Control script enforcement](https://learn.microsoft.com/windows/security/application-security/application-control/app-control-for-business/design/script-enforcement).
+For more information, see [Understand App Control script enforcement](https://learn.microsoft.com/windows/security/application-security/application-control/app-control-for-business/design/script-enforcement).
 
 ## Usage History on the Device
 
@@ -215,7 +219,7 @@ Row 1 of every run with App Usage on carries these columns, next to the App Inve
 |---|---|
 | `OK` | Nothing to report. |
 | `UnsupportedOS` | Windows is older than Windows 11 25H2 (build 26200). App Usage skipped. |
-| `LanguageMode:<mode>; skipped` | PowerShell isn't in Full Language mode, so App Usage skipped. In Constrained Language Mode the inventory runs without App Usage. The reason is in the script log; don't count on it reaching the workspace. See [Application Control](#application-control). |
+| `LanguageMode:<mode>; skipped` | PowerShell isn't in Full Language mode, so App Usage skipped. You won't see this token for Constrained Language Mode: in that mode the inventory script writes no log and uploads nothing. See [Application Control](#application-control). |
 | `AppUsageFailed:OsBuild` | The Windows build number couldn't be read. App Usage skipped. |
 | `AppUsageFailed:Serial` | The serial number couldn't be read, so the usage history can't be named. App Usage skipped. A device with no serial number uses its computer name instead and isn't affected. |
 | `MappingsUnavailable:Missing` | The PowerStacks mapping rules aren't in the script, which happens when the script that ran is the repository's source file instead of the release build. App Usage skipped. See [Deploy the Release Build](#deploy-the-release-build). |
