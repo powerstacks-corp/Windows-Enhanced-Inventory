@@ -75,16 +75,25 @@ $Companions = @('Test-AppUsageMappings.ps1', 'customer-mappings.example.json')
 $StrictUtf8 = New-Object Text.UTF8Encoding($false, $true)
 $RegionPattern = '(?ms)^#region APPUSAGE\r?\n(.*?)^#endregion APPUSAGE'
 $script:TempFile = $null
-$script:CreatedDir = $null
+# The output folders this build created, deepest first, and the release files it wrote.
+$script:CreatedDirs = New-Object 'System.Collections.Generic.List[string]'
+$script:WrittenFiles = New-Object 'System.Collections.Generic.List[string]'
 
-# Ends the build. A failed build removes its temporary file, and the output folder if it made it
-# and it's still empty, so nothing that looks like a release is left.
+# Ends the build. A failed build removes its temporary file, the release files it wrote (the script
+# and any companion, even a partial copy), and the output folders it made once they're empty, so
+# nothing that looks like a release is left.
 function Stop-Build([int]$Code, [string]$Message)
 {
     if ($Code -ne 0)
     {
-        if ($script:TempFile -and (Test-Path -LiteralPath $script:TempFile)) { Remove-Item -LiteralPath $script:TempFile -Force }
-        if ($script:CreatedDir -and (Test-Path -LiteralPath $script:CreatedDir) -and -not (Get-ChildItem -LiteralPath $script:CreatedDir -Force)) { Remove-Item -LiteralPath $script:CreatedDir -Force }
+        foreach ($File in @($script:TempFile) + @($script:WrittenFiles))
+        {
+            try { if ($File -and (Test-Path -LiteralPath $File)) { [IO.File]::Delete($File) } } catch { Write-Output "Couldn't remove ${File}: $($_.Exception.Message)" }
+        }
+        foreach ($Dir in $script:CreatedDirs)
+        {
+            try { if ((Test-Path -LiteralPath $Dir) -and -not (Get-ChildItem -LiteralPath $Dir -Force)) { [IO.Directory]::Delete($Dir) } } catch { Write-Output "Couldn't remove ${Dir}: $($_.Exception.Message)" }
+        }
     }
     if ($Message) { Write-Output $Message }
     exit $Code
@@ -309,14 +318,22 @@ foreach ($Name in $Companions)
 }
 if (-not (Test-Path -LiteralPath $OutDir -PathType Container))
 {
-    [void](New-Item -ItemType Directory -Path $OutDir -Force)
-    $script:CreatedDir = $OutDir
+    # Every level that isn't there yet, deepest first, so a failed build can remove them all.
+    $Missing = $OutDir
+    while ($Missing -and -not (Test-Path -LiteralPath $Missing))
+    {
+        $script:CreatedDirs.Add($Missing)
+        $Missing = Split-Path -Path $Missing -Parent
+    }
+    try { [void](New-Item -ItemType Directory -Path $OutDir -Force) }
+    catch { Stop-Build 2 "The output folder couldn't be created: $($_.Exception.Message)" }
 }
 if (Test-Path -LiteralPath (Join-Path $OutDir 'customer-mappings.json')) { Stop-Build 2 "The output folder holds a customer-mappings.json. A release never ships one; use an empty folder: $OutDir" }
 
 $OutBytes = (New-Object Text.UTF8Encoding($false)).GetBytes($Output)
 $script:TempFile = Join-Path $OutDir ('.build-' + [guid]::NewGuid().ToString('N') + '.tmp')
-[IO.File]::WriteAllBytes($script:TempFile, $OutBytes)
+try { [IO.File]::WriteAllBytes($script:TempFile, $OutBytes) }
+catch { Stop-Build 2 "The release couldn't be written, so nothing was left: $($_.Exception.Message)" }
 
 # The written file's App Usage region, loaded the way _Import.ps1 loads it, in a fresh runspace:
 # Get-AUMappings must read the embedded rules.
@@ -346,15 +363,26 @@ Write-Output "Embedded mappings: $($Embedded.Length) characters; the built scrip
 $Left = $SizeLimit - $OutBytes.Length
 if ($Left -lt 0) { Stop-Build 1 "Output: $($OutBytes.Length) bytes, $(-$Left) bytes over the $SizeLimit-byte limit (Task 0.3). Intune refuses it, so nothing was built." }
 
-# 5. Move the output into place, then the rest of the release artifact set.
-Move-Item -LiteralPath $script:TempFile -Destination $OutPath -Force
-$script:TempFile = $null
-foreach ($Name in $Companions)
+# 5. Move the output into place, then the rest of the release artifact set. Any failure here
+# removes what this build wrote, so the script never ships without its companions.
+try
 {
-    $From = Join-Path $SourceDir $Name
-    $To = Join-Path $OutDir $Name
-    if (-not [string]::Equals([IO.Path]::GetFullPath($From), [IO.Path]::GetFullPath($To), [StringComparison]::OrdinalIgnoreCase)) { Copy-Item -LiteralPath $From -Destination $To -Force }
+    # A move in one folder is a rename, so a failed one leaves any earlier file there as it was.
+    Move-Item -LiteralPath $script:TempFile -Destination $OutPath -Force
+    $script:TempFile = $null
+    $script:WrittenFiles.Add($OutPath)
+    foreach ($Name in $Companions)
+    {
+        $From = Join-Path $SourceDir $Name
+        $To = Join-Path $OutDir $Name
+        if (-not [string]::Equals([IO.Path]::GetFullPath($From), [IO.Path]::GetFullPath($To), [StringComparison]::OrdinalIgnoreCase))
+        {
+            $script:WrittenFiles.Add($To)
+            Copy-Item -LiteralPath $From -Destination $To -Force
+        }
+    }
 }
+catch { Stop-Build 2 "The release artifacts couldn't be written, so none were left: $($_.Exception.Message)" }
 Write-Output "Release artifacts in ${OutDir}: $([IO.Path]::GetFileName($OutPath)), $($Companions -join ', ')."
 Write-Output "Output: $($OutBytes.Length) bytes of the $SizeLimit-byte limit (Task 0.3), $Left bytes left for the signature block. Measure the signed file."
 Stop-Build 0

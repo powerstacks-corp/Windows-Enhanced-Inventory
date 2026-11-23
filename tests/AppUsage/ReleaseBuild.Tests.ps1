@@ -278,6 +278,32 @@ Describe 'Build-InventoryRelease.ps1' {
         @(Get-ChildItem -LiteralPath $Existing -Force) | Should -BeNullOrEmpty
     }
 
+    It 'leaves nothing that looks like a release when writing it fails: <Failing> throws' -ForEach @(
+        @{ Failing = 'Move-Item' }
+        @{ Failing = 'Copy-Item' }
+    ) {
+        # The build runs in a child process with the failing cmdlet replaced; a Copy-Item failure
+        # writes part of the companion first, as a full disk would.
+        $Wrapper = Join-Path (New-TestDir "wrapper-$Failing") 'Invoke-FailingBuild.ps1'
+        $Stub = if ($Failing -eq 'Move-Item') { "function Move-Item { throw 'Move failed: the disk is full.' }" }
+        else { "function Copy-Item { param (`$LiteralPath, `$Destination, [switch]`$Force) [IO.File]::WriteAllText(`$Destination, 'part'); throw 'Copy failed: the disk is full.' }" }
+        [IO.File]::WriteAllText($Wrapper, "param (`$SourceScript, `$MappingsPath, `$OutFile)`r`n$Stub`r`n& '$Builder' -SourceScript `$SourceScript -MappingsPath `$MappingsPath -OutFile `$OutFile`r`nexit `$LASTEXITCODE`r`n")
+        $Copy = New-TestSource "writefail-$Failing"
+        $Dir = Split-Path $Copy
+        # Two folder levels the build creates, so both must go.
+        $Out = Join-Path $Dir 'made\deeper\Intune_Windows_Inventory.ps1'
+        $r = Invoke-TestScript $Wrapper @('-SourceScript', $Copy, '-MappingsPath', (Join-Path $Dir 'powerstacks-mappings.json'), '-OutFile', $Out)
+        $r.ExitCode | Should -Be 2 -Because $r.Output
+        $r.Output | Should -Match "couldn't be written"
+        Test-Path -LiteralPath (Join-Path $Dir 'made') | Should -BeFalse
+
+        # In an output folder that was already there: no script, no companion, no temporary file left.
+        $Existing = New-TestDir "writefail-$Failing\existing"
+        $r = Invoke-TestScript $Wrapper @('-SourceScript', $Copy, '-MappingsPath', (Join-Path $Dir 'powerstacks-mappings.json'), '-OutFile', (Join-Path $Existing 'Intune_Windows_Inventory.ps1'))
+        $r.ExitCode | Should -Be 2 -Because $r.Output
+        @(Get-ChildItem -LiteralPath $Existing -Force) | Should -BeNullOrEmpty
+    }
+
     It 'refuses to build over the source script' {
         $r = Invoke-TestBuild $SourceScript $ShippedMappings $SourceScript
         $r.ExitCode | Should -Be 2
