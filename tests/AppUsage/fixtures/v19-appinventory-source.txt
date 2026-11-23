@@ -1,0 +1,308 @@
+# Version 19 of Intune_Windows_Inventory.ps1 (commit 094a084), the two parts the App Inventory
+# tests compare against: the App Inventory region and the final status report, copied verbatim.
+# Kept in the repo so the tests need no git history (CI checks out one commit). Regenerate with
+# Export-TestV19Source in tests/AppUsage/_ImportInventory.ps1. Never edit by hand.
+
+# region APPINVENTORY
+if ($CollectAppInventory)
+{
+    Write-CMTraceLog "========== Starting App Inventory Collection =========="
+    #Set Name of Log
+    $AppLog = "PowerStacksAppInventory$(if($LogAPIMode -eq "LogIngestionAPI"){"_CL"})"
+    Write-CMTraceLog "App inventory log name: $AppLog"
+
+    Write-CMTraceLog "Determining currently logged on user..."
+    try
+    {
+        $CurrentLoggedOnUser = (Get-WmiObject -Class win32_computersystem -ErrorAction SilentlyContinue).UserName
+        if ($null -eq $CurrentLoggedOnUser)
+        {
+            Write-CMTraceLog "No user from win32_computersystem, attempting to get from explorer.exe process..."
+            $CurrentOwner = Get-CimInstance Win32_Process -Filter 'name = "explorer.exe"' -ErrorAction SilentlyContinue | Invoke-CimMethod -MethodName getowner
+            $CurrentLoggedOnUser = "$($CurrentOwner.Domain)\$($CurrentOwner.User)"
+        }
+        Write-CMTraceLog "Current logged on user: $CurrentLoggedOnUser"
+    }
+    catch
+    {
+        Write-CMTraceLog "Error determining logged on user: $($_.Exception.Message)" -ErrorMsg
+    }
+
+    Write-CMTraceLog "Translating user account to SID..."
+    $UserSid = $null
+    try
+    {
+        $AdObj = New-Object System.Security.Principal.NTAccount($CurrentLoggedOnUser)
+        $strSID = $AdObj.Translate([System.Security.Principal.SecurityIdentifier])
+        $UserSid = $strSID.Value
+        Write-CMTraceLog "User SID: $UserSid"
+    }
+    catch
+    {
+        # IdentityNotMappedException: the account can't be resolved to a SID (orphaned/renamed/deleted
+        # account, a stale explorer.exe owner, or a name the local resolver doesn't know). This is not
+        # fatal - fall back to matching the user's profile folder in the registry, and if that also
+        # fails, continue with no user SID (Get-InstalledApplications then returns machine-scope apps
+        # only, since it always scans the HKLM uninstall keys).
+        Write-CMTraceLog "Could not translate '$CurrentLoggedOnUser' to a SID ($($_.Exception.Message)). Trying profile-list fallback..." -WarningMsg
+        try
+        {
+            $userLeaf = ($CurrentLoggedOnUser -split '\\')[-1]
+            $UserSid = Get-CimInstance Win32_UserProfile -ErrorAction Stop |
+                Where-Object { -not $_.Special -and $_.LocalPath -and (Split-Path $_.LocalPath -Leaf) -ieq $userLeaf } |
+                Select-Object -First 1 -ExpandProperty SID
+            if ($UserSid)
+            {
+                Write-CMTraceLog "Resolved user SID from profile list: $UserSid"
+            }
+            else
+            {
+                Write-CMTraceLog "No matching user profile found; continuing without a user SID (machine-scope app inventory only)." -WarningMsg
+            }
+        }
+        catch
+        {
+            Write-CMTraceLog "Profile-list SID fallback failed ($($_.Exception.Message)); continuing without a user SID." -WarningMsg
+        }
+    }
+
+    Write-CMTraceLog "Calling Get-InstalledApplications for Win32 apps..."
+    $MyApps = Get-InstalledApplications -UserSid $UserSid
+    Write-CMTraceLog "Retrieved $($MyApps.Count) Win32 applications"
+    $MyApps | ForEach-Object { $_ | Add-Member -NotePropertyName AppType -NotePropertyValue 'Win32' -Force }
+
+    if ($CollectUWPInventory)
+    {
+        Write-CMTraceLog "UWP inventory enabled, calling Get-AppxInstalledApplications..."
+        $MyAppsAppx = Get-AppxInstalledApplications # Due to limitations of Get-AppxPackage on AADJ devices we don't use the SID
+        Write-CMTraceLog "Retrieved $($MyAppsAppx.Count) UWP applications"
+        $MyApps += $MyAppsAppx
+        Write-CMTraceLog "Combined total: $($MyApps.Count) applications (Win32 + UWP)"
+    }
+    else
+    {
+        Write-CMTraceLog "UWP inventory disabled, skipping"
+    }
+
+    Write-CMTraceLog "Deduplicating applications..."
+    $UniqueApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -eq 1 } ).Group
+    $DuplicatedApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -gt 1 } ).Group
+    Write-CMTraceLog "Found $($UniqueApps.Count) unique apps and $($DuplicatedApps.Count) duplicated apps"
+
+    Write-CMTraceLog "Selecting newest version of duplicated apps..."
+    $NewestDuplicateApp = ($DuplicatedApps | Group-Object DisplayName) | ForEach-Object { $_.Group | Sort-Object { [version]$_.DisplayVersion } -Descending | Select-Object -First 1 }
+    $CleanAppList = $UniqueApps + $NewestDuplicateApp | Sort-Object DisplayName
+    Write-CMTraceLog "Clean app list contains $($CleanAppList.Count) applications after deduplication"
+
+    Write-CMTraceLog "Building app array for upload..."
+    $AppArray = @()
+    $appArrayCount = 0
+    foreach ($App in $CleanAppList)
+    {
+        $tempapp = New-Object -TypeName PSObject
+
+        if ($null -ne $App.DisplayName)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value $App.DisplayName -Force
+            $appArrayCount++
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppName" -Value "" -Force
+        }
+
+        if ($null -ne $App.DisplayVersion)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value $App.DisplayVersion -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppVersion" -Value "" -Force
+        }
+
+        if ($null -ne $App.Publisher)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value $App.Publisher -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppPublisher" -Value "" -Force
+        }
+
+        if ($null -ne $App.AppType)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value $App.AppType -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppType" -Value "Unknown" -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "InstallDate" -and $App.InstallDate)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $App.InstallDate -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppInstallDate" -Value $null -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "UninstallString" -and $App.UninstallString)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $App.UninstallString -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallString" -Value $null -Force
+        }
+
+        if ($App.PSObject.Properties.Name -contains "PSPath" -and $App.PSPath)
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $App.PSPath.Split("::")[-1] -Force
+        }
+        else
+        {
+            $tempapp | Add-Member -MemberType NoteProperty -Name "AppUninstallRegPath" -Value $null -Force
+        }
+
+        $AppArray += $tempapp
+    }
+    Write-CMTraceLog "Added $appArrayCount applications to app array"
+
+    Write-CMTraceLog 'Converting app array to JSON...'
+    $InstalledAppJson = $AppArray | ConvertTo-Json
+    Write-CMTraceLog "App inventory JSON size: $($InstalledAppJson.Length) characters"
+
+    Write-CMTraceLog "Compressing app inventory JSON with GZip..."
+    try
+    {
+        $ms = New-Object System.IO.MemoryStream
+        $cs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
+        $sw = New-Object System.IO.StreamWriter($cs)
+        $sw.Write($InstalledAppJson)
+        $sw.Close()
+        $InstalledAppJson = [System.Convert]::ToBase64String($ms.ToArray())
+        Write-CMTraceLog "App inventory compressed successfully, Base64 size: $($InstalledAppJson.Length) characters"
+    }
+    catch
+    {
+        Write-CMTraceLog "Error compressing app inventory: $($_.Exception.Message)" -ErrorMsg
+        throw
+    }
+
+    Write-CMTraceLog "Building main app upload object..."
+    $MainApp = New-Object -TypeName PSObject
+    $MainApp | Add-Member -MemberType NoteProperty -Name "ComputerName$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})" -Value "$ComputerName" -Force
+    $MainApp | Add-Member -MemberType NoteProperty -Name "ManagedDeviceID$(if($LogAPIMode -eq "LogIngestionAPI"){"_g"})" -Value "$ManagedDeviceID" -Force
+
+    Write-CMTraceLog "Splitting app inventory into chunks..."
+    $InstalledAppJsonArr = $InstalledAppJson -split "(.{$(if($LogAPIMode -eq 'LogIngestionAPI'){64512}else{31744})})"
+    $i = 0
+    foreach ($InstalledApp in $InstalledAppJsonArr)
+    {
+        if ($InstalledApp.Length -gt 0 )
+        {
+            $i++
+            $MainApp | Add-Member -MemberType NoteProperty -Name ("InstalledApps" + $i.ToString() + "$(if($LogAPIMode -eq "LogIngestionAPI"){"_s"})") -Value $InstalledApp -Force
+        }
+    }
+    Write-CMTraceLog "App inventory split into $i chunk(s)"
+
+    if ($InstalledAppJson.Length -gt $(if ($LogAPIMode -eq "LogIngestionAPI")
+            {
+                10 * 63 * 1024
+            }
+            else
+            {
+                10 * 31 * 1024
+            }))
+    {
+        $errorMsg = "InstallApp is too big and exceed the $(if($LogAPIMode -eq 'LogIngestionAPI'){64}else{32})Kb limit per column for a single upload. Please increase number of columns (#10). Current payload size is: " + ($InstalledAppJson.Length / 1024).ToString("#.#") + "Kb"
+        Write-CMTraceLog $errorMsg -ErrorMsg
+        throw($errorMsg)
+    }
+
+    Write-CMTraceLog "Converting main app object to JSON for upload..."
+    $AppJson = if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        "[$($MainApp | ConvertTo-Json -Compress)]"
+    }
+    else
+    {
+        $MainApp | ConvertTo-Json
+    }
+    Write-CMTraceLog "Final app JSON payload size: $($AppJson.Length) characters"
+
+    # Submit the data to the API endpoint
+    Write-CMTraceLog "Uploading app inventory to Log Analytics (Mode: $LogAPIMode)..."
+    $ResponseAppInventory =
+    if ($LogAPIMode -eq "LogIngestionAPI")
+    {
+        Write-CMTraceLog "Calling Send-LogIngestionAPI for app inventory..."
+        Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $AppLog
+    }
+    else
+    {
+        Write-CMTraceLog "Calling Send-DataCollectorAPI for app inventory..."
+        Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body ([System.Text.Encoding]::UTF8.GetBytes($AppJson)) -logType $AppLog
+    }
+    Write-CMTraceLog "App inventory upload response: $ResponseAppInventory"
+}
+# end region APPINVENTORY
+
+# Report back status
+Write-CMTraceLog "========== Generating Final Status Report =========="
+$date = (Get-Date).ToUniversalTime().ToString($InventoryDateFormat)
+$OutputMessage = "InventoryDate: $date "
+
+if ($CollectDeviceInventory)
+{
+    Write-CMTraceLog "Checking device inventory upload status..."
+    if ($ResponseDeviceInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :")
+    {
+        $OutputMessage = $OutPutMessage + "DeviceInventory: OK " + $ResponseDeviceInventory
+        Write-CMTraceLog "Device inventory upload: SUCCESS"
+    }
+    else
+    {
+        $OutputMessage = $OutPutMessage + "DeviceInventory: Fail "
+        Write-CMTraceLog "Device inventory upload: FAILED" -ErrorMsg
+    }
+}
+if ($CollectAppInventory)
+{
+    Write-CMTraceLog "Checking app inventory upload status..."
+    if ($ResponseAppInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :")
+    {
+        $OutputMessage = $OutPutMessage + " AppInventory: OK " + $ResponseAppInventory
+        Write-CMTraceLog "App inventory upload: SUCCESS"
+    }
+    else
+    {
+        $OutputMessage = $OutPutMessage + " AppInventory: Fail "
+        Write-CMTraceLog "App inventory upload: FAILED" -ErrorMsg
+    }
+}
+if ($CollectDriverInventory)
+{
+    Write-CMTraceLog "Checking driver inventory upload status..."
+    if ($ResponseDriverInventory -match "$(if($LogAPIMode -eq 'LogIngestionAPI'){204}else{200}) :")
+    {
+        $OutputMessage = $OutPutMessage + " DriverInventory: OK " + $ResponseDriverInventory
+        Write-CMTraceLog "Driver inventory upload: SUCCESS"
+    }
+    else
+    {
+        $OutputMessage = $OutPutMessage + " DriverInventory: Fail "
+        Write-CMTraceLog "Driver inventory upload: FAILED" -ErrorMsg
+    }
+}
+
+Write-CMTraceLog "========== Script Execution Completed =========="
+Write-CMTraceLog $OutputMessage
+
+if ($Transcribe)
+{
+    Stop-Transcript | Out-Null
+}
+#endregion script
