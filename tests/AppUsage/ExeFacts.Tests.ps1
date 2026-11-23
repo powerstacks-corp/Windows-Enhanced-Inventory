@@ -445,7 +445,7 @@ Describe 'Find-AUExePath' {
     }
 }
 
-Describe 'Timed reads outside the allowlisted system folders' {
+Describe 'Timed reads' {
     BeforeAll {
         $script:SlowScript = 'Start-Sleep -Seconds 30'
     }
@@ -456,66 +456,31 @@ Describe 'Timed reads outside the allowlisted system folders' {
         Mock Write-CMTraceLog { }
     }
 
-    It 'finds the allowlisted system folders and their user-writable subfolders from the machine' {
-        $roots = Get-AUDirectReadRoots
+    It 'times every read, System32 and Program Files included: a spent budget skips them all without opening them' {
+        # A standard user can hold an opportunistic lock on any file they can open for reading (I1).
+        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
         $pf = [Environment]::GetFolderPath('ProgramFiles').TrimEnd('\')
-        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
-        foreach ($folder in @($pf, [Environment]::GetFolderPath('ProgramFilesX86').TrimEnd('\'), "$pf\WindowsApps", "$win\System32", "$win\SysWOW64", "$win\WinSxS", "$win\Microsoft.NET", "$win\SystemApps", "$win\ImmersiveControlPanel"))
-        {
-            @($roots.Allowed | Where-Object { [string]::Equals($_, $folder, [StringComparison]::OrdinalIgnoreCase) }).Count | Should -Be 1 -Because $folder
-        }
-        @($roots.Allowed).Count | Should -Be 9
-        foreach ($folder in @("$win\System32\Tasks", "$win\System32\spool\drivers\color", "$win\SysWOW64\Tasks", "$win\System32\com\dmp"))
-        {
-            @($roots.Excluded | Where-Object { [string]::Equals($_, $folder, [StringComparison]::OrdinalIgnoreCase) }).Count | Should -Be 1 -Because $folder
-        }
-        @($roots.Allowed + $roots.Excluded) | ForEach-Object { $_ | Should -Not -Match '%|\\$' }
-        (New-AUReadBudget).DirectRoots.Allowed.Count | Should -Be 9
-    }
-
-    It 'reads directly only inside the allowlist; C:\Windows\Temp, System32\Tasks, and the rest of Windows are timed' {
-        $pf = [Environment]::GetFolderPath('ProgramFiles').TrimEnd('\')
-        $pf86 = [Environment]::GetFolderPath('ProgramFilesX86').TrimEnd('\')
-        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
-        $roots = Get-AUDirectReadRoots
-        foreach ($direct in @("$win\System32\notepad.exe", "$pf\Contoso\app.exe", "$pf86\Contoso\app.exe", "$pf\WindowsApps\Contoso.App_1.0.0.0_x64__abc\app.exe",
-                "$win\SysWOW64\where.exe", "$win\WinSxS\amd64_x\tool.exe", "$win\Microsoft.NET\Framework64\v4.0.30319\ngen.exe", "$win\SystemApps\App\app.exe",
-                "$win\ImmersiveControlPanel\SystemSettings.exe", "$($pf.ToUpperInvariant())\CONTOSO\APP.EXE", ($pf.Replace('\', '/') + '/Contoso/app.exe'), "\\?\$win\System32\notepad.exe",
-                "$win\System32\drivers\..\notepad.exe"))
-        {
-            Test-AUDirectRead $direct $roots | Should -BeTrue -Because $direct
-        }
-        foreach ($timed in @("$win\Temp\setup.exe", "$win\Tasks\x.exe", "$win\Tracing\x.exe", "$win\explorer.exe", "$win\IMECache\x\setup.exe", "$win\ccmcache\1\setup.exe",
-                "$win\System32\Tasks\evil.exe", "$win\System32\Tasks\Microsoft\x.exe", "$win\System32\spool\drivers\color\x.exe", "$win\System32\spool\PRINTERS\x.exe",
-                "$win\System32\Microsoft\Crypto\RSA\MachineKeys\x.exe", "$win\SysWOW64\Tasks\x.exe", "$win\SysWOW64\com\dmp\x.exe",
-                'C:\Users\alice\AppData\Local\Contoso\app.exe', 'C:\Users\alice\Downloads\setup.exe', 'C:\ProgramData\Contoso\agent.exe', 'E:\probe\ProbeOnE.exe',
-                "$pf\..\Users\alice\x.exe", "${pf}X\app.exe", "$win\System32Evil\x.exe", "$win\System32", 'Contoso\app.exe', '', $null))
-        {
-            Test-AUDirectRead $timed $roots | Should -BeFalse -Because "$timed"
-        }
-        # Without roots, it reads them itself.
-        Test-AUDirectRead "$win\System32\notepad.exe" | Should -BeTrue
-        Test-AUDirectRead "$win\System32\Tasks\evil.exe" | Should -BeFalse
-    }
-
-    It 'lets an excluded folder win over the allowed folder that holds it' {
-        $roots = [pscustomobject]@{ Allowed = @('D:\Apps'); Excluded = @('D:\Apps\Drop') }
-        Test-AUDirectRead 'D:\Apps\tool.exe' $roots | Should -BeTrue
-        Test-AUDirectRead 'D:\Apps\Drop\tool.exe' $roots | Should -BeFalse
-        Test-AUDirectRead 'D:\AppsX\tool.exe' $roots | Should -BeFalse
-    }
-
-    It 'routes reads by the allowlist: a System32 file is read directly, C:\Windows\Temp and System32\Tasks are timed' {
-        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
-        # A spent budget: a timed read is skipped without opening the file; a direct read still happens.
         $budget = New-AUReadBudget -TotalSeconds 0
-        $direct = Read-AUFile "$win\System32\notepad.exe" -ReadBudget $budget
-        $direct.Status | Should -BeExactly 'OK'
-        $direct.Before.Subsystem | Should -BeExactly 'GUI'
-        (Read-AUFile "$win\Temp\au-test-$([guid]::NewGuid().ToString('N')).exe" -ReadBudget $budget).Status | Should -BeExactly 'Skipped'
-        (Read-AUFile "$win\System32\Tasks\au-test-$([guid]::NewGuid().ToString('N')).exe" -ReadBudget $budget).Status | Should -BeExactly 'Skipped'
-        $budget.Skipped | Should -Be 2
+        foreach ($path in @("$win\System32\notepad.exe", "$win\SysWOW64\where.exe", "$pf\Windows NT\Accessories\wordpad.exe", "$win\Temp\au-test-$([guid]::NewGuid().ToString('N')).exe", $script:Path))
+        {
+            (Read-AUFile $path -ReadBudget $budget).Status | Should -BeExactly 'Skipped' -Because $path
+        }
+        $budget.Skipped | Should -Be 5
+        $budget.Reads | Should -Be 0
         $budget.Runspace | Should -BeNullOrEmpty
+    }
+
+    It 'reads a System32 file in the runspace' {
+        $budget = New-AUReadBudget
+        try
+        {
+            $read = Read-AUFile (Join-Path $env:SystemRoot 'System32\notepad.exe') -ReadBudget $budget
+            $read.Status | Should -BeExactly 'OK'
+            $read.Before.Subsystem | Should -BeExactly 'GUI'
+            $budget.Reads | Should -Be 1
+            $budget.Runspace | Should -Not -BeNullOrEmpty
+        }
+        finally { Close-AUReadBudget $budget }
     }
     It 'defaults to a 5-second timeout per file and a 120-second total' {
         $budget = New-AUReadBudget
@@ -524,7 +489,6 @@ Describe 'Timed reads outside the allowlisted system folders' {
     }
 
     It 'reads a user-writable file in a runspace, reuses the runspace, and verifies the build' {
-        Test-AUDirectRead $script:Path | Should -BeFalse
         $budget = New-AUReadBudget
         try
         {
@@ -562,7 +526,7 @@ Describe 'Timed reads outside the allowlisted system folders' {
         $timer.ElapsedMilliseconds | Should -BeLessThan 500
     }
 
-    It 'stops reading user-writable files once the run budget is spent, without waiting' {
+    It 'stops reading files once the run budget is spent, without waiting' {
         Mock Get-AUFileReadScript { $script:SlowScript }
         $budget = New-AUReadBudget -TotalSeconds 1 -FileTimeoutSeconds 0.4
         $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -614,14 +578,6 @@ Describe 'Timed reads outside the allowlisted system folders' {
             $budget.Runspace | Should -Not -BeNullOrEmpty
         }
         finally { Close-AUReadBudget $budget }
-    }
-
-    It 'reads allowlisted paths directly even when the budget is spent' {
-        Mock Test-AUDirectRead { $true }
-        $budget = New-AUReadBudget -TotalSeconds 0
-        (Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget).FactsVerified | Should -BeTrue
-        $budget.Skipped | Should -Be 0
-        $budget.Runspace | Should -BeNullOrEmpty
     }
 }
 
@@ -720,16 +676,29 @@ Describe 'Get-AUExeFacts' {
         $facts.RunPath | Should -BeExactly $script:Path
     }
 
-    It 'is unverified when the file changes while its version info is read' {
-        # The direct read, so the mocked file reads below apply.
-        Mock Test-AUDirectRead { $true }
+    It 'reads the fingerprint again after the version info, so a file changed mid-read shows a different After' {
+        # Read-AUFileFacts is what the timed runspace runs; called here, the mocks apply.
         New-TestPe $script:Path $script:OldBuild 0x10
-        $info = New-TestExeInfo 'app.exe' $script:OldBuild 0x10
         $script:Reads = 0
         Mock Get-AUPeFingerprint {
             $script:Reads++
             if ($script:Reads -eq 1) { return [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' } }
             return [pscustomobject]@{ LinkTimeUtc = $script:NewBuild; CheckSum = [uint32]0x20; Subsystem = 'GUI' }
+        }
+        $read = Read-AUFileFacts $script:Path -WithVersion
+        $read.Status | Should -BeExactly 'OK'
+        $read.Before.LinkTimeUtc | Should -Be $script:OldBuild
+        $read.After.LinkTimeUtc | Should -Be $script:NewBuild
+        $read.Info | Should -Not -BeNullOrEmpty
+    }
+
+    It 'is unverified when the file changes while its version info is read' {
+        New-TestPe $script:Path $script:OldBuild 0x10
+        $info = New-TestExeInfo 'app.exe' $script:OldBuild 0x10
+        $script:VersionInfo = Get-TestVersionInfo $script:Notepad
+        Mock Read-AUFile {
+            [pscustomobject]@{ Status = 'OK'; Before = [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' }; Info = $script:VersionInfo
+                After = [pscustomobject]@{ LinkTimeUtc = $script:NewBuild; CheckSum = [uint32]0x20; Subsystem = 'GUI' }; Error = $null; Owner = $null }
         }
         $facts = Get-AUExeFacts $script:Path $info @{} @{} $script:TestSid
         $facts.FactsVerified | Should -BeFalse
@@ -762,12 +731,23 @@ Describe 'Get-AUExeFacts' {
         Should -Invoke Get-AUPeFingerprint -Times 0
     }
 
-    It 'never throws: a failing version read leaves the build unverified and is logged' {
-        # The direct read, so the mocked file reads below apply.
-        Mock Test-AUDirectRead { $true }
-        Mock Write-CMTraceLog { }
+    It 'keeps a failing version read''s message in Error' {
         New-TestPe $script:Path $script:OldBuild 0x10
         Mock Get-AUVersionInfo { throw 'boom' }
+        $read = Read-AUFileFacts $script:Path -WithVersion
+        $read.Status | Should -BeExactly 'OK'
+        $read.Info | Should -BeNullOrEmpty
+        $read.Error | Should -Match 'boom'
+        $read.After | Should -Not -BeNullOrEmpty
+    }
+
+    It 'never throws: a failing version read leaves the build unverified and is logged' {
+        Mock Write-CMTraceLog { }
+        New-TestPe $script:Path $script:OldBuild 0x10
+        Mock Read-AUFile {
+            [pscustomobject]@{ Status = 'OK'; Before = [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' }; Info = $null
+                After = [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' }; Error = 'boom'; Owner = $null }
+        }
         $facts = Get-AUExeFacts $script:Path (New-TestExeInfo 'app.exe' $script:OldBuild 0x10) @{} @{} $script:TestSid
         $facts.FactsVerified | Should -BeFalse
         $facts.RunPath | Should -BeExactly $script:Path
