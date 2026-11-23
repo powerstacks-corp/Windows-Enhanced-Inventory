@@ -101,6 +101,36 @@ App Usage also sends one entry for each executable build it has seen and each ap
 | `RanAsSystemOnly` | `true` when it ran, and every run was under SYSTEM or a service account. |
 | `CandidateTargets` | Only for an executable left unmatched with two or more candidate apps: the DisplayNames of those apps. Absent otherwise. |
 
+### How the Data Is Sent
+
+When App Usage is on, every run gets a run ID, and every App Inventory row it sends carries three more columns:
+
+| Column | Meaning |
+|---|---|
+| `RunId_g` | A GUID, one per run. Every row of the run has the same one. |
+| `RowIndex_d` | This row's position in the run, from 1. |
+| `RowCount_d` | How many rows the run sent. |
+
+The installed apps (`InstalledApps1_s` to `InstalledApps10_s`) and the executable list (`ExeUsage1_s` to `ExeUsage10_s`) are each compressed and cut into pieces of 64,512 characters (31,744 with the classic Data Collector API), the way the App Inventory has always cut the installed apps.
+
+- **One row when it fits.** When the whole row is at most 943,718 bytes, the script's upload limit, which is just under the 1 MB the Logs Ingestion API accepts in one call, and each list fits in 10 pieces, the run sends one row, with `RowIndex_d` and `RowCount_d` both `1`. That's nearly every device.
+- **A split run when it doesn't.** A large device, such as a shared PC or a multi-session host, sends its run as several rows of the same table, each in its own call. Row 1 has every column the App Inventory sends, the App Usage device columns, and as many pieces as fit. Rows 2 and on have only `ComputerName_s`, `ManagedDeviceID_g`, the three run columns, and the remaining pieces. Pieces fill in order, installed apps first, then executables, and each row numbers its pieces from 1, up to 10 for each list.
+
+To rebuild a list, take its pieces from every row of the run, ordered by `RowIndex_d` and then by column number, join them, and decode them as before. A run is complete when all `RowCount_d` rows with its `RunId_g` are present. Reports use each device's latest complete run and never show part of a run. Rows 2 and on aren't devices, so a query that takes each device's latest row has to take its latest complete run instead.
+
+Turning App Usage on requires the BI for Intune release that reads split runs. When App Usage is off, the script sends exactly the row it always sent, with no run columns.
+
+### Rows That Fail to Send
+
+Each row gets the script's usual upload retries. A row that still fails is saved on the device, in `C:\Windows\AppUsage_<Serial>_outbox\`, next to the usage history and with the same `<Serial>`, as `<RunId>-<RowIndex>.json`. The next run sends it first, unchanged.
+
+- Only SYSTEM and administrators can open the folder and its files, because the rows hold usage data. If something else is at that path, such as a link, a folder owned by another account, or a folder other users can open, the script never reads, sends, or deletes anything there, and saves nothing to it. To fix that, delete the folder as an administrator; the next run that needs it creates it again.
+- Each run sends the saved rows first, oldest run first, and then its own rows, so the rows arrive in run order.
+- A run spends one round of retries in total. Once a row still fails after its retries, every row left to send, saved or new, waits in the folder for the next run. A network or service outage costs one round of retries, not one for each row.
+- The folder keeps the rows of the 5 most recent runs. Once every row of a newer run is sent, the saved rows of older runs are deleted, because the newer run replaces them.
+- While rows wait, row 1's `AppUsageCollectionStatus_s` includes `PendingRows`. The status is set after the saved rows are sent, so a run that empties the folder doesn't report it.
+- When App Usage is off, the folder stays on the device and its rows aren't sent.
+
 ## Mapping Rules
 
 App Usage sees executables, not apps. Mapping rules decide which installed app each executable belongs to, and what kind of executable it is. Rules come from two files:

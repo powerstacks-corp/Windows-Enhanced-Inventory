@@ -1818,7 +1818,7 @@ function Send-LogIngestionAPI(
     $contentType = "application/json"
 
     #validate that payload data does not exceed limits
-    if ($body.Length -gt (0.9 * 1024 * 1024))
+    if ($body.Length -gt $script:AUMaxRowBytes)
     {
         throw("Upload payload is too big and exceed the 1Mb limit for a single upload. Please reduce the payload size. Current payload size is: " + ($body.Length / 1024 / 1024).ToString("#.#") + "Mb")
     }
@@ -7920,6 +7920,781 @@ function ConvertTo-AUAppArray
     }
     Write-CMTraceLog "Added $appArrayCount applications to app array"
     return $AppArray
+}#endfunction
+
+# Split runs and the outbox (D44, F48 to F54). With metering on, a run's App Inventory data goes in
+# one row when it fits, or in several rows of the same table tied by RunId_g when it doesn't. Each
+# row is its own call. Rows that still fail wait in the outbox, C:\Windows\AppUsage_<Serial>_outbox\,
+# and the next run sends them first, unchanged.
+# The one row-size limit (F48): Send-LogIngestionAPI's guard (0.9 * 1024 * 1024, rounded down) uses
+# this constant, so a row New-AURunRows builds never fails the guard.
+$script:AUMaxRowBytes = 943718
+# The table has 10 columns per blob, so a piece 11 would be dropped silently (F49).
+$script:AUMaxPiecesPerBlob = 10
+# The outbox keeps the rows of this many runs, the most recent ones (D44).
+$script:AUOutboxMaxRuns = 5
+# Outbox files are <RunId>-<RowIndex>.json.
+$script:AUOutboxFilePattern = '^(?<RunId>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})-(?<RowIndex>[1-9][0-9]{0,8})\.json$'
+
+# The inventory's own upload path, the default sender for Send-AUOutbox and Send-AURunRows. It
+# makes the same call as the inline App Inventory upload, with the inventory's connection values,
+# so each row gets the inventory's existing retry (Invoke-LogSubmission). It returns $true only for
+# the success status the inventory's summary line checks (204, or 200 for the classic API).
+$script:AUInventorySender = {
+    param (
+        [byte[]]$Body,
+        [string]$LogAPIMode,
+        [string]$LogType
+    )
+
+    if ($LogAPIMode -eq 'LogIngestionAPI')
+    {
+        $Response = Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body $Body -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $LogType
+        $Success = '^204 :'
+    }
+    else
+    {
+        $Response = Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body $Body -logType $LogType
+        $Success = '^200 :'
+    }
+    Write-CMTraceLog -Message "App Usage: App Inventory row upload response: $Response" -Component 'AppUsage'
+    return ("$Response" -match $Success)
+}
+
+function Get-AUColumnName
+{
+    <#
+.SYNOPSIS
+    Returns a column name as the inventory writes it: with the type suffix for the Logs Ingestion API, without it for the classic API.
+.PARAMETER Name
+    The name without its suffix, such as RunId.
+.PARAMETER Type
+    The suffix letter, such as g.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+#>
+    param (
+        [string]$Name,
+        [string]$Type,
+        [string]$LogAPIMode
+    )
+
+    if ($LogAPIMode -eq 'LogIngestionAPI') { return "$($Name)_$Type" }
+    return $Name
+}#endfunction
+
+function Get-AUFileNameSerial
+{
+    <#
+.SYNOPSIS
+    Returns the serial as the ledger and outbox names use it (F44).
+.DESCRIPTION
+    Characters that aren't allowed in a file name become _. A blank serial falls back to the
+    computer name.
+.PARAMETER Serial
+    The device's serial number.
+.PARAMETER ComputerName
+    The computer name.
+#>
+    param (
+        [string]$Serial,
+        [string]$ComputerName
+    )
+
+    $Name = if ([string]::IsNullOrWhiteSpace($Serial)) { "$ComputerName" } else { $Serial }
+    $Chars = $Name.ToCharArray()
+    $Invalid = [IO.Path]::GetInvalidFileNameChars()
+    for ($i = 0; $i -lt $Chars.Length; $i++)
+    {
+        if ($Invalid -contains $Chars[$i]) { $Chars[$i] = [char]'_' }
+    }
+    return (New-Object string (, $Chars))
+}#endfunction
+
+function Get-AUOutboxPath
+{
+    <#
+.SYNOPSIS
+    Returns the outbox folder, C:\Windows\AppUsage_<Serial>_outbox (F50).
+.DESCRIPTION
+    Next to the ledger, with the same sanitized serial (Get-AUFileNameSerial), so only SYSTEM and
+    administrators can create it. Never under C:\ProgramData, where standard users can create files.
+.PARAMETER Serial
+    The device's serial number.
+.PARAMETER ComputerName
+    The computer name, used when the serial is blank.
+.PARAMETER Root
+    The folder that holds it, C:\Windows by default.
+#>
+    param (
+        [string]$Serial,
+        [string]$ComputerName,
+        [string]$Root = $env:SystemRoot
+    )
+
+    return [IO.Path]::Combine($Root, "AppUsage_$(Get-AUFileNameSerial -Serial $Serial -ComputerName $ComputerName)_outbox")
+}#endfunction
+
+function ConvertTo-AURowBody
+{
+    <#
+.SYNOPSIS
+    Returns the request body for one App Inventory row, exactly as the inventory's upload builds it.
+.DESCRIPTION
+    The Logs Ingestion API body is "[" + the row as compressed JSON + "]"; the classic API body is
+    the row as indented JSON. Both use ConvertTo-Json's default depth and UTF-8 bytes, as version 19
+    does. New-AURunRows measures rows with it, and Send-AURunRows sends what it returns, so the
+    size measured is the size sent.
+.PARAMETER Row
+    The row: an ordered dictionary or a PSCustomObject.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+#>
+    [OutputType([byte[]])]
+    param (
+        $Row,
+        [string]$LogAPIMode
+    )
+
+    $Json = if ($LogAPIMode -eq 'LogIngestionAPI') { "[$($Row | ConvertTo-Json -Compress)]" } else { $Row | ConvertTo-Json }
+    return , ([System.Text.Encoding]::UTF8.GetBytes($Json))
+}#endfunction
+
+function New-AURunRows
+{
+    <#
+.SYNOPSIS
+    Packs one run's App Inventory data into rows: one when it fits, several tied by RunId_g when it doesn't (D44).
+.DESCRIPTION
+    Every row carries RunId_g, RowIndex_d, and RowCount_d. Row 1 has every column in MainColumns,
+    in their order, then the run columns. Later rows have only ComputerName_s, ManagedDeviceID_g,
+    and the run columns. Then come the pieces (ConvertTo-AUChunks, 64512 characters, or 31744 for
+    the classic API), InstalledApps first, then ExeUsage, as many as fit. A row holds at most 10
+    pieces per blob, numbered from 1 on every row (F49), and each row's body (ConvertTo-AURowBody)
+    is at most MaxRowBytes. To rebuild a blob, take its pieces from every row ordered by RowIndex_d,
+    then by column number. An empty blob has no pieces, so it has no columns, as in version 19;
+    a run with no pieces at all is still one row.
+    The same input gives byte-identical rows (F54). Returns an object[] of PSCustomObjects, even for
+    one row: assign it directly, never wrap the call in @(). Throws when MainColumns isn't ordered,
+    lacks the identity columns, or already has a run or piece column, when RunId isn't a GUID, or
+    when row 1's columns alone are over MaxRowBytes.
+.PARAMETER MainColumns
+    Row 1's inventory and device columns: an ordered dictionary or a PSCustomObject (such as the
+    inventory's $MainApp without its pieces). A Hashtable is refused, because its order isn't kept.
+.PARAMETER InstalledAppsJson
+    The InstalledApps JSON.
+.PARAMETER ExeUsageJson
+    The ExeUsage JSON.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER MaxRowBytes
+    The row-size limit, $script:AUMaxRowBytes by default (F48).
+.PARAMETER RunId
+    The run's GUID; a new one by default. Pass the run's own, so every row and the rest of the run
+    share it.
+#>
+    [OutputType([object[]])]
+    param (
+        $MainColumns,
+        [string]$InstalledAppsJson,
+        [string]$ExeUsageJson,
+        [string]$LogAPIMode,
+        [int]$MaxRowBytes = $script:AUMaxRowBytes,
+        [string]$RunId = ([guid]::NewGuid().ToString())
+    )
+
+    $Main = [ordered]@{}
+    if ($MainColumns -is [System.Collections.Specialized.OrderedDictionary])
+    {
+        foreach ($Key in $MainColumns.Keys) { $Main[$Key] = $MainColumns[$Key] }
+    }
+    elseif ($null -ne $MainColumns -and $MainColumns.PSObject.BaseObject -is [System.Management.Automation.PSCustomObject])
+    {
+        foreach ($Property in $MainColumns.PSObject.Properties) { $Main[$Property.Name] = $Property.Value }
+    }
+    else { throw 'MainColumns must be an ordered dictionary or a PSCustomObject, so the rows keep their column order.' }
+
+    $Guid = [guid]::Empty
+    if (-not [guid]::TryParse($RunId, [ref]$Guid)) { throw "RunId '$RunId' isn't a GUID." }
+    $RunIdText = $Guid.ToString()
+
+    $ComputerColumn = Get-AUColumnName 'ComputerName' 's' $LogAPIMode
+    $DeviceColumn = Get-AUColumnName 'ManagedDeviceID' 'g' $LogAPIMode
+    $RunIdColumn = Get-AUColumnName 'RunId' 'g' $LogAPIMode
+    $IndexColumn = Get-AUColumnName 'RowIndex' 'd' $LogAPIMode
+    $CountColumn = Get-AUColumnName 'RowCount' 'd' $LogAPIMode
+    foreach ($Key in $Main.Keys)
+    {
+        if (@($RunIdColumn, $IndexColumn, $CountColumn) -contains $Key -or $Key -match '^(InstalledApps|ExeUsage)\d+(_s)?$') { throw "MainColumns already has the column $Key, which New-AURunRows sets." }
+    }
+    if (-not $Main.Contains($ComputerColumn) -or -not $Main.Contains($DeviceColumn)) { throw "MainColumns needs $ComputerColumn and $DeviceColumn." }
+
+    $ChunkSize = if ($LogAPIMode -eq 'LogIngestionAPI') { 64512 } else { 31744 }
+    $Blobs = [ordered]@{}
+    $Blobs['InstalledApps'] = (ConvertTo-AUChunks -Json $InstalledAppsJson -ChunkSize $ChunkSize)
+    $Blobs['ExeUsage'] = (ConvertTo-AUChunks -Json $ExeUsageJson -ChunkSize $ChunkSize)
+
+    # RowCount_d is known only at the end, so rows are measured with a placeholder of at least as
+    # many digits (9, then 99, ...); setting the real count can't make a row longer.
+    $Reserve = 9
+    do
+    {
+        $Rows = New-Object System.Collections.Generic.List[System.Collections.Specialized.OrderedDictionary]
+        $Row = [ordered]@{}
+        foreach ($Key in $Main.Keys) { $Row[$Key] = $Main[$Key] }
+        $Row[$RunIdColumn] = $RunIdText
+        $Row[$IndexColumn] = 1
+        $Row[$CountColumn] = $Reserve
+        $Size = (ConvertTo-AURowBody -Row $Row -LogAPIMode $LogAPIMode).Length
+        if ($Size -gt $MaxRowBytes) { throw "Row 1's columns alone are $Size bytes, over the $MaxRowBytes-byte row limit." }
+        $Counts = @{}
+        foreach ($Blob in $Blobs.Keys)
+        {
+            foreach ($Piece in $Blobs[$Blob])
+            {
+                $Number = [int]$Counts[$Blob] + 1
+                $Fits = $false
+                if ($Number -le $script:AUMaxPiecesPerBlob)
+                {
+                    $Name = Get-AUColumnName "$Blob$Number" 's' $LogAPIMode
+                    $Row[$Name] = $Piece
+                    if ((ConvertTo-AURowBody -Row $Row -LogAPIMode $LogAPIMode).Length -le $MaxRowBytes) { $Fits = $true }
+                    else { $Row.Remove($Name) }
+                }
+                if (-not $Fits)
+                {
+                    $Rows.Add($Row)
+                    $Row = [ordered]@{}
+                    $Row[$ComputerColumn] = $Main[$ComputerColumn]
+                    $Row[$DeviceColumn] = $Main[$DeviceColumn]
+                    $Row[$RunIdColumn] = $RunIdText
+                    $Row[$IndexColumn] = $Rows.Count + 1
+                    $Row[$CountColumn] = $Reserve
+                    $Counts = @{}
+                    $Number = 1
+                    $Name = Get-AUColumnName "$($Blob)1" 's' $LogAPIMode
+                    $Row[$Name] = $Piece
+                    $Size = (ConvertTo-AURowBody -Row $Row -LogAPIMode $LogAPIMode).Length
+                    if ($Size -gt $MaxRowBytes) { throw "A row with one piece is $Size bytes, over the $MaxRowBytes-byte row limit." }
+                }
+                $Counts[$Blob] = $Number
+            }
+        }
+        $Rows.Add($Row)
+        $Done = ($Rows.Count -le $Reserve)
+        if (-not $Done) { $Reserve = $Reserve * 10 + 9 }
+    } while (-not $Done)
+
+    $Result = New-Object object[] $Rows.Count
+    for ($i = 0; $i -lt $Rows.Count; $i++)
+    {
+        $Rows[$i][$CountColumn] = $Rows.Count
+        $Result[$i] = [pscustomobject]$Rows[$i]
+    }
+    if ($Rows.Count -gt 1) { Write-CMTraceLog -Message "App Usage: the run's App Inventory data is split into $($Rows.Count) rows (RunId $RunIdText)." -Component 'AppUsage' }
+    return , $Result
+}#endfunction
+
+function Get-AUOutboxState
+{
+    <#
+.SYNOPSIS
+    Returns Absent, Trusted, or Untrusted for the outbox folder.
+.DESCRIPTION
+    Trusted only when Test-AUTrustedFolder passes: a real folder, not a link, owned by SYSTEM or
+    Administrators, with the protected DACL. An untrusted outbox is never read, written, or
+    deleted from. Fails closed. Never throws.
+.PARAMETER OutboxDir
+    The outbox folder.
+#>
+    param (
+        [string]$OutboxDir
+    )
+
+    if (-not (Test-AUItemPresent -Path $OutboxDir)) { return 'Absent' }
+    if (Test-AUTrustedFolder -Path $OutboxDir) { return 'Trusted' }
+    return 'Untrusted'
+}#endfunction
+
+function Get-AUOutboxFiles
+{
+    <#
+.SYNOPSIS
+    Lists the rows waiting in a trusted outbox, oldest run first, then by RowIndex_d (F53).
+.DESCRIPTION
+    Only regular files named <RunId>-<RowIndex>.json and owned by SYSTEM or Administrators are
+    listed; anything else (a link, a folder, a file with another owner or name) is logged and left
+    alone, never read, sent, or deleted. The listing reads each entry's own attributes and doesn't
+    follow links. A run's time is the write time of its oldest file. Returns an object[] of
+    Path, RunId, RowIndex, WriteTime, and Length, even for one file. Throws when the folder can't be
+    listed.
+.PARAMETER OutboxDir
+    The outbox folder, already checked with Get-AUOutboxState.
+#>
+    [OutputType([object[]])]
+    param (
+        [string]$OutboxDir
+    )
+
+    $Files = New-Object System.Collections.Generic.List[object]
+    foreach ($Item in (New-Object IO.DirectoryInfo $OutboxDir).GetFileSystemInfos())
+    {
+        if ($Item.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (($Item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Directory)) -ne 0)
+        {
+            Write-CMTraceLog -Message "App Usage: $($Item.FullName) in the outbox isn't a regular file, so it's left alone." -Component 'AppUsage' -Type 2
+            continue
+        }
+        $Match = [regex]::Match($Item.Name, $script:AUOutboxFilePattern)
+        if (-not $Match.Success)
+        {
+            Write-CMTraceLog -Message "App Usage: $($Item.FullName) in the outbox isn't a saved row, so it's left alone." -Component 'AppUsage' -Type 2
+            continue
+        }
+        $Trusted = $false
+        try { $Trusted = Test-AUTrustedOwner -Security ([IO.File]::GetAccessControl($Item.FullName, [Security.AccessControl.AccessControlSections]::Owner)) }
+        catch { $Trusted = $false }
+        if (-not $Trusted)
+        {
+            Write-CMTraceLog -Message "App Usage: $($Item.FullName) in the outbox isn't owned by SYSTEM or Administrators, so it's never sent." -Component 'AppUsage' -Type 2
+            continue
+        }
+        $Files.Add([pscustomobject]@{
+                Path      = $Item.FullName
+                RunId     = ([guid]$Match.Groups['RunId'].Value).ToString()
+                RowIndex  = [int]$Match.Groups['RowIndex'].Value
+                WriteTime = $Item.LastWriteTimeUtc
+                Length    = $Item.Length
+            })
+    }
+
+    $RunTimes = @{}
+    foreach ($File in $Files)
+    {
+        if (-not $RunTimes.ContainsKey($File.RunId) -or $File.WriteTime -lt $RunTimes[$File.RunId]) { $RunTimes[$File.RunId] = $File.WriteTime }
+    }
+    $Sorted = @($Files | Sort-Object -Property @{ Expression = { $RunTimes[$_.RunId] } }, @{ Expression = { $_.RunId } }, @{ Expression = { $_.RowIndex } })
+    return , $Sorted
+}#endfunction
+
+function Remove-AUOutboxFile
+{
+    <#
+.SYNOPSIS
+    Deletes one outbox file. Returns $true when it's gone. Never throws.
+.PARAMETER Path
+    A file from Get-AUOutboxFiles.
+#>
+    param (
+        [string]$Path
+    )
+
+    try
+    {
+        [IO.File]::Delete($Path)
+        return $true
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't delete $Path from the outbox: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $false
+    }
+}#endfunction
+
+function Limit-AUOutboxRuns
+{
+    <#
+.SYNOPSIS
+    Keeps the rows of the MaxRuns most recent runs in the outbox and deletes the rest (D44).
+.DESCRIPTION
+    Returns the files that are kept, in the same order, as an object[].
+.PARAMETER Files
+    The outbox files, from Get-AUOutboxFiles (oldest run first).
+.PARAMETER MaxRuns
+    How many runs to keep.
+#>
+    [OutputType([object[]])]
+    param (
+        [object[]]$Files,
+        [int]$MaxRuns
+    )
+
+    $RunIds = New-Object System.Collections.Generic.List[string]
+    foreach ($File in $Files) { if (-not $RunIds.Contains($File.RunId)) { $RunIds.Add($File.RunId) } }
+    if ($RunIds.Count -le $MaxRuns) { return , @($Files) }
+
+    $Dropped = $RunIds.GetRange(0, $RunIds.Count - $MaxRuns)
+    $Kept = New-Object System.Collections.Generic.List[object]
+    foreach ($File in $Files)
+    {
+        if ($Dropped.Contains($File.RunId)) { [void](Remove-AUOutboxFile -Path $File.Path) }
+        else { $Kept.Add($File) }
+    }
+    Write-CMTraceLog -Message "App Usage: the outbox keeps the rows of the $MaxRuns most recent runs; deleted the rows of $($Dropped.Count) older run(s): $($Dropped -join ', ')." -Component 'AppUsage' -Type 2
+    return , $Kept.ToArray()
+}#endfunction
+
+function Read-AUOutboxRow
+{
+    <#
+.SYNOPSIS
+    Reads a saved row's body, unchanged, after checking it's a row of this run and mode.
+.DESCRIPTION
+    Returns the bytes, or $null when the file isn't a valid saved row: over MaxRowBytes, not UTF-8
+    JSON, not the body shape of LogAPIMode (an array of one row, or the classic API's one object),
+    or its run columns don't match its file name. Throws when the file can't be read, or has become
+    a link.
+.PARAMETER File
+    A file from Get-AUOutboxFiles.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER MaxRowBytes
+    The row-size limit.
+#>
+    param (
+        [object]$File,
+        [string]$LogAPIMode,
+        [int]$MaxRowBytes
+    )
+
+    if ($File.Length -gt $MaxRowBytes) { return $null }
+    if (Test-AUReparsePoint -Path $File.Path) { throw "$($File.Path) has become a link." }
+    $Bytes = [IO.File]::ReadAllBytes($File.Path)
+    if ($Bytes.Length -gt $MaxRowBytes) { return $null }
+    try
+    {
+        $Text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($Bytes)
+        $Parsed = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
+    }
+    catch { return $null }
+
+    if ($LogAPIMode -eq 'LogIngestionAPI')
+    {
+        if (-not $Text.StartsWith('[')) { return $null }
+        $Records = @($Parsed)
+        if ($Records.Count -ne 1) { return $null }
+        $Record = $Records[0]
+    }
+    else
+    {
+        if (-not $Text.StartsWith('{')) { return $null }
+        $Record = $Parsed
+    }
+    if ($null -eq $Record -or $Record -isnot [pscustomobject]) { return $null }
+
+    $RunIdValue = $Record.PSObject.Properties[(Get-AUColumnName 'RunId' 'g' $LogAPIMode)]
+    $IndexValue = $Record.PSObject.Properties[(Get-AUColumnName 'RowIndex' 'd' $LogAPIMode)]
+    if ($null -eq $RunIdValue -or $null -eq $IndexValue) { return $null }
+    $Guid = [guid]::Empty
+    if (-not [guid]::TryParse("$($RunIdValue.Value)", [ref]$Guid) -or $Guid.ToString() -ne $File.RunId) { return $null }
+    if ("$($IndexValue.Value)" -ne "$($File.RowIndex)") { return $null }
+    return , $Bytes
+}#endfunction
+
+function Save-AUOutboxRow
+{
+    <#
+.SYNOPSIS
+    Writes a row's body to the outbox as <RunId>-<RowIndex>.json. Returns $true when it's saved. Never throws.
+.DESCRIPTION
+    The body is written unchanged to a temp file created with the protected DACL (SYSTEM and
+    Administrators, inheritance off) and owned by Administrators, flushed to disk, then swapped in
+    (Move-AUFileAtomic), so a power loss never leaves a partial row.
+.PARAMETER OutboxDir
+    The trusted outbox folder.
+.PARAMETER RunId
+    The row's RunId_g.
+.PARAMETER RowIndex
+    The row's RowIndex_d.
+.PARAMETER Body
+    The body, from ConvertTo-AURowBody.
+#>
+    param (
+        [string]$OutboxDir,
+        [string]$RunId,
+        [int]$RowIndex,
+        [byte[]]$Body
+    )
+
+    $Path = [IO.Path]::Combine($OutboxDir, "$RunId-$RowIndex.json")
+    $Temp = "$Path.tmp"
+    try
+    {
+        $Security = New-AUProtectedSecurity
+        $Security.SetOwner((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
+        if (Test-AUItemPresent -Path $Temp) { [IO.File]::Delete($Temp) }
+        $Stream = New-Object IO.FileStream($Temp, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 65536, [IO.FileOptions]::None, $Security)
+        try
+        {
+            $Stream.Write($Body, 0, $Body.Length)
+            $Stream.Flush($true)
+        }
+        finally { $Stream.Dispose() }
+        Move-AUFileAtomic -Source $Temp -Target $Path
+        return $true
+    }
+    catch
+    {
+        $Message = $_.Exception.Message
+        try { if ([IO.File]::Exists($Temp)) { [IO.File]::Delete($Temp) } } catch { }
+        Write-CMTraceLog -Message "App Usage: couldn't save row $RowIndex of run $RunId to the outbox, so it's lost: $Message" -Component 'AppUsage' -Type 3
+        return $false
+    }
+}#endfunction
+
+function Invoke-AUSend
+{
+    <#
+.SYNOPSIS
+    Sends one body with the sender. Returns $true only when the sender's last output is $true. Never throws.
+.DESCRIPTION
+    A sender that throws, such as the inventory's size guard or a failed token request, counts as
+    a failed send.
+.PARAMETER Sender
+    The sender scriptblock: param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType).
+.PARAMETER Body
+    The body.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER LogType
+    The App Inventory log type.
+#>
+    param (
+        [scriptblock]$Sender,
+        [byte[]]$Body,
+        [string]$LogAPIMode,
+        [string]$LogType
+    )
+
+    try
+    {
+        $Output = & $Sender $Body $LogAPIMode $LogType
+        $Last = @($Output) | Select-Object -Last 1
+        return ($Last -is [bool] -and $Last)
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: the App Inventory row upload failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $false
+    }
+}#endfunction
+
+function Send-AUOutbox
+{
+    <#
+.SYNOPSIS
+    Sends the rows waiting in the outbox, oldest run first, each unchanged, and deletes each one once it's sent (F52, F53).
+.DESCRIPTION
+    Runs before this run's rows are built, so arrival order keeps run order, and row 1's
+    AppUsageCollectionStatus_s reflects the flush: PendingRows is $true when rows still wait
+    afterward. The outbox first keeps only the MaxRuns most recent runs. A saved row that isn't
+    valid (Read-AUOutboxRow) is deleted unsent.
+    RetryBudget is shared with Send-AURunRows (F51): each send gets the sender's own retry (the
+    inventory's Invoke-LogSubmission), and a send that still fails spends one unit. Once the budget
+    is 0, nothing more is sent this run and the rows stay for the next run. The caller sets it to 1
+    per run, so an outage costs one retry cycle, not one per row.
+    An outbox that isn't trusted (Get-AUOutboxState) is never read, sent, or deleted from;
+    OutboxSkipped is then $true, as it is when the folder can't be listed. Returns Sent, Remaining,
+    PendingRows, and OutboxSkipped. Never throws.
+.PARAMETER OutboxDir
+    The outbox folder (Get-AUOutboxPath).
+.PARAMETER RetryBudget
+    The run's retry budget, a [ref] to an int.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER LogType
+    The App Inventory log type.
+.PARAMETER Sender
+    The sender scriptblock; the inventory's upload ($script:AUInventorySender) by default.
+.PARAMETER MaxRowBytes
+    The row-size limit.
+.PARAMETER MaxRuns
+    How many runs the outbox keeps.
+#>
+    param (
+        [string]$OutboxDir,
+        [ref]$RetryBudget,
+        [string]$LogAPIMode,
+        [string]$LogType = $(if ($LogAPIMode -eq 'LogIngestionAPI') { 'PowerStacksAppInventory_CL' } else { 'PowerStacksAppInventory' }),
+        [scriptblock]$Sender = $script:AUInventorySender,
+        [int]$MaxRowBytes = $script:AUMaxRowBytes,
+        [int]$MaxRuns = $script:AUOutboxMaxRuns
+    )
+
+    $Result = [pscustomobject]@{ Sent = 0; Remaining = 0; PendingRows = $false; OutboxSkipped = $false }
+    $State = Get-AUOutboxState -OutboxDir $OutboxDir
+    if ($State -eq 'Absent') { return $Result }
+    if ($State -eq 'Untrusted')
+    {
+        Write-CMTraceLog -Message "App Usage: the outbox $OutboxDir isn't the protected folder the script creates, so it isn't read, sent, or changed this run." -Component 'AppUsage' -Type 3
+        $Result.OutboxSkipped = $true
+        return $Result
+    }
+
+    try { $Files = Get-AUOutboxFiles -OutboxDir $OutboxDir }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir, so it isn't sent this run: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        $Result.OutboxSkipped = $true
+        return $Result
+    }
+    $Files = Limit-AUOutboxRuns -Files $Files -MaxRuns $MaxRuns
+    $Remaining = $Files.Count
+    foreach ($File in $Files)
+    {
+        if ($RetryBudget.Value -le 0) { break }
+        try { $Body = Read-AUOutboxRow -File $File -LogAPIMode $LogAPIMode -MaxRowBytes $MaxRowBytes }
+        catch
+        {
+            Write-CMTraceLog -Message "App Usage: couldn't read $($File.Path) from the outbox, so it waits: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            continue
+        }
+        if ($null -eq $Body)
+        {
+            Write-CMTraceLog -Message "App Usage: $($File.Path) in the outbox isn't a valid saved row, so it's deleted unsent." -Component 'AppUsage' -Type 3
+            if (Remove-AUOutboxFile -Path $File.Path) { $Remaining-- }
+            continue
+        }
+        if (Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType)
+        {
+            $Result.Sent++
+            if (Remove-AUOutboxFile -Path $File.Path) { $Remaining-- }
+        }
+        else
+        {
+            $RetryBudget.Value--
+            Write-CMTraceLog -Message "App Usage: row $($File.RowIndex) of run $($File.RunId) from the outbox wasn't sent; it waits for the next run." -Component 'AppUsage' -Type 2
+        }
+    }
+    $Result.Remaining = $Remaining
+    $Result.PendingRows = ($Remaining -gt 0)
+    if ($Result.Sent -gt 0 -or $Remaining -gt 0) { Write-CMTraceLog -Message "App Usage: sent $($Result.Sent) row(s) from the outbox; $Remaining still wait." -Component 'AppUsage' }
+    return $Result
+}#endfunction
+
+function Send-AURunRows
+{
+    <#
+.SYNOPSIS
+    Sends this run's rows, each in its own call, and saves the rows that aren't sent to the outbox (D44, F51).
+.DESCRIPTION
+    Each row's body is ConvertTo-AURowBody's, the bytes New-AURunRows measured. RetryBudget is the
+    one Send-AUOutbox used (F51): a send that still fails after the sender's own retry spends one
+    unit, and once it's 0 every remaining row goes straight to the outbox without a send. A row
+    over MaxRowBytes is never sent or saved (New-AURunRows never builds one).
+    When every row was sent, the outbox rows of older runs are deleted: this newer complete run
+    supersedes them (D44). The outbox then keeps only the MaxRuns most recent runs. A missing
+    outbox is created with the protected DACL (New-AUProtectedFolder); one that isn't trusted is
+    never written or deleted from, and OutboxSkipped is $true. Returns Sent, Pending (rows not
+    sent), Saved (rows saved to the outbox), SentBytes, and OutboxSkipped. Throws only when a row
+    lacks the run columns (pass New-AURunRows' result as it is, not wrapped in @()).
+.PARAMETER Rows
+    The rows, from New-AURunRows.
+.PARAMETER OutboxDir
+    The outbox folder (Get-AUOutboxPath).
+.PARAMETER RetryBudget
+    The run's retry budget, a [ref] to an int, shared with Send-AUOutbox.
+.PARAMETER LogAPIMode
+    The inventory's $LogAPIMode.
+.PARAMETER LogType
+    The App Inventory log type.
+.PARAMETER Sender
+    The sender scriptblock; the inventory's upload ($script:AUInventorySender) by default.
+.PARAMETER MaxRowBytes
+    The row-size limit.
+.PARAMETER MaxRuns
+    How many runs the outbox keeps.
+#>
+    param (
+        [object[]]$Rows,
+        [string]$OutboxDir,
+        [ref]$RetryBudget,
+        [string]$LogAPIMode,
+        [string]$LogType = $(if ($LogAPIMode -eq 'LogIngestionAPI') { 'PowerStacksAppInventory_CL' } else { 'PowerStacksAppInventory' }),
+        [scriptblock]$Sender = $script:AUInventorySender,
+        [int]$MaxRowBytes = $script:AUMaxRowBytes,
+        [int]$MaxRuns = $script:AUOutboxMaxRuns
+    )
+
+    $RunIdColumn = Get-AUColumnName 'RunId' 'g' $LogAPIMode
+    $IndexColumn = Get-AUColumnName 'RowIndex' 'd' $LogAPIMode
+    $Result = [pscustomobject]@{ Sent = 0; Pending = 0; Saved = 0; SentBytes = 0; OutboxSkipped = $false }
+    $Unsent = New-Object System.Collections.Generic.List[object]
+    $RunId = $null
+    foreach ($Row in @($Rows))
+    {
+        if ($null -eq $Row -or $null -eq $Row.PSObject.Properties[$RunIdColumn] -or $null -eq $Row.PSObject.Properties[$IndexColumn]) { throw "Every row needs $RunIdColumn and $IndexColumn; pass New-AURunRows' result as it is." }
+        $RunId = ([guid]"$($Row.$RunIdColumn)").ToString()
+        $Index = [int]$Row.$IndexColumn
+        $Body = ConvertTo-AURowBody -Row $Row -LogAPIMode $LogAPIMode
+        if ($Body.Length -gt $MaxRowBytes)
+        {
+            Write-CMTraceLog -Message "App Usage: row $Index of run $RunId is $($Body.Length) bytes, over the $MaxRowBytes-byte limit, so it's never sent." -Component 'AppUsage' -Type 3
+            $Result.Pending++
+            continue
+        }
+        if ($RetryBudget.Value -gt 0)
+        {
+            if (Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType)
+            {
+                $Result.Sent++
+                $Result.SentBytes += $Body.Length
+                continue
+            }
+            $RetryBudget.Value--
+            Write-CMTraceLog -Message "App Usage: row $Index of run $RunId wasn't sent, so it goes to the outbox." -Component 'AppUsage' -Type 2
+        }
+        $Unsent.Add([pscustomobject]@{ Index = $Index; Body = $Body })
+        $Result.Pending++
+    }
+    if ($null -eq $RunId) { return $Result }
+
+    $State = Get-AUOutboxState -OutboxDir $OutboxDir
+    if ($Result.Pending -eq 0)
+    {
+        if ($State -ne 'Trusted') { return $Result }
+        try
+        {
+            $Superseded = 0
+            foreach ($File in (Get-AUOutboxFiles -OutboxDir $OutboxDir))
+            {
+                if ($File.RunId -ne $RunId -and (Remove-AUOutboxFile -Path $File.Path)) { $Superseded++ }
+            }
+            if ($Superseded -gt 0) { Write-CMTraceLog -Message "App Usage: every row of run $RunId was sent, so $Superseded outbox row(s) of older runs were deleted." -Component 'AppUsage' }
+        }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir to delete older runs: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        return $Result
+    }
+    if ($Unsent.Count -eq 0) { return $Result }
+
+    if ($State -eq 'Absent')
+    {
+        try
+        {
+            New-AUProtectedFolder -Path $OutboxDir
+            $State = 'Trusted'
+        }
+        catch
+        {
+            Write-CMTraceLog -Message "App Usage: couldn't create the outbox $OutboxDir, so $($Unsent.Count) unsent row(s) are lost: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            $Result.OutboxSkipped = $true
+            return $Result
+        }
+    }
+    if ($State -ne 'Trusted')
+    {
+        Write-CMTraceLog -Message "App Usage: the outbox $OutboxDir isn't the protected folder the script creates, so $($Unsent.Count) unsent row(s) aren't saved." -Component 'AppUsage' -Type 3
+        $Result.OutboxSkipped = $true
+        return $Result
+    }
+    foreach ($Item in $Unsent)
+    {
+        if (Save-AUOutboxRow -OutboxDir $OutboxDir -RunId $RunId -RowIndex $Item.Index -Body $Item.Body) { $Result.Saved++ }
+    }
+    Write-CMTraceLog -Message "App Usage: saved $($Result.Saved) of $($Unsent.Count) unsent row(s) of run $RunId to the outbox." -Component 'AppUsage' -Type 2
+    try { [void](Limit-AUOutboxRuns -Files (Get-AUOutboxFiles -OutboxDir $OutboxDir) -MaxRuns $MaxRuns) }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir to keep it to $MaxRuns runs: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    return $Result
 }#endfunction
 #endregion APPUSAGE
 
