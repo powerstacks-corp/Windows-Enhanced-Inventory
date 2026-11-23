@@ -468,6 +468,45 @@ Describe 'Get-AUCopyBytes and Get-AUFreeSpace (I4)' {
     }
 }
 
+Describe 'WMI time limits (review minor 2)' {
+    It 'gives every CIM call in the region a time limit, and uses no Get-WmiObject, which has none' {
+        $Ast = [Management.Automation.Language.Parser]::ParseInput($AURegionText, [ref]$null, [ref]$null)
+        $Calls = @($Ast.FindAll({ param ($Node) $Node -is [Management.Automation.Language.CommandAst] -and @('Get-CimInstance', 'Invoke-CimMethod', 'Remove-CimInstance', 'Get-WmiObject', 'gwmi') -contains $Node.GetCommandName() }, $true))
+        $Calls.Count | Should -BeGreaterThan 5
+        foreach ($Call in $Calls)
+        {
+            $Call.GetCommandName() | Should -Not -BeIn @('Get-WmiObject', 'gwmi') -Because $Call.Extent.Text
+            @($Call.CommandElements | Where-Object { $_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'OperationTimeoutSec' }).Count | Should -Be 1 -Because $Call.Extent.Text
+        }
+    }
+
+    It 'limits the shadow copy lookups and removal to 30 seconds' {
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; InstallDate = (Get-Date) } }
+        Mock Remove-CimInstance { } -RemoveParameterType 'InputObject'
+        Remove-AUShadowCopy -ShadowId $script:ShadowId | Should -BeTrue
+        Test-AUShadowFromRun -ShadowId $script:ShadowId -SinceUtc ([datetime]::UtcNow.AddHours(-1)) | Should -Not -BeNullOrEmpty
+        Should -Invoke Get-CimInstance -Times 2 -Exactly -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' -and $OperationTimeoutSec -eq 30 }
+        Should -Invoke Remove-CimInstance -Times 1 -Exactly -ParameterFilter { $OperationTimeoutSec -eq 30 }
+    }
+
+    It 'limits the account, BIOS, and shadow copy queries to 30 seconds, and the shadow copy creation to 120' {
+        Mock Get-CimInstance { @() }
+        $null = Get-AUMachineDomainSid
+        $null = Get-AUSerial
+        Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_UserAccount' -and $OperationTimeoutSec -eq 30 }
+        Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_BIOS' -and $OperationTimeoutSec -eq 30 }
+
+        $WorkDir = New-TestWorkDir
+        Mock Get-AUProfileList { }
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $null } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Mock Remove-AUShadowCopy { $true }
+        $null = New-AUSnapshot -WorkDir $WorkDir
+        Should -Invoke Invoke-CimMethod -Times 1 -Exactly -ParameterFilter { $MethodName -eq 'Create' -and $OperationTimeoutSec -eq 120 }
+        Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' -and $OperationTimeoutSec -eq 30 }
+    }
+}
+
 Describe 'Copy-AUShadowFile' {
     It 'copies hidden files too, and the copies get only the work folder entries' {
         $Source = Join-Path $TestDrive 'source-folder'

@@ -5787,6 +5787,9 @@ $script:AUInputColumn = 'UserInputS'
 # Time budgets, in seconds, for each external step. A step that runs out is stopped and counts as failed.
 $script:AUToolTimeoutSeconds = 60
 $script:AURepairTimeoutSeconds = 900
+# WMI queries; creating a shadow copy can take longer than a query.
+$script:AUCimTimeoutSeconds = 30
+$script:AUShadowCreateTimeoutSeconds = 120
 # A killed run's folder and shadow copy are removed by the next run once they're this old (F28).
 $script:AUStaleRunHours = 24
 # The marker file in a run folder that names its shadow copy, so a later run can delete it.
@@ -6003,8 +6006,8 @@ function Remove-AUShadowCopy
     try
     {
         if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { throw "'$ShadowId' isn't a shadow copy ID." }
-        $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -ErrorAction Stop
-        if ($Shadow) { $Shadow | Remove-CimInstance -ErrorAction Stop }
+        $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop
+        if ($Shadow) { $Shadow | Remove-CimInstance -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop }
         return $true
     }
     catch
@@ -6036,7 +6039,7 @@ function Test-AUShadowFromRun
     try
     {
         if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { return $false }
-        $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -ErrorAction Stop | Select-Object -First 1
+        $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop | Select-Object -First 1
         if (-not $Shadow -or $Shadow.InstallDate -isnot [datetime]) { return $false }
         $Installed = $Shadow.InstallDate.ToUniversalTime()
         return ($Installed -ge $SinceUtc.ToUniversalTime() -and $Installed -le [datetime]::UtcNow)
@@ -6338,7 +6341,7 @@ function Get-AUMachineDomainSid
 #>
     try
     {
-        foreach ($Account in @(Get-CimInstance -ClassName Win32_UserAccount -Filter 'LocalAccount=TRUE' -ErrorAction Stop))
+        foreach ($Account in @(Get-CimInstance -ClassName Win32_UserAccount -Filter 'LocalAccount=TRUE' -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop))
         {
             $Sid = [string]$Account.SID
             if ($Sid -match '^S-1-5-21-\d+-\d+-\d+-\d+$') { return (New-Object Security.Principal.SecurityIdentifier $Sid).AccountDomainSid.Value }
@@ -6544,13 +6547,13 @@ function New-AUSnapshot
 
         try
         {
-            $Created = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = "$($env:SystemDrive)\"; Context = 'ClientAccessible' } -ErrorAction Stop
+            $Created = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = "$($env:SystemDrive)\"; Context = 'ClientAccessible' } -OperationTimeoutSec $script:AUShadowCreateTimeoutSeconds -ErrorAction Stop
             if ($Created.ReturnValue -ne 0 -or -not $Created.ShadowID) { throw "Win32_ShadowCopy.Create returned $($Created.ReturnValue)." }
             $Snapshot.ShadowId = [string]$Created.ShadowID
             # A run killed from here on leaves this marker, so a later run deletes the shadow copy.
             try { Write-AUShadowMarker -Folder $WorkDir -ShadowId $Snapshot.ShadowId }
             catch { Write-CMTraceLog -Message "App Usage: couldn't write the shadow marker in $WorkDir`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
-            $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($Snapshot.ShadowId)'" -ErrorAction Stop
+            $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($Snapshot.ShadowId)'" -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop
             if (-not $Shadow -or -not $Shadow.DeviceObject) { throw "shadow copy $($Snapshot.ShadowId) has no device path." }
             $Snapshot.ShadowRoot = ([string]$Shadow.DeviceObject).TrimEnd('\')
         }
@@ -10326,7 +10329,7 @@ function Get-AUSerial
 #>
     try
     {
-        $Bios = @(Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop)
+        $Bios = @(Get-CimInstance -ClassName Win32_BIOS -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop)
         if ($Bios.Count -gt 0) { return ([string]$Bios[0].SerialNumber).Trim() }
         Write-CMTraceLog -Message 'App Usage: Win32_BIOS returned nothing, so the serial number is unknown.' -Component 'AppUsage' -Type 3
     }
