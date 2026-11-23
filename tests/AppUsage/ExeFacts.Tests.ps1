@@ -401,7 +401,7 @@ Describe 'Find-AUExePath' {
     }
 }
 
-Describe 'Timed reads outside Windows and Program Files' {
+Describe 'Timed reads outside the allowlisted system folders' {
     BeforeAll {
         $script:SlowScript = 'Start-Sleep -Seconds 30'
     }
@@ -412,18 +412,67 @@ Describe 'Timed reads outside Windows and Program Files' {
         Mock Write-CMTraceLog { }
     }
 
-    It 'reads directly only under Windows and Program Files' {
-        foreach ($direct in @('C:\Windows\System32\notepad.exe', 'C:\Program Files\Contoso\app.exe', 'C:\Program Files (x86)\Contoso\app.exe', 'E:\Program Files\Contoso\app.exe'))
+    It 'finds the allowlisted system folders and their user-writable subfolders from the machine' {
+        $roots = Get-AUDirectReadRoots
+        $pf = [Environment]::GetFolderPath('ProgramFiles').TrimEnd('\')
+        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
+        foreach ($folder in @($pf, [Environment]::GetFolderPath('ProgramFilesX86').TrimEnd('\'), "$pf\WindowsApps", "$win\System32", "$win\SysWOW64", "$win\WinSxS", "$win\Microsoft.NET", "$win\SystemApps", "$win\ImmersiveControlPanel"))
         {
-            Test-AUDirectRead $direct | Should -BeTrue
+            @($roots.Allowed | Where-Object { [string]::Equals($_, $folder, [StringComparison]::OrdinalIgnoreCase) }).Count | Should -Be 1 -Because $folder
         }
-        foreach ($timed in @('C:\Users\alice\AppData\Local\Contoso\app.exe', 'C:\Users\alice\Downloads\setup.exe', 'C:\Windows\Temp\setup.exe', 'C:\Windows\IMECache\x\setup.exe',
-                'C:\ProgramData\Contoso\agent.exe', 'E:\probe\ProbeOnE.exe', 'C:\Tools\tool.exe'))
+        @($roots.Allowed).Count | Should -Be 9
+        foreach ($folder in @("$win\System32\Tasks", "$win\System32\spool\drivers\color", "$win\SysWOW64\Tasks", "$win\System32\com\dmp"))
         {
-            Test-AUDirectRead $timed | Should -BeFalse
+            @($roots.Excluded | Where-Object { [string]::Equals($_, $folder, [StringComparison]::OrdinalIgnoreCase) }).Count | Should -Be 1 -Because $folder
         }
+        @($roots.Allowed + $roots.Excluded) | ForEach-Object { $_ | Should -Not -Match '%|\\$' }
+        (New-AUReadBudget).DirectRoots.Allowed.Count | Should -Be 9
     }
 
+    It 'reads directly only inside the allowlist; C:\Windows\Temp, System32\Tasks, and the rest of Windows are timed' {
+        $pf = [Environment]::GetFolderPath('ProgramFiles').TrimEnd('\')
+        $pf86 = [Environment]::GetFolderPath('ProgramFilesX86').TrimEnd('\')
+        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
+        $roots = Get-AUDirectReadRoots
+        foreach ($direct in @("$win\System32\notepad.exe", "$pf\Contoso\app.exe", "$pf86\Contoso\app.exe", "$pf\WindowsApps\Contoso.App_1.0.0.0_x64__abc\app.exe",
+                "$win\SysWOW64\where.exe", "$win\WinSxS\amd64_x\tool.exe", "$win\Microsoft.NET\Framework64\v4.0.30319\ngen.exe", "$win\SystemApps\App\app.exe",
+                "$win\ImmersiveControlPanel\SystemSettings.exe", "$($pf.ToUpperInvariant())\CONTOSO\APP.EXE", ($pf.Replace('\', '/') + '/Contoso/app.exe'), "\\?\$win\System32\notepad.exe",
+                "$win\System32\drivers\..\notepad.exe"))
+        {
+            Test-AUDirectRead $direct $roots | Should -BeTrue -Because $direct
+        }
+        foreach ($timed in @("$win\Temp\setup.exe", "$win\Tasks\x.exe", "$win\Tracing\x.exe", "$win\explorer.exe", "$win\IMECache\x\setup.exe", "$win\ccmcache\1\setup.exe",
+                "$win\System32\Tasks\evil.exe", "$win\System32\Tasks\Microsoft\x.exe", "$win\System32\spool\drivers\color\x.exe", "$win\System32\spool\PRINTERS\x.exe",
+                "$win\System32\Microsoft\Crypto\RSA\MachineKeys\x.exe", "$win\SysWOW64\Tasks\x.exe", "$win\SysWOW64\com\dmp\x.exe",
+                'C:\Users\alice\AppData\Local\Contoso\app.exe', 'C:\Users\alice\Downloads\setup.exe', 'C:\ProgramData\Contoso\agent.exe', 'E:\probe\ProbeOnE.exe',
+                "$pf\..\Users\alice\x.exe", "${pf}X\app.exe", "$win\System32Evil\x.exe", "$win\System32", 'Contoso\app.exe', '', $null))
+        {
+            Test-AUDirectRead $timed $roots | Should -BeFalse -Because "$timed"
+        }
+        # Without roots, it reads them itself.
+        Test-AUDirectRead "$win\System32\notepad.exe" | Should -BeTrue
+        Test-AUDirectRead "$win\System32\Tasks\evil.exe" | Should -BeFalse
+    }
+
+    It 'lets an excluded folder win over the allowed folder that holds it' {
+        $roots = [pscustomobject]@{ Allowed = @('D:\Apps'); Excluded = @('D:\Apps\Drop') }
+        Test-AUDirectRead 'D:\Apps\tool.exe' $roots | Should -BeTrue
+        Test-AUDirectRead 'D:\Apps\Drop\tool.exe' $roots | Should -BeFalse
+        Test-AUDirectRead 'D:\AppsX\tool.exe' $roots | Should -BeFalse
+    }
+
+    It 'routes reads by the allowlist: a System32 file is read directly, C:\Windows\Temp and System32\Tasks are timed' {
+        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
+        # A spent budget: a timed read is skipped without opening the file; a direct read still happens.
+        $budget = New-AUReadBudget -TotalSeconds 0
+        $direct = Read-AUFile "$win\System32\notepad.exe" -ReadBudget $budget
+        $direct.Status | Should -BeExactly 'OK'
+        $direct.Before.Subsystem | Should -BeExactly 'GUI'
+        (Read-AUFile "$win\Temp\au-test-$([guid]::NewGuid().ToString('N')).exe" -ReadBudget $budget).Status | Should -BeExactly 'Skipped'
+        (Read-AUFile "$win\System32\Tasks\au-test-$([guid]::NewGuid().ToString('N')).exe" -ReadBudget $budget).Status | Should -BeExactly 'Skipped'
+        $budget.Skipped | Should -Be 2
+        $budget.Runspace | Should -BeNullOrEmpty
+    }
     It 'defaults to a 5-second timeout per file and a 120-second total' {
         $budget = New-AUReadBudget
         $budget.TimeoutMs | Should -Be 5000
@@ -505,7 +554,7 @@ Describe 'Timed reads outside Windows and Program Files' {
         Close-AUReadBudget $budget
     }
 
-    It 'reads Windows and Program Files paths directly even when the budget is spent' {
+    It 'reads allowlisted paths directly even when the budget is spent' {
         Mock Test-AUDirectRead { $true }
         $budget = New-AUReadBudget -TotalSeconds 0
         (Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget).FactsVerified | Should -BeTrue

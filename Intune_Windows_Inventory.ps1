@@ -6929,7 +6929,7 @@ function Read-AUSrum
 # fingerprint. A kernel path is translated by suffix probing under each fixed drive (QueryDosDevice
 # needs compiling, D25), and a file's facts are read only when its PE TimeDateStamp and CheckSum
 # equal the build's (D24). Files are only ever opened to read their headers and version info, and a file
-# outside Windows and Program Files is read in a timed runspace, so a lock on it can't stall the run.
+# outside the allowlisted system folders is read in a timed runspace, so a lock on it can't stall the run.
 $script:AUFileShare = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
 $script:AUUnixEpoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
 # The PE header bytes read at e_lfanew: the signature (4), the file header (20), and the optional
@@ -7120,24 +7120,107 @@ function Get-AUVersionInfo
     return [Diagnostics.FileVersionInfo]::GetVersionInfo((ConvertTo-AUIoPath $Path))
 }#endfunction
 
+# Folders under the System32 and SysWOW64 allowlist entries that standard users can write to on
+# stock Windows; files there are read with the timed read.
+$script:AUUserWritableSystemFolders = @('Tasks', 'Tasks_Migrated', 'spool\drivers\color', 'spool\PRINTERS', 'spool\SERVERS', 'Microsoft\Crypto\RSA\MachineKeys', 'com\dmp', 'FxsTmp')
+
+function Get-AUDirectReadRoots
+{
+    <#
+.SYNOPSIS
+    Returns the folders whose files may be read directly (Allowed) and the user-writable folders inside them (Excluded).
+.DESCRIPTION
+    Allowed: %ProgramFiles%, %ProgramFiles(x86)%, %ProgramFiles%\WindowsApps, and %SystemRoot%\
+    System32, SysWOW64, WinSxS, Microsoft.NET, SystemApps, and ImmersiveControlPanel. Excluded: the
+    folders in AUUserWritableSystemFolders under System32 and SysWOW64, such as System32\Tasks and
+    System32\spool\drivers\color. The locations come from the machine's registry
+    (ProgramFilesDir, ProgramFilesDir (x86), and SystemRoot), never from user variables, with the
+    known-folder API as the fallback. No trailing backslash. A location that can't be found is left
+    out, so its files get the timed read. Never throws.
+#>
+    $Read = {
+        param ([string]$KeyPath, [string]$Name)
+        $Base = $null
+        $Key = $null
+        try
+        {
+            $Base = Open-AURegistryBase -Hive Machine
+            $Key = $Base.OpenSubKey($KeyPath)
+            if ($null -eq $Key) { return $null }
+            return [string]$Key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        catch { return $null }
+        finally
+        {
+            if ($null -ne $Key) { $Key.Close() }
+            if ($null -ne $Base) { $Base.Close() }
+        }
+    }
+    $Clean = {
+        param ([string]$Folder, [string]$Fallback)
+        if ([string]::IsNullOrWhiteSpace($Folder) -or $Folder.IndexOf('%') -ge 0) { $Folder = $Fallback }
+        if ([string]::IsNullOrWhiteSpace($Folder)) { return $null }
+        $Folder = $Folder.Trim().TrimEnd('\')
+        if ($Folder -notmatch '^[A-Za-z]:\\[^\\]') { return $null }
+        return $Folder
+    }
+
+    $Allowed = New-Object 'System.Collections.Generic.List[string]'
+    $Excluded = New-Object 'System.Collections.Generic.List[string]'
+    try
+    {
+        $ProgramFiles = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows\CurrentVersion' 'ProgramFilesDir') ([Environment]::GetFolderPath('ProgramFiles'))
+        $ProgramFilesX86 = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows\CurrentVersion' 'ProgramFilesDir (x86)') ([Environment]::GetFolderPath('ProgramFilesX86'))
+        $SystemRoot = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'SystemRoot') ([Environment]::GetFolderPath('Windows'))
+        if ($ProgramFiles) { $Allowed.Add($ProgramFiles); $Allowed.Add($ProgramFiles + '\WindowsApps') }
+        if ($ProgramFilesX86) { $Allowed.Add($ProgramFilesX86) }
+        if ($SystemRoot)
+        {
+            foreach ($Folder in @('System32', 'SysWOW64', 'WinSxS', 'Microsoft.NET', 'SystemApps', 'ImmersiveControlPanel')) { $Allowed.Add($SystemRoot + '\' + $Folder) }
+            foreach ($System in @('System32', 'SysWOW64'))
+            {
+                foreach ($Folder in $script:AUUserWritableSystemFolders) { $Excluded.Add($SystemRoot + '\' + $System + '\' + $Folder) }
+            }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't find the system folders; every file gets the timed read: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    return [pscustomobject]@{ Allowed = $Allowed.ToArray(); Excluded = $Excluded.ToArray() }
+}#endfunction
+
 function Test-AUDirectRead
 {
     <#
 .SYNOPSIS
-    Tests whether a file may be read directly: true only for a Windows or Program Files location.
+    Tests whether a file may be read directly: true only inside an allowlisted system folder that standard users can't write to.
 .DESCRIPTION
-    Any other location (a user profile, Temp, Downloads, a management cache, ProgramData, another
-    drive's root folders) may be writable by a standard user, who could hold an opportunistic lock
-    or a slow filter on the file and make SYSTEM's open wait indefinitely. Those files are read
-    through Read-AUFile's timed runspace instead. Uses Get-AULocationClass, so C:\Windows\Temp is Temp.
+    The path is normalized with GetFullPath (forward slashes, a \\?\ prefix, . and .. segments, and
+    existing 8.3 short names resolved) and
+    compared ignoring case with each folder plus a trailing backslash: Excluded first, then Allowed
+    (Get-AUDirectReadRoots). Anything else (a user profile, C:\Windows\Temp, C:\Windows\Tasks,
+    C:\Windows\Tracing, the rest of C:\Windows, ProgramData, another drive) may
+    be writable by a standard user, who could hold an opportunistic lock or a slow filter on the
+    file and make SYSTEM's open wait indefinitely, so it's read through Read-AUFile's timed
+    runspace. A path that doesn't normalize is false.
 .PARAMETER Path
     The drive-letter path.
+.PARAMETER Roots
+    The Get-AUDirectReadRoots result (a read budget's DirectRoots), or $null to read it now.
 #>
     param (
-        [string]$Path
+        [string]$Path,
+        [pscustomobject]$Roots
     )
 
-    return ((Get-AULocationClass $Path) -in @('Windows', 'ProgramFiles'))
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $Full = $Path.Trim().Replace('/', '\')
+    if ($Full.StartsWith('\\?\')) { $Full = $Full.Substring(4) }
+    if ($Full -notmatch '^[A-Za-z]:\\') { return $false }
+    try { $Full = [IO.Path]::GetFullPath($Full) }
+    catch { return $false }
+    if ($null -eq $Roots) { $Roots = Get-AUDirectReadRoots }
+    foreach ($Folder in @($Roots.Excluded)) { if ($Folder -and $Full.StartsWith($Folder + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false } }
+    foreach ($Folder in @($Roots.Allowed)) { if ($Folder -and $Full.StartsWith($Folder + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
 }#endfunction
 
 function Read-AUFileDirect
@@ -7199,10 +7282,11 @@ function New-AUReadBudget
 .SYNOPSIS
     Returns a run's budget for timed file reads: a per-file timeout and a total for the run.
 .DESCRIPTION
-    Task 15 makes one per run, passes it to Find-AUExePath and Get-AUExeFacts, and closes it with
-    Close-AUReadBudget. RemainingMs falls by the time every timed read takes; once it's spent, the
-    remaining files outside Windows and Program Files are skipped (unverified, no facts). Reads,
-    TimedOut, and Skipped count what happened. The runspace is created on the first timed read.
+    Task 15 creates one read budget per run, passes it to Find-AUExePath and Get-AUExeFacts, and
+    closes it with Close-AUReadBudget in a finally block. RemainingMs falls by the time every timed
+    read takes; once it's spent, the remaining files outside the direct-read folders are skipped
+    (unverified, no facts). Reads, TimedOut, and Skipped count what happened. DirectRoots is read
+    once (Get-AUDirectReadRoots). The runspace is created on the first timed read.
 .PARAMETER TotalSeconds
     The run's total for timed reads.
 .PARAMETER FileTimeoutSeconds
@@ -7221,6 +7305,7 @@ function New-AUReadBudget
         Reads       = 0
         TimedOut    = 0
         Skipped     = 0
+        DirectRoots = (Get-AUDirectReadRoots)
     }
 }#endfunction
 
@@ -7246,9 +7331,9 @@ function Read-AUFile
 {
     <#
 .SYNOPSIS
-    Reads a file with Read-AUFileDirect, in a timed runspace unless it's under Windows or Program Files.
+    Reads a file with Read-AUFileDirect, in a timed runspace unless it's in an allowlisted system folder.
 .DESCRIPTION
-    A Windows or Program Files file (Test-AUDirectRead) is read directly. Any other file is read in
+    A file in an allowlisted system folder (Test-AUDirectRead) is read directly. Any other file is read in
     a background runspace that is waited on for at most the budget's per-file timeout, or what's
     left of its total. On a timeout the read is logged and let go: the pipeline is told to stop and
     the runspace to close, neither waited on, and the next read gets a new runspace. A timed-out
@@ -7260,7 +7345,8 @@ function Read-AUFile
 .PARAMETER WithVersion
     Also read the version info and the fingerprint after it.
 .PARAMETER ReadBudget
-    The run's New-AUReadBudget result. With none, a budget for this one read is made and closed.
+    The run's New-AUReadBudget result (Task 15 creates one per run and closes it in a finally
+    block). With none, a budget for this one read is made and closed.
 #>
     param (
         [string]$Path,
@@ -7268,7 +7354,9 @@ function Read-AUFile
         [pscustomobject]$ReadBudget
     )
 
-    if (Test-AUDirectRead $Path) { return Read-AUFileDirect $Path -WithVersion:$WithVersion }
+    $Roots = $null
+    if ($null -ne $ReadBudget) { $Roots = $ReadBudget.DirectRoots }
+    if (Test-AUDirectRead $Path $Roots) { return Read-AUFileDirect $Path -WithVersion:$WithVersion }
     $Own = $null
     if ($null -eq $ReadBudget) { $Own = New-AUReadBudget; $ReadBudget = $Own }
     $Result = [pscustomobject]@{ Status = 'Failed'; Before = $null; Info = $null; After = $null; Error = $null }
@@ -7279,7 +7367,7 @@ function Read-AUFile
     {
         if ($ReadBudget.RemainingMs -le 0)
         {
-            if ($ReadBudget.Skipped -eq 0) { Write-CMTraceLog -Message 'App Usage: the file-read time budget is spent; files outside Windows and Program Files are now treated as unverified.' -Component 'AppUsage' -Type 2 }
+            if ($ReadBudget.Skipped -eq 0) { Write-CMTraceLog -Message 'App Usage: the file-read time budget is spent; files outside the direct-read system folders are now treated as unverified.' -Component 'AppUsage' -Type 2 }
             $ReadBudget.Skipped++
             $Result.Status = 'Skipped'
             return $Result
@@ -7481,7 +7569,8 @@ function Find-AUExePath
 .PARAMETER VolumeCache
     The run's volume-to-drive map, shared across entries.
 .PARAMETER ReadBudget
-    The run's New-AUReadBudget result, or $null for a budget for this call only.
+    The run's New-AUReadBudget result (Task 15 creates one per run and closes it in a finally
+    block), or $null for a budget for this call only.
 #>
     param (
         [string[]]$KernelPaths,
@@ -7560,8 +7649,8 @@ function Get-AUExeFacts
     FileVersion, ProductVersion, FactsVerified, Subsystem, MsiProductCode, PackageFamily,
     IsServiceBinary, UserSid, and PathEvidence.
     Path-level facts come from the path: RunPath, LocationClass ($null with no path), and
-    IsServiceBinary (the service map). The file is read once with Read-AUFile (timed outside Windows
-    and Program Files). Build facts (version info, Subsystem, and the Windows Installer owner) are
+    IsServiceBinary (the service map). The file is read once with Read-AUFile (timed outside the
+    allowlisted system folders). Build facts (version info, Subsystem, and the Windows Installer owner) are
     filled in only when the file's PE TimeDateStamp and CheckSum equal the ExeInfo's both before
     and after the version info is read; FactsVerified says so. When the build is unverified and the
     file at the path is a PE image, PathEvidence holds that current file's CompanyName and
@@ -7581,7 +7670,8 @@ function Get-AUExeFacts
 .PARAMETER ExeInfoText
     The SRUM ExeInfo string, for a Package entry's PackageFamily.
 .PARAMETER ReadBudget
-    The run's New-AUReadBudget result, or $null for a budget for this call only.
+    The run's New-AUReadBudget result (Task 15 creates one per run and closes it in a finally
+    block), or $null for a budget for this call only.
 #>
     param (
         [string]$Path,
