@@ -276,6 +276,130 @@ Describe 'Format-AUStatus and the status token list (F42)' {
     }
 }
 
+Describe 'App Usage log lines carry no other user''s identity (D18)' {
+    BeforeAll {
+        # The inventory log is readable by standard users, so App Usage logs counts and exe names only:
+        # no SIDs, no profile paths, and no paths under a profile. These variables and properties hold
+        # one, and may reach a log line only through Get-AUSafeLogText (SIDs and profile folders
+        # replaced) or Get-AUFileLeaf (the file name).
+        $script:Forbidden = @('RunPath', 'ProfilePath', 'UserSid', 'Sid', 'KernelPath', 'Kernel', 'MountName', 'Mount', 'ShownBase')
+        $script:ForbiddenMembers = @('RunPath', 'ProfilePath', 'UserSid', 'Sid', 'KernelPath')
+        # In these functions, these variables hold a user's file, a profile folder, or a hive copy.
+        $script:UserFileVariables = @('Path', 'Source', 'Pair', 'Candidate')
+        $script:UserFileFunctions = @('Read-AUFile', 'Read-AUFileFacts', 'Get-AUFileOwner', 'Get-AUKernelProbe', 'Select-AUVerifiedPath', 'Resolve-AUKernelPath', 'Find-AUExePath',
+            'Get-AUExeFacts', 'Copy-AUShadowFile', 'Get-AUCopyBytes', 'New-AUSnapshot', 'Mount-AUHive', 'Dismount-AUHive', 'Read-AUUserApps', 'Read-AUArpEntries')
+        $script:SafeCommands = @('Get-AUSafeLogText', 'Get-AUFileLeaf')
+
+        function Test-UnderSafeCommand($Node, $Top)
+        {
+            $Parent = $Node.Parent
+            while ($null -ne $Parent -and -not [object]::ReferenceEquals($Parent, $Top.Parent))
+            {
+                if ($Parent -is [Management.Automation.Language.CommandAst] -and $script:SafeCommands -contains $Parent.GetCommandName()) { return $true }
+                $Parent = $Parent.Parent
+            }
+            return $false
+        }
+
+        function Get-TestLogLeaks
+        {
+            $Ast = [Management.Automation.Language.Parser]::ParseInput($AURegionText, [ref]$null, [ref]$null)
+            $Leaks = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($Call in $Ast.FindAll({ param ($Node) $Node -is [Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -eq 'Write-CMTraceLog' }, $true))
+            {
+                $Function = $Call.Parent
+                while ($null -ne $Function -and $Function -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $Function = $Function.Parent }
+                $FunctionName = if ($null -ne $Function) { $Function.Name } else { '' }
+                $Elements = @($Call.CommandElements)
+                $Message = $null
+                for ($i = 1; $i -lt $Elements.Count; $i++)
+                {
+                    if ($Elements[$i] -is [Management.Automation.Language.CommandParameterAst] -and $Elements[$i].ParameterName -eq 'Message') { $Message = $Elements[$i + 1]; break }
+                }
+                if ($null -eq $Message -and $Elements.Count -gt 1 -and $Elements[1] -isnot [Management.Automation.Language.CommandParameterAst]) { $Message = $Elements[1] }
+                if ($null -eq $Message) { continue }
+                $Line = "$FunctionName line $($Call.Extent.StartLineNumber): $($Call.Extent.Text)"
+                foreach ($Variable in $Message.FindAll({ param ($Node) $Node -is [Management.Automation.Language.VariableExpressionAst] }, $true))
+                {
+                    if (Test-UnderSafeCommand $Variable $Message) { continue }
+                    $Name = $Variable.VariablePath.UserPath
+                    if ($script:Forbidden -contains $Name -or ($script:UserFileVariables -contains $Name -and $script:UserFileFunctions -contains $FunctionName)) { $Leaks.Add("`$$Name in $Line") }
+                }
+                foreach ($Member in $Message.FindAll({ param ($Node) $Node -is [Management.Automation.Language.MemberExpressionAst] }, $true))
+                {
+                    if (Test-UnderSafeCommand $Member $Message) { continue }
+                    $MemberName = [string]$Member.Member.Value
+                    if ($script:ForbiddenMembers -contains $MemberName) { $Leaks.Add(".$MemberName in $Line") }
+                    # An exception's message can name a file under a profile, or a SID.
+                    if ($MemberName -eq 'Message' -and $Member.Expression -is [Management.Automation.Language.MemberExpressionAst] -and [string]$Member.Expression.Member.Value -eq 'Exception') { $Leaks.Add(".Exception.Message in $Line") }
+                }
+            }
+            return , $Leaks.ToArray()
+        }
+    }
+
+    It 'never logs a SID, a profile path, a path under a profile, or an unfiltered exception message' {
+        $Leaks = Get-TestLogLeaks
+        $Leaks | Should -BeNullOrEmpty
+    }
+
+    Context 'on a run' {
+        BeforeAll {
+            # The real exe-path search and read budget, so the file reads and their failures are logged.
+            $script:RealFind = ${function:Find-AUExePath}
+            $script:RealBudget = ${function:New-AUReadBudget}
+            $script:RealClose = ${function:Close-AUReadBudget}
+        }
+        BeforeEach { Use-TestDevice }
+
+        It 'logs no SID or profile path on a run that reads another user''s files and fails' {
+            $script:Logged = New-Object 'System.Collections.Generic.List[string]'
+            function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) $script:Logged.Add($Message) }
+            Mock Find-AUExePath { & $script:RealFind -KernelPaths $KernelPaths -ExeInfo $ExeInfo -VolumeCache $VolumeCache -ReadBudget $ReadBudget }
+            Mock New-AUReadBudget { & $script:RealBudget }
+            Mock Close-AUReadBudget { & $script:RealClose -ReadBudget $ReadBudget }
+            $script:FakeDrive = Join-Path $TestDrive "drive-$([guid]::NewGuid().ToString('N'))"
+            $File = Join-Path $script:FakeDrive 'Users\a\AppData\Local\Contoso\omega.exe'
+            [void](New-Item -ItemType Directory -Force -Path (Split-Path $File))
+            [IO.File]::WriteAllText($File, 'not read')
+            Mock Get-AUFixedDrives { $script:FakeDrive }
+            # Every read fails with a message that names the user's folder and SID.
+            Mock Get-AUFileReadScript { "throw 'Access to the path C:\Users\a\AppData\Local\Contoso\omega.exe is denied for $($script:UserA).'" }
+            Mock Get-AUUsers { Write-Warning "user $($script:UserB) at C:\Users\b"; $script:Users }
+            $script:Srum = New-TestSrum @((New-TestRow $script:UserA 'alpha.exe' 100), (New-TestRow $script:UserA 'omega.exe' 101)) @{ Resource = @([pscustomobject]@{ UserSid = $script:UserA; ExeName = 'omega.exe'; KernelPath = '\Device\HarddiskVolume3\Users\a\AppData\Local\Contoso\omega.exe'; TimeStampUtc = $script:Recent }) }
+
+            $Result = Invoke-AppUsage -RunId $script:Run
+            Get-TestTokens $Result | Should -Not -Contain 'AppUsageFailed'
+            # The reads and the stray output were logged ...
+            @($script:Logged | Where-Object { $_ -like "*couldn't read omega.exe*" }).Count | Should -BeGreaterThan 0
+            @($script:Logged | Where-Object { $_ -like '*unexpected output*' }).Count | Should -Be 1
+            # ... with no SID, no profile folder, and no path under a profile.
+            foreach ($Line in $script:Logged)
+            {
+                $Line | Should -Not -Match ([regex]::Escape($script:UserA))
+                $Line | Should -Not -Match ([regex]::Escape($script:UserB))
+                $Line | Should -Not -Match '(?i)C:\\Users\\(a|b)\b'
+                $Line | Should -Not -Match '(?i)\\Users\\a\\AppData'
+            }
+        }
+    }
+
+    It 'replaces user SIDs and the folder under \Users with placeholders, and keeps the rest' {
+        $Text = "Access to 'C:\Users\Jane Doe\AppData\Local\x.exe' is denied for S-1-5-21-111-222-333-1001 at HKU\AU_S-1-12-1-1-2-3-4; C:\Users\bob: gone"
+        $Safe = Get-AUSafeLogText $Text
+        $Safe | Should -Not -Match 'Jane|bob|S-1-5-21-111|S-1-12-1-1-2'
+        $Safe | Should -Match '\\Users\\<user>\\AppData\\Local\\x\.exe'
+        $Safe | Should -Match '<SID>'
+        $Safe | Should -Match ': gone$'
+        Get-AUSafeLogText 'S-1-5-18 and S-1-5-32-544 stay' | Should -BeExactly 'S-1-5-18 and S-1-5-32-544 stay'
+        Get-AUSafeLogText '' | Should -BeExactly ''
+        Get-AUFileLeaf '\Device\HarddiskVolume3\Users\bob\AppData\Local\Contoso\tool.exe' | Should -BeExactly 'tool.exe'
+        Get-AUFileLeaf 'C:\Users\bob\tool.exe' | Should -BeExactly 'tool.exe'
+        Get-AUFileLeaf 'tool.exe' | Should -BeExactly 'tool.exe'
+        Get-AUFileLeaf $null | Should -BeExactly ''
+    }
+}
+
 Describe 'Get-AULedgerPath (F44)' {
     It 'replaces invalid file-name characters in the serial' {
         Get-AULedgerPath 'AB/12:34' 'PC1' | Should -Be 'C:\Windows\AppUsage_AB_12_34.json'

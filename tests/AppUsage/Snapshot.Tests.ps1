@@ -324,6 +324,17 @@ Describe 'New-AUSnapshot' {
         Should -Invoke Remove-AUShadowCopy -Times 0
     }
 
+    It 'counts a profile off the system drive in the log without naming its SID or folder (D18)' {
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        # A logger with the real one's parameters, so the filter can read the message.
+        function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) }
+        Mock Write-CMTraceLog { }
+        $null = New-AUSnapshot -WorkDir $script:WorkDir
+        Should -Invoke Write-CMTraceLog -Times 1 -Exactly -ParameterFilter { $Message -like "App Usage: 1 signed-out profiles aren't on *" }
+        Should -Invoke Write-CMTraceLog -Times 0 -ParameterFilter { $Message -match 'S-1-12-1-9-9-9-9|otherdrive|signedout|S-1-5-21-1-2-3-1001' }
+    }
+
     It 'copies SRUM and signed-out hives only from the shadow root, into the work folder' {
         Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
         Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $script:ShadowRoot } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }

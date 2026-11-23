@@ -4438,12 +4438,12 @@ function Move-AUUnreadableLedger
         [IO.File]::Move($Path, $Aside)
         Write-CMTraceLog -Message "App Usage: moved the unreadable ledger aside to $Aside." -Component 'AppUsage' -Type 2
         try { Set-AUProtectedAcl -Path $Aside }
-        catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Aside`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Aside`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         return $Aside
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't move the unreadable ledger $Path aside, so it won't be written this run: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't move the unreadable ledger $Path aside, so it won't be written this run: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         return $null
     }
 }#endfunction
@@ -4486,7 +4486,7 @@ function Read-AULedger
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: the ledger $Path is unreadable, so it's rebuilt from SRUM: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: the ledger $Path is unreadable, so it's rebuilt from SRUM: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         $Ledger = New-AULedger
         $Ledger.Status = [string[]]@('LedgerReset')
         if ($null -eq (Move-AUUnreadableLedger $Path)) { $Ledger.Writable = $false }
@@ -4544,7 +4544,7 @@ function Write-AULedger
         try
         {
             try { Set-AUProtectedAcl -Stream $Stream }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Temp`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Temp`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
             $Stream.Write($Bytes, 0, $Bytes.Length)
             $Stream.Flush($true)
         }
@@ -4553,7 +4553,7 @@ function Write-AULedger
         if ([IO.File]::Exists($Path))
         {
             try { Set-AUProtectedAcl -Path $Path }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Path`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't restrict access to $Path`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         }
         Move-AUFileAtomic -Source $Temp -Target $Path
     }
@@ -4561,7 +4561,7 @@ function Write-AULedger
     {
         $Failure = $_
         try { if ([IO.File]::Exists($Temp)) { [IO.File]::Delete($Temp) } } catch { }
-        Write-CMTraceLog -Message "App Usage: couldn't write the ledger $Path; the file is unchanged: $($Failure.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't write the ledger $Path; the file is unchanged: $(Get-AUSafeLogText $Failure.Exception.Message)" -Component 'AppUsage' -Type 3
         throw $Failure
     }
 }#endfunction
@@ -4863,7 +4863,7 @@ function ConvertTo-AUOutputDate
     try { return (Format-AUDate $Value) }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: left a date out of the output: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: left a date out of the output: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         return $null
     }
 }#endfunction
@@ -5586,6 +5586,56 @@ $script:AUOutboxLockName = 'Global\PowerStacksAppUsageOutbox'
 # Well-known SIDs, never localized names: SYSTEM and Administrators (F27).
 $script:AULockAclSids = @('S-1-5-18', 'S-1-5-32-544')
 
+# The inventory log is readable by standard users (C:\Windows\Logs grants BUILTIN\Users read), so App
+# Usage log lines name no other user (D18): no SIDs, no profile paths, and no paths under a profile.
+# They log counts and exe names; text that could hold a user's path or SID, such as an exception
+# message, goes through Get-AUSafeLogText.
+$script:AUSidPattern = 'S-1-\d+(-\d+){3,}'
+$script:AUProfileFolderPattern = '(?i)\\Users\\[^\\''"]+?(?=\\|''|"|:\s|$)'
+
+function Get-AUSafeLogText
+{
+    <#
+.SYNOPSIS
+    Returns text for the log with user SIDs replaced by <SID> and the folder under \Users by <user> (D18).
+.DESCRIPTION
+    A SID with three or more subauthorities (an account, such as S-1-5-21-... or S-1-12-1-...) is
+    replaced, so well-known SIDs such as S-1-5-18 and S-1-5-32-544 stay. In a path, the folder
+    right under \Users (the profile folder, named for the user) becomes <user>; the rest of the
+    path stays. Never throws.
+.PARAMETER Text
+    The text, such as an exception message or a hive copy's path.
+#>
+    param (
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    try
+    {
+        $Text = [regex]::Replace($Text, $script:AUSidPattern, '<SID>')
+        return [regex]::Replace($Text, $script:AUProfileFolderPattern, '\Users\<user>')
+    }
+    catch { return '<text withheld>' }
+}#endfunction
+
+function Get-AUFileLeaf
+{
+    <#
+.SYNOPSIS
+    Returns the file name at the end of a path, for a log line that mustn't name the folder (D18). Never throws.
+.PARAMETER Path
+    A drive-letter or kernel path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    $Text = $Path.TrimEnd([char[]]@('\', '/'))
+    return $Text.Substring($Text.LastIndexOfAny([char[]]@('\', '/')) + 1)
+}#endfunction
+
 function Test-AUExceptionType
 {
     <#
@@ -5687,7 +5737,7 @@ function Invoke-AUWithLock
             $Outcome.Acquired = $false
             if (Test-AUExceptionType $_.Exception ([UnauthorizedAccessException])) { $Reason = 'access was denied' }
             else { $Reason = 'it could not be opened or waited on' }
-            Write-CMTraceLog -Message "App Usage: skipped this run because $Reason on lock ${Name}: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+            Write-CMTraceLog -Message "App Usage: skipped this run because $Reason on lock ${Name}: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
             return $Outcome
         }
         if (-not $Outcome.Acquired)
@@ -5699,12 +5749,12 @@ function Invoke-AUWithLock
         catch
         {
             $Outcome.Error = $_.Exception.Message
-            Write-CMTraceLog -Message "App Usage: the work under lock $Name failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: the work under lock $Name failed: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         }
         finally
         {
             try { $Mutex.ReleaseMutex() }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't release lock ${Name}: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't release lock ${Name}: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         }
         return $Outcome
     }
@@ -5713,7 +5763,7 @@ function Invoke-AUWithLock
         if ($null -ne $Mutex)
         {
             try { $Mutex.Dispose() }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't close lock ${Name}: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't close lock ${Name}: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         }
     }
 }#endfunction
@@ -5959,7 +6009,7 @@ function Remove-AUShadowCopy
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't remove shadow copy $ShadowId`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't remove shadow copy $ShadowId`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         return $false
     }
 }#endfunction
@@ -6077,10 +6127,10 @@ function Clear-AUStaleRuns
                 Remove-AUFolderTree -Path $Folder.FullName
                 Write-CMTraceLog -Message "App Usage: removed the stale run folder $($Folder.FullName), created $($CreatedUtc.ToString('o'))." -Component 'AppUsage' -Type 2
             }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the stale run folder $($Folder.FullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the stale run folder $($Folder.FullName): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't check $Root for stale run folders: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't check $Root for stale run folders: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
 }#endfunction
 
 function New-AUWorkDir
@@ -6203,7 +6253,7 @@ function Mount-AUShadow
         if ($Result.ExitCode -eq 0 -and [IO.Directory]::Exists($LinkPath)) { return $true }
         Write-CMTraceLog -Message "App Usage: couldn't link $LinkPath to the shadow copy (exit $($Result.ExitCode), timed out $($Result.TimedOut)): $(([string]$Result.Output).Trim())" -Component 'AppUsage' -Type 3
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't link $LinkPath to the shadow copy: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't link $LinkPath to the shadow copy: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
     return $false
 }#endfunction
 
@@ -6241,7 +6291,7 @@ function Copy-AUShadowFile
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't list $Source in the shadow copy: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: couldn't list $(Get-AUSafeLogText $Source) in the shadow copy: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         return $false
     }
     $AllCopied = ($Pairs.Count -gt 0)
@@ -6251,7 +6301,7 @@ function Copy-AUShadowFile
         catch
         {
             $AllCopied = $false
-            Write-CMTraceLog -Message "App Usage: couldn't copy $($Pair[0]) from the shadow copy: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+            Write-CMTraceLog -Message "App Usage: couldn't copy $(Get-AUSafeLogText $Pair[0]) from the shadow copy: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         }
     }
     return $AllCopied
@@ -6295,7 +6345,7 @@ function Get-AUMachineDomainSid
         }
         Write-CMTraceLog -Message 'App Usage: no local account SID found, so the machine domain SID is blank.' -Component 'AppUsage' -Type 2
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine domain SID: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine domain SID: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
     return ''
 }#endfunction
 
@@ -6324,7 +6374,7 @@ function Get-AUProfileList
             [pscustomobject]@{ Sid = $Sid; ProfilePath = [Environment]::ExpandEnvironmentVariables($ProfilePath) }
         }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't read ProfileList: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read ProfileList: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
     finally { if ($null -ne $Key) { $Key.Close() } }
 }#endfunction
 
@@ -6406,7 +6456,7 @@ function Get-AUCopyBytes
             foreach ($File in [IO.Directory]::GetFiles($SruFolder)) { $Total += (New-Object IO.FileInfo $File).Length }
         }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't size the SRUM folder in the shadow copy: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't size the SRUM folder in the shadow copy: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
     foreach ($Folder in @($HiveFolders))
     {
         if (-not $Folder) { continue }
@@ -6499,7 +6549,7 @@ function New-AUSnapshot
             $Snapshot.ShadowId = [string]$Created.ShadowID
             # A run killed from here on leaves this marker, so a later run deletes the shadow copy.
             try { Write-AUShadowMarker -Folder $WorkDir -ShadowId $Snapshot.ShadowId }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't write the shadow marker in $WorkDir`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't write the shadow marker in $WorkDir`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
             $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($Snapshot.ShadowId)'" -ErrorAction Stop
             if (-not $Shadow -or -not $Shadow.DeviceObject) { throw "shadow copy $($Snapshot.ShadowId) has no device path." }
             $Snapshot.ShadowRoot = ([string]$Shadow.DeviceObject).TrimEnd('\')
@@ -6507,7 +6557,7 @@ function New-AUSnapshot
         catch
         {
             $Snapshot.Status = 'ShadowCopyFailed'
-            Write-CMTraceLog -Message "App Usage: couldn't take a shadow copy of $($env:SystemDrive): $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: couldn't take a shadow copy of $($env:SystemDrive): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
             return $Snapshot
         }
 
@@ -6552,12 +6602,13 @@ function New-AUSnapshot
                 Write-CMTraceLog -Message 'App Usage: SRUDB.dat did not copy from the shadow copy.' -Component 'AppUsage' -Type 3
             }
 
+            $OffDrive = 0
             foreach ($UserProfile in $SignedOut)
             {
                 $Source = ConvertTo-AUShadowPath -Path $UserProfile.ProfilePath -ShadowRoot $Mount
                 if (-not $Source)
                 {
-                    Write-CMTraceLog -Message "App Usage: the profile of $($UserProfile.Sid) at '$($UserProfile.ProfilePath)' isn't on $($env:SystemDrive), so its hive can't be copied." -Component 'AppUsage' -Type 2
+                    $OffDrive++
                     continue
                 }
                 $Folder = [IO.Path]::Combine($WorkDir, "hives\$($UserProfile.Sid)")
@@ -6572,12 +6623,13 @@ function New-AUSnapshot
                     $Snapshot.HiveCopies[$UserProfile.Sid] = $Hive
                 }
             }
+            if ($OffDrive -gt 0) { Write-CMTraceLog -Message "App Usage: $OffDrive signed-out profiles aren't on $($env:SystemDrive), so their hives can't be copied." -Component 'AppUsage' -Type 2 }
         }
         finally
         {
             # The link only, never its target. Remove-AUSnapshot removes it too if this fails.
             try { if ([IO.Directory]::Exists($Mount)) { [IO.Directory]::Delete($Mount) } }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the shadow link $Mount`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the shadow link in $WorkDir`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
         $CopiedCount = @($Snapshot.HiveCopies.Values | Where-Object { $_ }).Count
         Write-CMTraceLog -Message "App Usage: shadow copy $($Snapshot.ShadowId) taken; SRUM copy $($Snapshot.Status); $CopiedCount of $($SignedOut.Count) signed-out hives copied." -Component 'AppUsage'
@@ -6586,7 +6638,7 @@ function New-AUSnapshot
     {
         if ($null -eq $Snapshot.ShadowRoot) { $Snapshot.Status = 'ShadowCopyFailed' }
         elseif ($null -eq $Snapshot.SrumDbPath) { $Snapshot.Status = 'SrumReadFailed:CopyFailed' }
-        Write-CMTraceLog -Message "App Usage: the snapshot failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: the snapshot failed: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
     }
     finally
     {
@@ -6596,7 +6648,7 @@ function New-AUSnapshot
         {
             $Snapshot.ShadowId = $null
             try { [IO.File]::Delete([IO.Path]::Combine($WorkDir, $script:AUShadowMarker)) }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the shadow marker in $WorkDir`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't remove the shadow marker in $WorkDir`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
     }
     return $Snapshot
@@ -6625,7 +6677,7 @@ function Remove-AUSnapshot
 
     if ($null -eq $Snapshot) { return }
     try { $ShadowId = [string]$Snapshot.ShadowId; $WorkDir = [string]$Snapshot.WorkDir }
-    catch { Write-CMTraceLog -Message "App Usage: the snapshot to remove isn't readable: $($_.Exception.Message)" -Component 'AppUsage' -Type 3; return }
+    catch { Write-CMTraceLog -Message "App Usage: the snapshot to remove isn't readable: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3; return }
     try
     {
         [GC]::Collect()
@@ -6663,7 +6715,7 @@ function Remove-AUSnapshot
             }
             catch
             {
-                if ($Attempt -eq 3) { Write-CMTraceLog -Message "App Usage: couldn't remove the work folder $WorkDir`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+                if ($Attempt -eq 3) { Write-CMTraceLog -Message "App Usage: couldn't remove the work folder $WorkDir`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
                 else { Start-Sleep -Milliseconds 500 }
             }
         }
@@ -6696,7 +6748,7 @@ function Initialize-AUEsent
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't load ManagedEsent from $Path`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't load ManagedEsent from $Path`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         return $false
     }
 }#endfunction
@@ -6977,13 +7029,13 @@ function Read-AUSrumTables
             finally { $Table.Dispose() }
             $Result.Resource = @($Newest.Values)
         }
-        catch { Write-CMTraceLog -Message "App Usage: couldn't read the SRUM resource table, so no run paths this run: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't read the SRUM resource table, so no run paths this run: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
     }
     catch
     {
         $Result.Failure = $Stage
         $Result.Complete = $false
-        Write-CMTraceLog -Message "App Usage: the SRUM read stopped ($Stage): $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: the SRUM read stopped ($Stage): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
     }
     finally
     {
@@ -6992,26 +7044,26 @@ function Read-AUSrumTables
         if ($Opened)
         {
             try { [void]$Api::JetCloseDatabase($Session, $DbId, [Microsoft.Isam.Esent.Interop.CloseDatabaseGrbit]::None) }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't close the SRUM database: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't close the SRUM database: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
         if ($Attached)
         {
             try { [void]$Api::JetDetachDatabase($Session, $DbPath) }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't detach the SRUM database: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't detach the SRUM database: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
         if ($InSession)
         {
             try { [void]$Api::JetEndSession($Session, [Microsoft.Isam.Esent.Interop.EndSessionGrbit]::None) }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't end the ESE session: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't end the ESE session: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
         if ($Created)
         {
             try { [void]$Api::JetTerm($Instance) }
             catch
             {
-                Write-CMTraceLog -Message "App Usage: couldn't stop the ESE instance, so stopping it abruptly: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+                Write-CMTraceLog -Message "App Usage: couldn't stop the ESE instance, so stopping it abruptly: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
                 try { [void]$Api::JetTerm2($Instance, [Microsoft.Isam.Esent.Interop.TermGrbit]::Abrupt) }
-                catch { Write-CMTraceLog -Message "App Usage: couldn't stop the ESE instance abruptly: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+                catch { Write-CMTraceLog -Message "App Usage: couldn't stop the ESE instance abruptly: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
             }
         }
     }
@@ -7090,7 +7142,7 @@ function Read-AUSrum
         $Read.Timeline = @()
         $Read.Resource = @()
         $Read.Complete = $false
-        Write-CMTraceLog -Message "App Usage: SRUM read failed ($Reason): $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: SRUM read failed ($Reason): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
     }
     return $Read
 }#endfunction
@@ -7128,7 +7180,7 @@ function Get-AUFixedDrives
             if ($Ready) { $Roots.Add($Drive.Name.Substring(0, 2).ToUpperInvariant()) }
         }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't list the fixed drives: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the fixed drives: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
     # Unrolled, so a pipeline gets one root at a time.
     return $Roots.ToArray()
 }#endfunction
@@ -7359,7 +7411,7 @@ function Get-AUProtectedRoots
             }
         }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't find the system folders; every file gets the owner check: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't find the system folders; every file gets the owner check: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
     return [pscustomobject]@{ Allowed = $Allowed.ToArray(); Excluded = $Excluded.ToArray() }
 }#endfunction
 
@@ -7576,7 +7628,7 @@ function Close-AUReadBudget
     if ($null -eq $ReadBudget -or $null -eq $ReadBudget.Runspace) { return }
     $Runspace = $ReadBudget.Runspace
     $ReadBudget.Runspace = $null
-    try { $Runspace.Dispose() } catch { Write-CMTraceLog -Message "App Usage: couldn't close the file-read runspace: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    try { $Runspace.Dispose() } catch { Write-CMTraceLog -Message "App Usage: couldn't close the file-read runspace: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
 }#endfunction
 
 function Read-AUFile
@@ -7652,7 +7704,7 @@ function Read-AUFile
         # released or the process exits. Each timeout costs the budget at least min(5 s, what's left),
         # so a run abandons at most about 24 runspaces (120 s / 5 s), plus one for a last short wait.
         $ReadBudget.TimedOut++
-        Write-CMTraceLog -Message "App Usage: reading $Path took longer than $Wait ms; it's treated as unverified." -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: reading $(Get-AUFileLeaf $Path) took longer than $Wait ms; it's treated as unverified." -Component 'AppUsage' -Type 2
         try { [void]$Shell.BeginStop($null, $null) } catch { }
         $Abandoned = $ReadBudget.Runspace
         $ReadBudget.Runspace = $null
@@ -7662,7 +7714,7 @@ function Read-AUFile
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't read $($Path): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: couldn't read $(Get-AUFileLeaf $Path): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         # A runspace that failed isn't used again; the next read gets a new one. CloseAsync doesn't wait.
         $Broken = $ReadBudget.Runspace
         $ReadBudget.Runspace = $null
@@ -7774,7 +7826,7 @@ function Select-AUVerifiedPath
     if ($Verified.Count -eq 0) { return $null }
     if ($Verified.Count -gt 1)
     {
-        Write-CMTraceLog -Message "App Usage: $KernelPath verifies under $($Verified.Count) drives; the path stays untranslated." -Component 'AppUsage'
+        Write-CMTraceLog -Message "App Usage: $(Get-AUFileLeaf $KernelPath) verifies under $($Verified.Count) drives; the path stays untranslated." -Component 'AppUsage'
         return $null
     }
     if ($null -ne $VolumeCache -and -not [string]::Equals([string]$Probe.CachedRoot, $Verified[0].Root, [StringComparison]::OrdinalIgnoreCase)) { $VolumeCache[$Probe.Volume] = $Verified[0].Root }
@@ -7813,7 +7865,7 @@ function Resolve-AUKernelPath
     try { return (Select-AUVerifiedPath (Get-AUKernelProbe $KernelPath $ExeInfo $VolumeCache $ReadBudget) $KernelPath $VolumeCache) }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't translate $($KernelPath): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: couldn't translate the path of $(Get-AUFileLeaf $KernelPath): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         return $null
     }
 }#endfunction
@@ -7873,7 +7925,7 @@ function Find-AUExePath
                 }
                 [void](Select-AUVerifiedPath $Probe $Kernel $VolumeCache)
             }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't translate $($Kernel): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't translate the path of $(Get-AUFileLeaf $Kernel): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
         if ($Verified.Count -eq 1) { return [pscustomobject]@{ Path = @($Verified)[0]; Verified = $true } }
         if ($Verified.Count -gt 1)
@@ -8011,7 +8063,7 @@ function Get-AUExeFacts
         else { Write-CMTraceLog -Message "App Usage: an executable file outside the protected folders has an owner that isn't trusted for its entry, so it's treated as unverified." -Component 'AppUsage' -Type 2 }
         return $Facts
     }
-    if ($Read.Error) { Write-CMTraceLog -Message "App Usage: couldn't read the version info of $($RunPath): $($Read.Error)" -Component 'AppUsage' -Type 2 }
+    if ($Read.Error) { Write-CMTraceLog -Message "App Usage: couldn't read the version info of $(Get-AUFileLeaf $RunPath): $(Get-AUSafeLogText $Read.Error)" -Component 'AppUsage' -Type 2 }
     $Info = $Read.Info
     if ($null -eq $Info) { return $Facts }
 
@@ -8118,7 +8170,7 @@ function Get-AUServiceBinaries
     try { $Services = @(Get-AUServiceRecords) }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't list the services; no executable counts as a service binary: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: couldn't list the services; no executable counts as a service binary: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         return $Map
     }
 
@@ -8223,7 +8275,7 @@ function Get-AUUsers
         Write-CMTraceLog -Message "App Usage: $($Users.Count) profiles in ProfileList ($Counts)." -Component 'AppUsage'
         return $Users.ToArray()
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't list the users: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the users: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
 }#endfunction
 
 function Expand-AUEnvironmentText
@@ -8389,7 +8441,7 @@ function Dismount-AUHive
         catch { $Detail = $_.Exception.Message }
         if ($Attempt -lt 3) { Start-Sleep -Milliseconds 500 }
     }
-    Write-CMTraceLog -Message "App Usage: couldn't unload HKU\$MountName ($Detail)." -Component 'AppUsage' -Type 3
+    Write-CMTraceLog -Message "App Usage: couldn't unload $(Get-AUSafeLogText "HKU\$MountName ($Detail)")." -Component 'AppUsage' -Type 3
     return $false
 }#endfunction
 
@@ -8415,21 +8467,21 @@ function Mount-AUHive
     {
         if (-not $Path -or -not [IO.File]::Exists($Path))
         {
-            Write-CMTraceLog -Message "App Usage: the hive copy '$Path' isn't there, so HKU\$MountName wasn't loaded." -Component 'AppUsage' -Type 2
+            Write-CMTraceLog -Message "App Usage: the hive copy '$(Get-AUSafeLogText $Path)' isn't there, so $(Get-AUSafeLogText "HKU\$MountName") wasn't loaded." -Component 'AppUsage' -Type 2
             return $false
         }
         if (Test-AUHiveLoaded -Sid $MountName)
         {
-            Write-CMTraceLog -Message "App Usage: HKU\$MountName was still loaded (an earlier run stopped), so it's unloaded first." -Component 'AppUsage' -Type 2
+            Write-CMTraceLog -Message "App Usage: $(Get-AUSafeLogText "HKU\$MountName") was still loaded (an earlier run stopped), so it's unloaded first." -Component 'AppUsage' -Type 2
             [void](Dismount-AUHive -MountName $MountName)
         }
         $Result = Invoke-AUProcess -FilePath $script:AURegPath -Arguments "load `"HKU\$MountName`" `"$Path`"" -WorkingDirectory ([IO.Path]::GetDirectoryName($Path)) -TimeoutSeconds $script:AUToolTimeoutSeconds
         if ($Result.ExitCode -eq 0) { return $true }
-        Write-CMTraceLog -Message "App Usage: couldn't load the hive copy '$Path' at HKU\$MountName (exit $($Result.ExitCode), timed out $($Result.TimedOut)): $(([string]$Result.Output).Trim())" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't load the hive copy '$(Get-AUSafeLogText $Path)' at $(Get-AUSafeLogText "HKU\$MountName") (exit $($Result.ExitCode), timed out $($Result.TimedOut)): $(Get-AUSafeLogText ([string]$Result.Output).Trim())" -Component 'AppUsage' -Type 3
         # A load that timed out may still finish.
         if ($Result.TimedOut) { [void](Dismount-AUHive -MountName $MountName) }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't load the hive copy '$Path' at HKU\$MountName`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't load the hive copy '$(Get-AUSafeLogText $Path)' at $(Get-AUSafeLogText "HKU\$MountName")`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
     return $false
 }#endfunction
 
@@ -8513,7 +8565,7 @@ function Read-AUArpEntries
             catch
             {
                 $Complete = $false
-                Write-CMTraceLog -Message "App Usage: couldn't read $ShownBase\$SubPath\$Name`: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+                Write-CMTraceLog -Message "App Usage: couldn't read an uninstall entry under $(Get-AUSafeLogText "$ShownBase\$SubPath")`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
             }
             finally { if ($null -ne $Sub) { $Sub.Close() } }
         }
@@ -8521,7 +8573,7 @@ function Read-AUArpEntries
     catch
     {
         $Complete = $false
-        Write-CMTraceLog -Message "App Usage: couldn't read $ShownBase\$SubPath`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't read $(Get-AUSafeLogText "$ShownBase\$SubPath")`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
     }
     finally { if ($null -ne $Key) { $Key.Close() } }
     return $Complete
@@ -8646,7 +8698,7 @@ function Read-AUMsiFileMap
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't read Windows Installer UserData: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: couldn't read Windows Installer UserData: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         return $false
     }
     finally { if ($null -ne $UserData) { $UserData.Close() } }
@@ -8707,7 +8759,7 @@ function Read-AUUserApps
                 $Base = Open-AURegistryBase -Hive Users -Name $Sid
                 if ($null -eq $Base)
                 {
-                    Write-CMTraceLog -Message "App Usage: the hive of $Sid is no longer loaded, so its apps weren't read." -Component 'AppUsage' -Type 2
+                    Write-CMTraceLog -Message "App Usage: a signed-in user's hive is no longer loaded, so that user's apps weren't read." -Component 'AppUsage' -Type 2
                     return $false
                 }
                 try { return [bool](& $ReadHive $Base) }
@@ -8730,7 +8782,7 @@ function Read-AUUserApps
                     if ($null -eq $Base)
                     {
                         $User.ProfileState = 'CopyFailed'
-                        Write-CMTraceLog -Message "App Usage: HKU\$Mount isn't there after loading the hive copy of $Sid." -Component 'AppUsage' -Type 3
+                        Write-CMTraceLog -Message "App Usage: a hive copy isn't at its mount after loading it, so that user's apps weren't read." -Component 'AppUsage' -Type 3
                         return $false
                     }
                     return [bool](& $ReadHive $Base)
@@ -8747,7 +8799,7 @@ function Read-AUUserApps
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't read the apps of $Sid`: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't read a user's apps: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         return $false
     }
 }#endfunction
@@ -8780,7 +8832,7 @@ function Initialize-AUAppxSupport
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't load System.EnterpriseServices for the 24H2 Get-AppxPackage fix: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        Write-CMTraceLog -Message "App Usage: couldn't load System.EnterpriseServices for the 24H2 Get-AppxPackage fix: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         return
     }
     $Cache = [IO.Path]::Combine($env:SystemRoot, 'Microsoft.NET\assembly')
@@ -8795,7 +8847,7 @@ function Initialize-AUAppxSupport
             $Publish.GacInstall([IO.Path]::Combine($env:SystemRoot, "System32\WindowsPowerShell\v1.0\$Dll"))
             Write-CMTraceLog -Message "App Usage: installed $Dll in the global assembly cache (24H2 Get-AppxPackage fix)." -Component 'AppUsage'
         }
-        catch { Write-CMTraceLog -Message "App Usage: couldn't install $Dll in the global assembly cache: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't install $Dll in the global assembly cache: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
     }
 }#endfunction
 
@@ -8850,7 +8902,7 @@ function Read-AUStoreApps
     try { $Packages = @(Get-AUAppxPackages) }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't read the Store and MSIX packages: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't read the Store and MSIX packages: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         return $false
     }
     $Profiles = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
@@ -8874,7 +8926,7 @@ function Read-AUStoreApps
             if (-not $AnyInstalled) { continue }
             $Publisher = $null
             try { $Publisher = Get-AUAppxPublisher -PackageFullName ([string]$Package.PackageFullName) }
-            catch { Write-CMTraceLog -Message "App Usage: couldn't read the manifest of $($Package.PackageFullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't read the manifest of $($Package.PackageFullName): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
             # Installed with no user SID shown: a blank Scope, which counts as present in every scope.
             if ($Sids.Count -eq 0) { $Sids.Add('') }
             foreach ($Sid in $Sids)
@@ -8905,7 +8957,7 @@ function Read-AUStoreApps
         catch
         {
             $Complete = $false
-            Write-CMTraceLog -Message "App Usage: couldn't read the package $($Package.PackageFullName): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+            Write-CMTraceLog -Message "App Usage: couldn't read the package $($Package.PackageFullName): $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2
         }
     }
     return $Complete
@@ -8976,7 +9028,7 @@ function Get-AUInstalledApps
             foreach ($User in $UserList) { $ProfilePaths[[string]$User.Sid] = [string]$User.ProfilePath }
             $MsiRead = [bool](Read-AUMsiFileMap -Base $Machine -Into $MsiFileMap -ProfilePaths $ProfilePaths)
         }
-        catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine's apps: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't read the machine's apps: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         finally { if ($null -ne $Machine) { $Machine.Close() } }
 
         # Only an actual read of SYSTEM's hive counts (ruling 4).
@@ -8997,7 +9049,7 @@ function Get-AUInstalledApps
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: app discovery failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: app discovery failed: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         foreach ($Name in @($ScopeRead.Keys)) { $ScopeRead[$Name] = 'Unread' }
     }
 
@@ -9575,7 +9627,7 @@ function Remove-AUOutboxFile
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't delete or rename the sent row $Path in the outbox, so the next run sends it again: $Message; $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't delete or rename the sent row $Path in the outbox, so the next run sends it again: $Message; $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         return $false
     }
 }#endfunction
@@ -9782,7 +9834,7 @@ function Invoke-AUSend
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: the App Inventory row upload failed: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: the App Inventory row upload failed: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
     }
     return $Outcome
 }#endfunction
@@ -9846,7 +9898,7 @@ function Remove-AUStaleOutboxTemp
             if (Remove-AUOutboxFile -Path $Item.FullName) { $Deleted++ }
         }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir for leftover temp files: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir for leftover temp files: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
     if ($Deleted -gt 0) { Write-CMTraceLog -Message "App Usage: deleted $Deleted leftover file(s) (temp files older than $MaxAgeHours hours, and sent rows) from the outbox $OutboxDir." -Component 'AppUsage' -Type 2 }
     return $Deleted
 }#endfunction
@@ -9918,7 +9970,7 @@ function Send-AUOutbox
     try { $Files = Get-AUOutboxFiles -OutboxDir $OutboxDir }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir, so it isn't sent this run: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir, so it isn't sent this run: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         $Result.OutboxSkipped = $true
         return $Result
     }
@@ -9930,7 +9982,7 @@ function Send-AUOutbox
         try { $Body = Read-AUOutboxRow -File $File -LogAPIMode $LogAPIMode -MaxRowBytes $MaxRowBytes }
         catch
         {
-            Write-CMTraceLog -Message "App Usage: couldn't read $($File.Path) from the outbox, so it waits: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: couldn't read $($File.Path) from the outbox, so it waits: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
             continue
         }
         if ($null -eq $Body)
@@ -10071,7 +10123,7 @@ function Send-AURunRows
             }
             if ($Superseded -gt 0) { Write-CMTraceLog -Message "App Usage: every row of run $RunId was sent, so $Superseded outbox row(s) of older runs were deleted." -Component 'AppUsage' }
         }
-        catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir to delete older runs: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir to delete older runs: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
         return $Result
     }
     if ($Unsent.Count -eq 0) { return $Result }
@@ -10085,7 +10137,7 @@ function Send-AURunRows
         }
         catch
         {
-            Write-CMTraceLog -Message "App Usage: couldn't create the outbox $OutboxDir, so $($Unsent.Count) unsent row(s) are lost: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: couldn't create the outbox $OutboxDir, so $($Unsent.Count) unsent row(s) are lost: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
             $Result.OutboxSkipped = $true
             return $Result
         }
@@ -10102,7 +10154,7 @@ function Send-AURunRows
     }
     Write-CMTraceLog -Message "App Usage: saved $($Result.Saved) of $($Unsent.Count) unsent row(s) of run $RunId to the outbox." -Component 'AppUsage' -Type 2
     try { [void](Limit-AUOutboxRuns -Files (Get-AUOutboxFiles -OutboxDir $OutboxDir) -MaxRuns $MaxRuns) }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir to keep it to $MaxRuns runs: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir to keep it to $MaxRuns runs: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
     return $Result
 }#endfunction
 
@@ -10250,7 +10302,7 @@ function Get-AUOsBuild
         $Build = 0
         if ([int]::TryParse([string]$Key.GetValue('CurrentBuildNumber'), [ref]$Build)) { return $Build }
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't read the Windows build number: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read the Windows build number: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 2 }
     finally { if ($null -ne $Key) { $Key.Close() } }
     return 0
 }#endfunction
@@ -10278,7 +10330,7 @@ function Get-AUSerial
         if ($Bios.Count -gt 0) { return ([string]$Bios[0].SerialNumber).Trim() }
         Write-CMTraceLog -Message 'App Usage: Win32_BIOS returned nothing, so the serial number is unknown.' -Component 'AppUsage' -Type 3
     }
-    catch { Write-CMTraceLog -Message "App Usage: couldn't read the serial number: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't read the serial number: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
     return $null
 }#endfunction
 
@@ -10689,7 +10741,7 @@ function Invoke-AUCollection
         catch
         {
             Add-AUStatusToken $Tokens 'LedgerWriteFailed'
-            Write-CMTraceLog -Message "App Usage: the ledger wasn't written this run: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: the ledger wasn't written this run: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         }
         & $EndStage 'LedgerWrite'
     }
@@ -11000,14 +11052,14 @@ function Invoke-AppUsage
             $Stray = Invoke-AURun -Run $Run *>&1
             foreach ($Item in @($Stray))
             {
-                if ($null -ne $Item) { Write-CMTraceLog -Message "App Usage: unexpected output: $Item" -Component 'AppUsage' -Type 2 }
+                if ($null -ne $Item) { Write-CMTraceLog -Message "App Usage: unexpected output: $(Get-AUSafeLogText ([string]$Item))" -Component 'AppUsage' -Type 2 }
             }
         }
         catch
         {
             Add-AUStatusToken $Run.Tokens 'AppUsageFailed'
             Clear-AUResultData $Result
-            Write-CMTraceLog -Message "App Usage: the run failed, so its usage results are blank: $($_.Exception.Message)" -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: the run failed, so its usage results are blank: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
         }
 
         $Result.StatusTokens = $Run.Tokens.ToArray()
@@ -11029,7 +11081,7 @@ function Invoke-AppUsage
     catch
     {
         # Last resort: even the result couldn't be built normally. Plain types only, as in New-AUResult.
-        try { Write-CMTraceLog -Message "App Usage: failed before a result was built: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 } catch { }
+        try { Write-CMTraceLog -Message "App Usage: failed before a result was built: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 } catch { }
         $Fallback = New-Object PSObject -Property ([ordered]@{
                 RunId = $RunId; Status = 'AppUsageFailed'; StatusTokens = @('AppUsageFailed'); InventoryApps = $null; AppFields = $null; ExeEntries = $null
                 UnmatchedExeCount = $null; WatchingSince = $null; ProfilesFound = $null; ProfilesRead = $null; MappingsVersion = ''; CustomerMappingsHash = ''
