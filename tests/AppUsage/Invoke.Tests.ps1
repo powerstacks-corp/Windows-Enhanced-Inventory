@@ -283,7 +283,8 @@ Describe 'App Usage log lines carry no other user''s identity (D18)' {
         # one, and may reach a log line only through Get-AUSafeLogText (SIDs and profile folders
         # replaced) or Get-AUFileLeaf (the file name).
         $script:Forbidden = @('RunPath', 'ProfilePath', 'UserSid', 'Sid', 'KernelPath', 'Kernel', 'MountName', 'Mount', 'ShownBase')
-        $script:ForbiddenMembers = @('RunPath', 'ProfilePath', 'UserSid', 'Sid', 'KernelPath')
+        # Error and Result: a lock outcome's or run's raw error text and stray output.
+        $script:ForbiddenMembers = @('RunPath', 'ProfilePath', 'UserSid', 'Sid', 'KernelPath', 'Error', 'Result')
         # In these functions, these variables hold a user's file, a profile folder, or a hive copy.
         $script:UserFileVariables = @('Path', 'Source', 'Pair', 'Candidate')
         $script:UserFileFunctions = @('Read-AUFile', 'Read-AUFileFacts', 'Get-AUFileOwner', 'Get-AUKernelProbe', 'Select-AUVerifiedPath', 'Resolve-AUKernelPath', 'Find-AUExePath',
@@ -301,11 +302,34 @@ Describe 'App Usage log lines carry no other user''s identity (D18)' {
             return $false
         }
 
+        # The App Usage log calls: every one in the region, and those in the inline App Inventory
+        # section's App Usage code (the bodies of its if statements on $CollectAppMetering or $AUResult;
+        # never an else branch, which is version 19's read).
+        function Get-TestLogCalls
+        {
+            $IsLog = { param ($Node) $Node -is [Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -eq 'Write-CMTraceLog' }
+            $Calls = New-Object 'System.Collections.Generic.List[object]'
+            $Region = [Management.Automation.Language.Parser]::ParseInput($AURegionText, [ref]$null, [ref]$null)
+            foreach ($Call in $Region.FindAll($IsLog, $true)) { $Calls.Add($Call) }
+            $Inline = [regex]::Match($AUScriptText, '(?ms)^# region APPINVENTORY\r?\n(.*?)^# end region APPINVENTORY')
+            if (-not $Inline.Success) { throw 'The App Inventory section was not found.' }
+            $InlineAst = [Management.Automation.Language.Parser]::ParseInput($Inline.Groups[1].Value, [ref]$null, [ref]$null)
+            $Seen = New-Object 'System.Collections.Generic.HashSet[int]'
+            foreach ($If in $InlineAst.FindAll({ param ($Node) $Node -is [Management.Automation.Language.IfStatementAst] }, $true))
+            {
+                foreach ($Clause in $If.Clauses)
+                {
+                    if ($Clause.Item1.Extent.Text -notmatch '\$CollectAppMetering|\$AUResult') { continue }
+                    foreach ($Call in $Clause.Item2.FindAll($IsLog, $true)) { if ($Seen.Add($Call.Extent.StartOffset)) { $Calls.Add($Call) } }
+                }
+            }
+            return , $Calls.ToArray()
+        }
+
         function Get-TestLogLeaks
         {
-            $Ast = [Management.Automation.Language.Parser]::ParseInput($AURegionText, [ref]$null, [ref]$null)
             $Leaks = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($Call in $Ast.FindAll({ param ($Node) $Node -is [Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -eq 'Write-CMTraceLog' }, $true))
+            foreach ($Call in (Get-TestLogCalls))
             {
                 $Function = $Call.Parent
                 while ($null -ne $Function -and $Function -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $Function = $Function.Parent }
@@ -341,6 +365,15 @@ Describe 'App Usage log lines carry no other user''s identity (D18)' {
     It 'never logs a SID, a profile path, a path under a profile, or an unfiltered exception message' {
         $Leaks = Get-TestLogLeaks
         $Leaks | Should -BeNullOrEmpty
+    }
+
+    It 'scans the inline App Inventory section''s App Usage log lines, the row sender''s included' {
+        $Texts = @((Get-TestLogCalls) | ForEach-Object { $_.Extent.Text })
+        @($Texts | Where-Object { $_ -like '*App Usage failed, so the inventory uses its own read*' }).Count | Should -Be 1
+        @($Texts | Where-Object { $_ -clike 'Write-CMTraceLog "App inventory row upload failed*' }).Count | Should -Be 1
+        @($Texts | Where-Object { $_ -like '*could not be sent with App Usage*' }).Count | Should -Be 1
+        # Version 19's own lines aren't App Usage's.
+        @($Texts | Where-Object { $_ -like '*Starting App Inventory Collection*' }).Count | Should -Be 0
     }
 
     Context 'on a run' {
@@ -380,6 +413,37 @@ Describe 'App Usage log lines carry no other user''s identity (D18)' {
                 $Line | Should -Not -Match ([regex]::Escape($script:UserB))
                 $Line | Should -Not -Match '(?i)C:\\Users\\(a|b)\b'
                 $Line | Should -Not -Match '(?i)\\Users\\a\\AppData'
+            }
+        }
+    }
+
+    Context 'under the run lock' {
+        BeforeAll { $script:RealLock = ${function:Invoke-AUWithLock} }
+        BeforeEach { Use-TestDevice }
+
+        It 'logs no SID or profile path from work under the lock that <Case>' -ForEach @(
+            @{ Case = 'throws' }
+            @{ Case = 'writes stray output' }
+        ) {
+            $script:Logged = New-Object 'System.Collections.Generic.List[string]'
+            function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) $script:Logged.Add($Message) }
+            # The real lock, so its outcome's Error and Result reach Invoke-AURun.
+            Mock Invoke-AUWithLock { & $script:RealLock -Body $Body -TimeoutSeconds $TimeoutSeconds -Name "Global\PowerStacksAppUsageTest-$([guid]::NewGuid().ToString('N'))" }
+            $script:LeakSid = 'S-1-5-21-555-666-777-1009'
+            $script:LeakText = "Access to the path 'C:\Users\au-leak-user\NTUSER.DAT' is denied for $($script:LeakSid)."
+            if ($Case -eq 'throws') { Mock Get-AUUsers { throw $script:LeakText } }
+            else { Mock Remove-AUSnapshot { $script:LeakText } }
+            $Result = Invoke-AppUsage -RunId $script:Run
+            if ($Case -eq 'throws')
+            {
+                Get-TestTokens $Result | Should -Contain 'AppUsageFailed'
+                @($script:Logged | Where-Object { $_ -like 'App Usage: the run failed*' }).Count | Should -Be 1
+            }
+            else { @($script:Logged | Where-Object { $_ -like '*unexpected output*' }).Count | Should -BeGreaterThan 0 }
+            foreach ($Line in $script:Logged)
+            {
+                $Line | Should -Not -Match ([regex]::Escape($script:LeakSid))
+                $Line | Should -Not -Match 'au-leak-user'
             }
         }
     }

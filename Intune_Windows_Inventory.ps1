@@ -10954,12 +10954,12 @@ function Invoke-AURun
         Add-AUStatusToken $Tokens 'AppUsageBusy'
         return
     }
-    if ($null -ne $Lock.Result) { Write-CMTraceLog -Message "App Usage: the work under the lock wrote unexpected output: $(@($Lock.Result) -join ' | ')" -Component 'AppUsage' -Type 2 }
+    if ($null -ne $Lock.Result) { Write-CMTraceLog -Message "App Usage: the work under the lock wrote unexpected output: $(Get-AUSafeLogText (@($Lock.Result) -join ' | '))" -Component 'AppUsage' -Type 2 }
     if ($null -ne $Lock.Error)
     {
         Add-AUStatusToken $Tokens 'AppUsageFailed'
         Clear-AUResultData $Run.Result
-        Write-CMTraceLog -Message "App Usage: the run failed, so its usage results are blank: $($Lock.Error)" -Component 'AppUsage' -Type 3
+        Write-CMTraceLog -Message "App Usage: the run failed, so its usage results are blank: $(Get-AUSafeLogText $Lock.Error)" -Component 'AppUsage' -Type 3
     }
 }#endfunction
 
@@ -12115,7 +12115,7 @@ if ($CollectAppInventory)
         }
         catch
         {
-            Write-CMTraceLog "App Usage failed, so the inventory uses its own read: $($_.Exception.Message)" -ErrorMsg
+            Write-CMTraceLog "App Usage failed, so the inventory uses its own read: $(Get-AUSafeLogText $_.Exception.Message)" -ErrorMsg
             $AUResult = $null
         }
         if ($null -eq $AUResult -or $null -eq $AUResult.DeviceColumns)
@@ -12126,7 +12126,7 @@ if ($CollectAppInventory)
             }
             catch
             {
-                Write-CMTraceLog "App Usage result could not be built: $($_.Exception.Message)" -ErrorMsg
+                Write-CMTraceLog "App Usage result could not be built: $(Get-AUSafeLogText $_.Exception.Message)" -ErrorMsg
                 $AUResult = $null
             }
         }
@@ -12174,7 +12174,7 @@ if ($CollectAppInventory)
         }
         catch
         {
-            Write-CMTraceLog "App Usage fields could not be added: $($_.Exception.Message)" -ErrorMsg
+            Write-CMTraceLog "App Usage fields could not be added: $(Get-AUSafeLogText $_.Exception.Message)" -ErrorMsg
         }
     }
 
@@ -12241,7 +12241,7 @@ if ($CollectAppInventory)
                         {
                         }
                     }
-                    try { Write-CMTraceLog "App inventory row upload failed: $($_.Exception.Message)" -WarningMsg } catch { }
+                    try { Write-CMTraceLog "App inventory row upload failed: $(Get-AUSafeLogText $_.Exception.Message)" -WarningMsg } catch { }
                 }
                 # The outcome is decided from the response before anything is logged, so a failed log line can't change it.
                 $Ok = ("$Response" -match "^$(if($Mode -eq 'LogIngestionAPI'){204}else{200}) :")
@@ -12257,7 +12257,7 @@ if ($CollectAppInventory)
         }
         catch
         {
-            Write-CMTraceLog "App Inventory rows could not be sent with App Usage, so the inventory uses its own upload: $($_.Exception.Message)" -ErrorMsg
+            Write-CMTraceLog "App Inventory rows could not be sent with App Usage, so the inventory uses its own upload: $(Get-AUSafeLogText $_.Exception.Message)" -ErrorMsg
         }
     }
 
