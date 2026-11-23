@@ -288,6 +288,167 @@ Describe 'Text from files and the registry in -like patterns (I1)' {
     }
 }
 
+Describe 'The installed-app index (Task 21 scale)' {
+    BeforeAll {
+        $Kelvin = [string][char]0x212A
+        # Apps that probe each lookup: case, scope, tags, escapes, blank and padded values, and a
+        # non-ASCII name that -like matches to an ASCII pattern (the Kelvin sign lowercases to k).
+        $script:IndexApps = @(
+            (New-TestApp 'Contoso Alpha 2.1' 'Contoso Ltd')
+            (New-TestApp 'Contoso Alpha' 'Contoso' @{ Scope = $script:TestSid })
+            (New-TestApp 'Contoso Alpha' 'Contoso' @{ Scope = $script:OtherSid })
+            (New-TestApp 'Contoso Tool [x64]' 'Contoso')
+            (New-TestApp 'Contoso Tool (x86) 1.0' 'Contoso')
+            (New-TestApp 'Contoso Tool 1.0' 'Contoso')
+            (New-TestApp 'CONTOSO BETA' 'contoso')
+            (New-TestApp "${Kelvin}elvin Tool" "${Kelvin}elvin Corp")
+            (New-TestApp 'Fabrikam Coded' 'Fabrikam' @{ ProductCode = '{aaaaaaaa-0000-0000-0000-000000000001}' })
+            (New-TestApp 'Fabrikam Package' 'Fabrikam' @{ PackageFamily = 'Fabrikam.Package_abc'; Scope = $script:TestSid })
+            (New-TestApp 'Fabrikam Solo' $null)
+            (New-TestApp '  Contoso Gamma  ' ' Contoso ')
+            (New-TestApp 'Odd`Name' 'Odd')
+            (New-TestApp 'Contoso `[EU' 'Contoso')
+            (New-TestApp '' 'Contoso')
+            $null
+        )
+        $Target = {
+            param ([string]$Pattern, [AllowNull()][string]$Publisher, [hashtable]$Values = @{})
+            $t = [ordered]@{ MatchSection = 'PowerStacks'; MatchRuleId = 'ps-test-1'; RuleType = 'identity'; InstalledStateDependent = $false; TargetPattern = $Pattern; TargetPublisher = $Publisher; ResolvedAppName = $null; ProductCode = $null; PackageFamily = $null }
+            foreach ($Key in $Values.Keys) { $t[$Key] = $Values[$Key] }
+            return [pscustomobject]$t
+        }
+        $Exact = @{ RuleType = 'arpCompare'; InstalledStateDependent = $true; MatchRuleId = 'ps-arp-compare' }
+        $script:IndexTargets = @(
+            (& $Target 'Contoso Alpha*' 'Contoso*')
+            (& $Target 'Contoso Beta' 'Contoso')
+            (& $Target 'Contoso T*' 'Contoso')
+            (& $Target 'Contoso T*' 'CONTOSO')
+            (& $Target '*' '')
+            (& $Target 'Contoso Tool `[x64`]' 'Contoso' ($Exact + @{ ResolvedAppName = 'Contoso Tool [x64]' }))
+            (& $Target 'Contoso Alpha 1.0' 'Contoso Ltd' ($Exact + @{ ResolvedAppName = 'Contoso Alpha 1.0' }))
+            (& $Target 'Contoso Tool*' 'Contoso*' @{ MatchRuleId = 'ps-resolve-arch'; ResolvedAppName = 'Contoso Tool (x86) 1.1' })
+            (& $Target 'Contoso Tool*' 'Contoso*' @{ MatchRuleId = 'ps-resolve-path'; ResolvedAppName = 'Contoso Tool 2.0' })
+            (& $Target 'Nothing' 'Nobody' @{ ProductCode = ' {AAAAAAAA-0000-0000-0000-000000000001} ' })
+            (& $Target 'Nothing' 'Nobody' @{ PackageFamily = 'FABRIKAM.PACKAGE_ABC' })
+            (& $Target 'Kelvin Tool' 'Kelvin Corp')
+            (& $Target 'Kelvin*' "${Kelvin}elvin Corp")
+            (& $Target "${Kelvin}elvin Tool" 'Kelvin Corp')
+            (& $Target 'Contoso Alpha 2.1`' 'Contoso Ltd')
+            (& $Target 'Odd``Name' 'Odd')
+            (& $Target 'Odd`Name' 'Odd')
+            (& $Target ([Management.Automation.WildcardPattern]::Escape('Contoso `[EU')) 'Contoso')
+            (& $Target 'Contoso [Alpha' 'Contoso')
+            (& $Target 'Contoso]' 'Contoso')
+            (& $Target 'Fabrikam Solo' '')
+            (& $Target 'Fabrikam Solo' $null)
+            (& $Target '  Contoso Gamma  ' ' Contoso ')
+            (& $Target 'Contoso Gamma' 'Contoso')
+            (& $Target $null 'Contoso')
+        )
+        # The reference: every in-scope app, one by one, as Get-AUInstallStatus did before the index.
+        $script:ScanInstalled = {
+            param ($Target, [string]$Sid)
+            $Keys = Get-AUTargetKeys $Target
+            foreach ($App in $script:IndexApps)
+            {
+                if ($null -eq $App) { continue }
+                $Scope = ([string]$App.Scope).Trim()
+                if ($Scope -and $Scope -ne 'Machine' -and -not ($Sid -and [string]::Equals($Scope, $Sid, [StringComparison]::OrdinalIgnoreCase))) { continue }
+                if (Test-AUTargetApp $App $Keys) { return $true }
+            }
+            return $false
+        }
+    }
+
+    It 'gives Get-AUInstallStatus the same answer as checking every installed app, for every target and user' {
+        $Index = New-AUAppIndex $script:IndexApps
+        $ScopeRead = New-TestScopeRead @{ $script:OtherSid = 'Read' }
+        $Installed = 0
+        foreach ($t in $script:IndexTargets)
+        {
+            foreach ($Sid in @($script:TestSid, $script:OtherSid, ''))
+            {
+                $Expected = 'Unknown'
+                if (& $script:ScanInstalled $t $Sid) { $Expected = 'Installed'; $Installed++ }
+                elseif ($Sid) { $Expected = 'NotInstalled' }
+                $Because = "target '$($t.TargetPattern)' / '$($t.TargetPublisher)' for '$Sid'"
+                Get-AUInstallStatus -Target $t -InstalledApps $script:IndexApps -ScopeRead $ScopeRead -UserSid $Sid -AppIndex $Index | Should -BeExactly $Expected -Because $Because
+                Get-AUInstallStatus -Target $t -InstalledApps $script:IndexApps -ScopeRead $ScopeRead -UserSid $Sid | Should -BeExactly $Expected -Because $Because
+            }
+        }
+        # The cases above really do match, through every lookup.
+        $Installed | Should -BeGreaterThan 40
+    }
+
+    It 'Get-AUPatternLiteral gives <Text> for the pattern <Pattern>' -ForEach @(
+        @{ Pattern = 'Contoso Alpha'; Text = 'Contoso Alpha' }
+        @{ Pattern = ''; Text = '' }
+        @{ Pattern = 'Contoso Tool `[x64`]'; Text = 'Contoso Tool [x64]' }
+        @{ Pattern = 'Odd``Name `* `?'; Text = 'Odd`Name * ?' }
+        @{ Pattern = 'Contoso*'; Text = $null }
+        @{ Pattern = 'Contoso?'; Text = $null }
+        @{ Pattern = 'Contoso [Alpha'; Text = $null }
+        @{ Pattern = 'Contoso]'; Text = $null }
+        @{ Pattern = 'Contoso`'; Text = $null }
+        @{ Pattern = 'Odd`Name'; Text = $null }
+    ) {
+        Get-AUPatternLiteral $Pattern | Should -Be $Text
+        if ($null -ne $Text) { $Text -like $Pattern | Should -BeTrue }
+    }
+
+    It 'matches the Kelvin sign app to the ASCII pattern Kelvin Tool, as -like does' {
+        $t = $script:IndexTargets[11]
+        $t.TargetPattern | Should -BeExactly 'Kelvin Tool'
+        (Get-AUPatternLiteral $t.TargetPattern) | Should -BeExactly 'Kelvin Tool'
+        Get-AUInstallStatus -Target $t -InstalledApps $script:IndexApps -ScopeRead (New-TestScopeRead) -UserSid $script:TestSid -AppIndex (New-AUAppIndex $script:IndexApps) | Should -BeExactly 'Installed'
+    }
+
+    It 'uses the given -AppIndex in place of scanning InstalledApps' {
+        $t = $script:IndexTargets[0]
+        $Index = New-AUAppIndex @((New-TestApp 'Contoso Alpha 3.0' 'Contoso'))
+        Get-AUInstallStatus -Target $t -InstalledApps @() -ScopeRead (New-TestScopeRead) -UserSid $script:TestSid -AppIndex $Index | Should -BeExactly 'Installed'
+        Get-AUInstallStatus -Target $t -InstalledApps @() -ScopeRead (New-TestScopeRead) -UserSid $script:TestSid | Should -BeExactly 'NotInstalled'
+    }
+
+    It 'gives Get-AUTargetAppNames the names in installed-app order, as a scan does' {
+        $Index = New-AUAppIndex $script:IndexApps
+        foreach ($t in $script:IndexTargets)
+        {
+            $Keys = Get-AUTargetKeys $t
+            $Expected = New-Object 'Collections.Generic.List[string]'
+            foreach ($App in $script:IndexApps)
+            {
+                if ($null -eq $App) { continue }
+                $Name = ([string]$App.DisplayName).Trim()
+                if (-not $Name -or $Expected.Contains($Name)) { continue }
+                if (Test-AUTargetApp $App $Keys) { $Expected.Add($Name) }
+            }
+            $Resolved = ([string]$t.ResolvedAppName).Trim()
+            if ($Resolved -and $Index.Names.ContainsKey($Resolved)) { continue }
+            @(Get-AUTargetAppNames $t $Index) | Should -Be @($Expected) -Because "target '$($t.TargetPattern)' / '$($t.TargetPublisher)'"
+        }
+    }
+
+    It 'gives Resolve-AUIdentity the result it gave before the index, with and without -AppIndex, for <Name>' -ForEach @(
+        @{ Name = 'arpCompare'; Facts = @{ FileCompanyName = 'Contoso, Inc.'; FileProductName = 'Contoso Alpha' }
+            Expected = '{"TargetPattern":null,"TargetPublisher":null,"ResolvedAppName":null,"ProductCode":null,"PackageFamily":null,"MatchSection":"None","MatchRuleId":null,"RuleType":null,"InstalledStateDependent":false,"EvidenceUsed":"Verified","CandidateTargets":["Contoso Alpha 2.1","Contoso Alpha"]}' }
+        @{ Name = 'arpCompare among siblings'; Facts = @{ FileCompanyName = 'Contoso'; FileDescription = 'Contoso Tool'; RunPath = 'C:\Program Files (x86)\Contoso\tool.exe' }
+            Expected = '{"TargetPattern":null,"TargetPublisher":null,"ResolvedAppName":null,"ProductCode":null,"PackageFamily":null,"MatchSection":"None","MatchRuleId":null,"RuleType":null,"InstalledStateDependent":false,"EvidenceUsed":"Verified","CandidateTargets":["Contoso Tool [x64]","Contoso Tool (x86) 1.0","Contoso Tool 1.0"]}' }
+        @{ Name = 'ownership msi'; Facts = @{ MsiProductCode = '{AAAAAAAA-0000-0000-0000-000000000001}' }
+            Expected = '{"TargetPattern":"Fabrikam Coded","TargetPublisher":"Fabrikam","ResolvedAppName":"Fabrikam Coded","ProductCode":"{aaaaaaaa-0000-0000-0000-000000000001}","PackageFamily":null,"MatchSection":"PowerStacks","MatchRuleId":"ps-own-msi","RuleType":"ownership","InstalledStateDependent":true,"EvidenceUsed":"Verified","CandidateTargets":null}' }
+        @{ Name = 'ownership store'; Facts = @{ ExeName = $null; PackageFamily = 'fabrikam.package_abc' }
+            Expected = '{"TargetPattern":"Fabrikam Package","TargetPublisher":"Fabrikam","ResolvedAppName":"Fabrikam Package","ProductCode":null,"PackageFamily":"Fabrikam.Package_abc","MatchSection":"PowerStacks","MatchRuleId":"ps-own-store","RuleType":"ownership","InstalledStateDependent":true,"EvidenceUsed":"Verified","CandidateTargets":null}' }
+        @{ Name = 'no match'; Facts = @{ FileCompanyName = 'Northwind'; FileProductName = 'Northwind Traders' }
+            Expected = '{"TargetPattern":null,"TargetPublisher":null,"ResolvedAppName":null,"ProductCode":null,"PackageFamily":null,"MatchSection":"None","MatchRuleId":null,"RuleType":null,"InstalledStateDependent":false,"EvidenceUsed":"None","CandidateTargets":null}' }
+    ) {
+        Mock Write-CMTraceLog { }
+        $m = New-TestMappings -PowerStacks @('{ "id": "ps-own-msi", "type": "ownership", "source": "msi" }', '{ "id": "ps-own-store", "type": "ownership", "source": "store" }', $script:RuleArp)
+        $f = New-TestFacts $Facts
+        Resolve-AUIdentity -Facts $f -Mappings $m -InstalledApps $script:IndexApps | ConvertTo-Json -Compress | Should -BeExactly $Expected
+        Resolve-AUIdentity -Facts $f -Mappings $m -InstalledApps $script:IndexApps -AppIndex (New-AUAppIndex $script:IndexApps) | ConvertTo-Json -Compress | Should -BeExactly $Expected
+    }
+}
+
 Describe 'Resolve-AUTarget' {
     Context 'Retained targets (D17, F11)' {
         It 'keeps an arpCompare target after the app is uninstalled: Retained, same rule, NotInstalled' {

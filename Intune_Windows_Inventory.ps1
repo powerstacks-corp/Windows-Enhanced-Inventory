@@ -2097,6 +2097,9 @@ function ConvertFrom-AUOleDate
     catch { return $null }
 }#endfunction
 
+# The one UTC date format (AppLastUsedDate and every other App Usage date).
+$script:AUUtcDateFormat = "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffff'Z'"
+
 function Format-AUDate
 {
     <#
@@ -2112,7 +2115,7 @@ function Format-AUDate
     )
 
     if ($Utc.Kind -ne [DateTimeKind]::Utc) { throw "Format-AUDate needs a Utc date; got Kind $($Utc.Kind)." }
-    return $Utc.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+    return $Utc.ToString($script:AUUtcDateFormat, [Globalization.CultureInfo]::InvariantCulture)
 }#endfunction
 
 # Mapping rules (D3, D38, D41, D45). The rule IDs a D47 candidate step records; no file may define them.
@@ -2713,6 +2716,9 @@ $script:AUArchTokens = @('x64', 'x86', 'x86_64', 'amd64', 'arm64', '64-bit', '32
 # the region loading there without an error record.
 $script:AUNormalizedText = $null
 if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') { $script:AUNormalizedText = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal) }
+# Get-AUTargetKeys results by target fields, for the same reason and with the same check.
+$script:AUTargetKeysCache = $null
+if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') { $script:AUTargetKeysCache = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal) }
 
 function Get-AULocationClass
 {
@@ -2789,6 +2795,43 @@ function ConvertTo-AUWildcardLiteral
     return $Text.Replace('`', '``').Replace('*', '`*').Replace('?', '`?').Replace('[', '`[').Replace(']', '`]')
 }#endfunction
 
+function Get-AUPatternLiteral
+{
+    <#
+.SYNOPSIS
+    Returns the one text a -like pattern matches (ignoring case), or $null when it can match others.
+.DESCRIPTION
+    A pattern with no wildcard and no escape is its own text. The escapes ConvertTo-AUWildcardLiteral
+    writes (a backtick before `, *, ?, [, or ]) are removed. Any other pattern gives $null: an
+    unescaped *, ?, [, or ], a trailing backtick, or a backtick before any other character, whose
+    -like meaning isn't a plain literal. The installed-app index looks up a literal by its text and
+    checks every other pattern app by app.
+.PARAMETER Pattern
+    The -like pattern.
+#>
+    param (
+        [AllowNull()][string]$Pattern
+    )
+
+    if ($null -eq $Pattern) { return $null }
+    if ($Pattern.IndexOfAny($script:AUWildcardChars) -lt 0) { return $Pattern }
+    $Text = [Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $Pattern.Length; $i++)
+    {
+        $Char = $Pattern[$i]
+        if ($Char -eq [char]'`')
+        {
+            if ($i + 1 -ge $Pattern.Length -or [Array]::IndexOf($script:AUWildcardChars, $Pattern[$i + 1]) -lt 0) { return $null }
+            $i++
+            [void]$Text.Append($Pattern[$i])
+            continue
+        }
+        if ([Array]::IndexOf($script:AUWildcardChars, $Char) -ge 0) { return $null }
+        [void]$Text.Append($Char)
+    }
+    return $Text.ToString()
+}#endfunction
+
 function Get-AUNormalizedText
 {
     <#
@@ -2823,7 +2866,7 @@ function Get-AUNormalizedText
     elseif ($Kind -eq 'Name')
     {
         $Value = [regex]::Replace($Value, '\([^)]*\)|\[[^\]]*\]', ' ')
-        $Kept = New-Object 'System.Collections.Generic.List[string]'
+        $Kept = [System.Collections.Generic.List[string]]::new()
         foreach ($Token in ($Value -split '\s+'))
         {
             $Token = $Token.Trim(',', ';', ':')
@@ -2837,7 +2880,7 @@ function Get-AUNormalizedText
     else
     {
         $Value = [regex]::Replace($Value.Replace('.', ''), '[^\p{L}\p{Nd}]+', ' ').Trim()
-        $Tokens = New-Object 'System.Collections.Generic.List[string]'
+        $Tokens = [System.Collections.Generic.List[string]]::new()
         foreach ($Token in ($Value -split ' ')) { if ($Token) { $Tokens.Add($Token) } }
         while ($Tokens.Count -gt 1 -and $Tokens[$Tokens.Count - 1] -in $script:AULegalSuffixes) { $Tokens.RemoveAt($Tokens.Count - 1) }
         $Value = $Tokens -join ' '
@@ -2864,7 +2907,7 @@ function ConvertTo-AUVersionParts
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $Match = [regex]::Match($Text, '^\s*v?(\d+(?:\s*[.,]\s*\d+){0,3})')
     if (-not $Match.Success) { return $null }
-    $Parts = New-Object 'System.Collections.Generic.List[int]'
+    $Parts = [System.Collections.Generic.List[int]]::new()
     foreach ($Piece in ($Match.Groups[1].Value -split '[.,]'))
     {
         $Number = 0
@@ -3005,15 +3048,20 @@ function Get-AUIdentityRuleHit
     The Get-AUIdentityEvidence result.
 .PARAMETER InstalledApps
     The installed-app entries.
+.PARAMETER AppIndex
+    New-AUAppIndex of InstalledApps, for the ownership and arpCompare lookups; built here when it
+    isn't given.
 #>
     param (
         [pscustomobject]$Rule,
         [pscustomobject]$Facts,
         [pscustomobject]$Evidence,
-        [object[]]$InstalledApps
+        [object[]]$InstalledApps,
+        [pscustomobject]$AppIndex
     )
 
-    $Candidates = New-Object 'System.Collections.Generic.List[object]'
+    $Candidates = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $AppIndex -and [string]$Rule.type -cne 'identity') { $AppIndex = New-AUAppIndex $InstalledApps }
     switch -CaseSensitive ([string]$Rule.type)
     {
         'identity'
@@ -3043,35 +3091,34 @@ function Get-AUIdentityRuleHit
                 # The Installer owner is a build-specific fact, attached only to a verified build (D24).
                 $Code = ([string]$Facts.MsiProductCode).Trim()
                 if ($Evidence.Kind -ne 'Verified' -or -not $Code) { return $null }
-                foreach ($App in $InstalledApps)
-                {
-                    if ([string]::Equals(([string]$App.ProductCode).Trim(), $Code, [StringComparison]::OrdinalIgnoreCase)) { $Candidates.Add($App) }
-                }
+                foreach ($App in (Get-AUIndexedApps $AppIndex $AppIndex.ByCode $Code)) { $Candidates.Add($App) }
             }
             elseif ($Rule.source -ceq 'store')
             {
                 $Family = ([string]$Facts.PackageFamily).Trim()
                 if (-not $Family) { return $null }
-                foreach ($App in $InstalledApps)
-                {
-                    if ([string]::Equals(([string]$App.PackageFamily).Trim(), $Family, [StringComparison]::OrdinalIgnoreCase)) { $Candidates.Add($App) }
-                }
+                foreach ($App in (Get-AUIndexedApps $AppIndex $AppIndex.ByFamily $Family)) { $Candidates.Add($App) }
             }
         }
         'arpCompare'
         {
-            $Publisher = Get-AUNormalizedText $Evidence.Publisher -Kind Publisher
-            if (-not $Publisher) { return $null }
-            $Names = @((Get-AUNormalizedText $Evidence.ProductName -Kind Name), (Get-AUNormalizedText $Evidence.FileDescription -Kind Name)) | Where-Object { $_ }
-            if (-not $Names) { return $null }
-            # This loop runs for most exes, so it reads the cache directly and calls the function only on a miss.
+            # This runs for most exes, so it reads the Get-AUNormalizedText cache directly and calls the
+            # function only on a miss.
             $Cache = $script:AUNormalizedText
             $Key = $null
-            foreach ($App in $InstalledApps)
+            $Publisher = $null
+            if (-not $Cache.TryGetValue('Publisher|' + [string]$Evidence.Publisher, [ref]$Publisher)) { $Publisher = Get-AUNormalizedText $Evidence.Publisher -Kind Publisher }
+            if (-not $Publisher) { return $null }
+            $Names = [Collections.Generic.List[string]]::new()
+            foreach ($Text in @([string]$Evidence.ProductName, [string]$Evidence.FileDescription))
             {
-                $AppPublisher = [string]$App.Publisher
-                if (-not $Cache.TryGetValue('Publisher|' + $AppPublisher, [ref]$Key)) { $Key = Get-AUNormalizedText $AppPublisher -Kind Publisher }
-                if ($Key -cne $Publisher) { continue }
+                if (-not $Cache.TryGetValue('Name|' + $Text, [ref]$Key)) { $Key = Get-AUNormalizedText $Text -Kind Name }
+                if ($Key) { $Names.Add($Key) }
+            }
+            if ($Names.Count -eq 0) { return $null }
+            # Only the apps with this normalized publisher.
+            foreach ($App in (Get-AUIndexedApps $AppIndex $AppIndex.ByPublisherKey $Publisher))
+            {
                 $AppName = [string]$App.DisplayName
                 if (-not $Cache.TryGetValue('Name|' + $AppName, [ref]$Key)) { $Key = Get-AUNormalizedText $AppName -Kind Name }
                 if ($Key -cin $Names) { $Candidates.Add($App) }
@@ -3126,7 +3173,7 @@ function Get-AUAppFolders
         [pscustomobject]$App
     )
 
-    $Folders = New-Object 'System.Collections.Generic.List[string]'
+    $Folders = [System.Collections.Generic.List[string]]::new()
     $Add = {
         param ([string]$Folder, [bool]$FromFile)
         if ([string]::IsNullOrWhiteSpace($Folder)) { return }
@@ -3189,7 +3236,7 @@ function Select-AUCandidate
             'path'
             {
                 if (-not $RunPath) { break }
-                $Depths = New-Object 'int[]' $Left.Count
+                $Depths = [int[]]::new($Left.Count)
                 for ($i = 0; $i -lt $Left.Count; $i++)
                 {
                     foreach ($Folder in (Get-AUAppFolders $Left[$i]))
@@ -3221,14 +3268,14 @@ function Select-AUCandidate
             }
             'product'
             {
-                $Names = @((Get-AUNormalizedText $Evidence.ProductName -Kind Name), (Get-AUNormalizedText $Evidence.FileDescription -Kind Name)) | Where-Object { $_ }
+                $Names = @(foreach ($Name in @((Get-AUNormalizedText $Evidence.ProductName -Kind Name), (Get-AUNormalizedText $Evidence.FileDescription -Kind Name))) { if ($Name) { $Name } })
                 if (-not $Names) { break }
                 $Kept = @($Left | Where-Object { (Get-AUNormalizedText ([string]$_.DisplayName) -Kind Name) -cin $Names })
             }
             'version'
             {
                 if (-not $Verified) { break }
-                $Versions = New-Object 'System.Collections.Generic.List[object]'
+                $Versions = [System.Collections.Generic.List[object]]::new()
                 foreach ($Text in $Evidence.Versions)
                 {
                     $Parts = ConvertTo-AUVersionParts $Text
@@ -3303,11 +3350,14 @@ function Resolve-AUIdentity
     The whole Get-AUMappings result (F18).
 .PARAMETER InstalledApps
     The installed-app entries (Task 13 shape).
+.PARAMETER AppIndex
+    New-AUAppIndex of InstalledApps, built once per run; built here when it isn't given.
 #>
     param (
         [pscustomobject]$Facts,
         [pscustomobject]$Mappings,
-        [object[]]$InstalledApps
+        [object[]]$InstalledApps,
+        [pscustomobject]$AppIndex
     )
 
     $Result = [pscustomobject]@{
@@ -3325,6 +3375,7 @@ function Resolve-AUIdentity
     }
     # A $null entry never matches: it has no DisplayName, ProductCode, PackageFamily, or Publisher.
     $Apps = @($InstalledApps)
+    if ($null -eq $AppIndex) { $AppIndex = New-AUAppIndex $Apps }
     $Evidence = Get-AUIdentityEvidence $Facts
 
     # An identity rule needs its exeName to match, so that check runs inline first: most rules fail it,
@@ -3345,7 +3396,13 @@ function Resolve-AUIdentity
                 $ExePattern = $Candidate.when.exeName
                 if ($null -eq $ExeText -or $null -eq $ExePattern -or -not ($ExeText -like [string]$ExePattern)) { continue }
             }
-            $Hit = Get-AUIdentityRuleHit $Candidate $Facts $Evidence $Apps
+            elseif ($Candidate.type -ceq 'ownership')
+            {
+                # Get-AUIdentityRuleHit's own first checks, inline for the same reason.
+                if ($Candidate.source -ceq 'msi' -and ($Evidence.Kind -ne 'Verified' -or -not ([string]$Facts.MsiProductCode).Trim())) { continue }
+                if ($Candidate.source -ceq 'store' -and -not ([string]$Facts.PackageFamily).Trim()) { continue }
+            }
+            $Hit = Get-AUIdentityRuleHit $Candidate $Facts $Evidence $Apps $AppIndex
             if ($Hit) { $Rule = $Candidate; $Section = $Pair[0]; break }
         }
         if ($Hit) { break }
@@ -3371,8 +3428,8 @@ function Resolve-AUIdentity
             if ($Section -eq 'Customer') { Write-CMTraceLog -Message "App Usage: resolved $RuleId by $($Narrowed.Step)." -Component 'AppUsage' }
             else { $RuleId = 'ps-resolve-' + $Narrowed.Step }
         }
-        $Names = New-Object 'System.Collections.Generic.List[string]'
-        $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $Names = [System.Collections.Generic.List[string]]::new()
+        $Seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($App in $Candidates) { if ($Seen.Add(([string]$App.DisplayName).Trim())) { $Names.Add(([string]$App.DisplayName).Trim()) } }
         if ($Names.Count -gt 1)
         {
@@ -3409,6 +3466,82 @@ function Resolve-AUIdentity
     return $Result
 }#endfunction
 
+# Get-AUClassificationCandidates plans, one per rules array, kept only as long as the array is.
+$script:AUClassificationPlans = $null
+if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') { $script:AUClassificationPlans = New-Object 'System.Runtime.CompilerServices.ConditionalWeakTable[object,object]' }
+
+function Get-AUClassificationCandidates
+{
+    <#
+.SYNOPSIS
+    Returns the classification and ignore rules that might match an executable, in file order.
+.DESCRIPTION
+    Most rules name one exe (an exeName condition with no wildcard, Get-AUPatternLiteral), and a
+    rule like that can match only that exe. A plan built once per rules array keeps those rules by
+    their exe name (lowercased invariant) and every other rule (no exeName, a wildcard or non-ASCII
+    one, or a non-rule) in a list checked for every executable. Returns the rules of both that apply
+    to ExeName, in file order; all of them when ExeName isn't ASCII. With no exe name, only the
+    rules without a plain exe name. Get-AUClassification still checks every condition of each.
+    Returns the rules as given when they aren't an array.
+.PARAMETER Rules
+    A section's classificationRules.
+.PARAMETER ExeName
+    The executable's ExeName fact, or $null.
+#>
+    param (
+        [object]$Rules,
+        [AllowNull()][object]$ExeName
+    )
+
+    if ($Rules -isnot [array] -or $null -eq $script:AUClassificationPlans) { return , @($Rules) }
+    $Plan = $null
+    if (-not $script:AUClassificationPlans.TryGetValue($Rules, [ref]$Plan))
+    {
+        $ByExe = [Collections.Generic.Dictionary[string,Collections.Generic.List[int]]]::new([StringComparer]::Ordinal)
+        $Other = [Collections.Generic.List[int]]::new()
+        for ($i = 0; $i -lt $Rules.Count; $i++)
+        {
+            $Literal = $null
+            $When = $null
+            if ($null -ne $Rules[$i]) { $When = $Rules[$i].when }
+            if ($null -ne $When)
+            {
+                foreach ($Condition in $When.PSObject.Properties)
+                {
+                    if ($Condition.Name -cne 'exeName') { continue }
+                    $Literal = Get-AUPatternLiteral ([string]$Condition.Value)
+                    if ($null -ne $Literal -and $Literal -cmatch '[^\x00-\x7F]') { $Literal = $null }
+                }
+            }
+            if ($null -eq $Literal) { $Other.Add($i); continue }
+            $Key = $Literal.ToLowerInvariant()
+            if (-not $ByExe.ContainsKey($Key)) { $ByExe[$Key] = [Collections.Generic.List[int]]::new() }
+            $ByExe[$Key].Add($i)
+        }
+        $Plan = [pscustomobject]@{
+            ByExe      = $ByExe
+            Other      = $Other.ToArray()
+            OtherRules = [object[]]@(foreach ($i in $Other) { $Rules[$i] })
+            Results    = [Collections.Generic.Dictionary[string,object[]]]::new([StringComparer]::Ordinal)
+        }
+        $script:AUClassificationPlans.Add($Rules, $Plan)
+    }
+
+    # A rule's exeName never matches an unknown exe name (Test-AUTextPattern).
+    if ($null -eq $ExeName) { return , $Plan.OtherRules }
+    $Key = ([string]$ExeName).Trim()
+    if ($Key -cmatch '[^\x00-\x7F]') { return , @($Rules) }
+    $Key = $Key.ToLowerInvariant()
+    $Found = $null
+    if ($Plan.Results.TryGetValue($Key, [ref]$Found)) { return , $Found }
+    $Positions = [Collections.Generic.SortedSet[int]]::new([int[]]$Plan.Other)
+    $Named = $null
+    if ($Plan.ByExe.TryGetValue($Key, [ref]$Named)) { $Positions.UnionWith($Named) }
+    $Found = [object[]]@(foreach ($i in $Positions) { $Rules[$i] })
+    $Plan.Results[$Key] = $Found
+    return , $Found
+}#endfunction
+
 function Get-AUClassification
 {
     <#
@@ -3441,7 +3574,7 @@ function Get-AUClassification
 
     foreach ($Section in $Sections)
     {
-        foreach ($Rule in @($Section.classificationRules))
+        foreach ($Rule in (Get-AUClassificationCandidates $Section.classificationRules $Facts.ExeName))
         {
             if ($null -eq $Rule -or $null -eq $Rule.when) { continue }
             $IsIgnore = ($Rule.type -ceq 'ignore')
@@ -3603,26 +3736,37 @@ function Resolve-AUTarget
     if ($null -ne $Identity -and $Identity.MatchSection -cin $script:AUTargetSections) { $IdentitySection = $Identity.MatchSection }
 
     $FromIdentity = {
+        if ($null -eq $Identity)
+        {
+            return [pscustomobject]@{
+                TargetPattern           = $null
+                TargetPublisher         = $null
+                ResolvedAppName         = $null
+                ProductCode             = $null
+                PackageFamily           = $null
+                MatchSection            = 'None'
+                MatchRuleId             = $null
+                RuleType                = $null
+                InstalledStateDependent = $false
+                EvidenceUsed            = 'None'
+                CandidateTargets        = $null
+                RetainedFrom            = $null
+            }
+        }
         $Result = [pscustomobject]@{
-            TargetPattern           = $null
-            TargetPublisher         = $null
-            ResolvedAppName         = $null
-            ProductCode             = $null
-            PackageFamily           = $null
-            MatchSection            = 'None'
-            MatchRuleId             = $null
-            RuleType                = $null
-            InstalledStateDependent = $false
-            EvidenceUsed            = 'None'
-            CandidateTargets        = $null
+            TargetPattern           = $Identity.TargetPattern
+            TargetPublisher         = $Identity.TargetPublisher
+            ResolvedAppName         = $Identity.ResolvedAppName
+            ProductCode             = $Identity.ProductCode
+            PackageFamily           = $Identity.PackageFamily
+            MatchSection            = $IdentitySection
+            MatchRuleId             = $Identity.MatchRuleId
+            RuleType                = $Identity.RuleType
+            InstalledStateDependent = $Identity.InstalledStateDependent
+            EvidenceUsed            = $Identity.EvidenceUsed
+            CandidateTargets        = $Identity.CandidateTargets
             RetainedFrom            = $null
         }
-        if ($null -eq $Identity) { return $Result }
-        foreach ($Name in @('TargetPattern', 'TargetPublisher', 'ResolvedAppName', 'ProductCode', 'PackageFamily', 'MatchRuleId', 'RuleType', 'InstalledStateDependent', 'EvidenceUsed', 'CandidateTargets'))
-        {
-            $Result.$Name = $Identity.$Name
-        }
-        $Result.MatchSection = $IdentitySection
         if ($IdentitySection -ne 'None' -and $StoredSection -eq $IdentitySection -and [string]::IsNullOrWhiteSpace([string]$Result.ResolvedAppName) -and (Test-AUSameTarget $Result $StoredTarget))
         {
             foreach ($Name in @('ResolvedAppName', 'ProductCode', 'PackageFamily'))
@@ -3747,6 +3891,14 @@ function Get-AUTargetKeys
         [pscustomobject]$Target
     )
 
+    # The keys depend only on these target fields, so each set is computed once per run (Task 21).
+    # Callers only read the result.
+    $Signature = @([string]$Target.ProductCode, [string]$Target.PackageFamily, [string]$Target.TargetPattern, [string]$Target.TargetPublisher,
+        [string]($null -eq $Target.TargetPattern), [string]($null -eq $Target.TargetPublisher), [string]$Target.MatchRuleId, [string]$Target.ResolvedAppName,
+        [string]($Target.InstalledStateDependent -eq $true), [string]$Target.RuleType) -join [string][char]31
+    $Keys = $null
+    if ($null -ne $script:AUTargetKeysCache -and $script:AUTargetKeysCache.TryGetValue($Signature, [ref]$Keys)) { return $Keys }
+
     $Keys = [pscustomobject]@{
         Code             = ([string]$Target.ProductCode).Trim()
         Family           = ([string]$Target.PackageFamily).Trim()
@@ -3771,6 +3923,7 @@ function Get-AUTargetKeys
         elseif ($null -ne $Keys.PublisherPattern) { $Keys.PublisherLike = $true }
         if ($ChosenAmongSiblings) { $Keys.TagKey = Get-AUNameTags $Resolved }
     }
+    if ($null -ne $script:AUTargetKeysCache) { $script:AUTargetKeysCache[$Signature] = $Keys }
     return $Keys
 }#endfunction
 
@@ -3796,7 +3949,7 @@ function Get-AUNameTags
     if ($script:AUNormalizedText.TryGetValue($Key, [ref]$Cached)) { return $Cached }
 
     $Value = ([string]$Text).ToLowerInvariant()
-    $Tags = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
+    $Tags = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
     foreach ($Token in ($Value -split '[\s()\[\],;:]+'))
     {
         if ($Token -and $Token -in $script:AUArchTokens) { [void]$Tags.Add('a:' + $Token) }
@@ -3880,33 +4033,38 @@ function Get-AUInstallStatus
     normalized DisplayName and Publisher (Get-AUNormalizedText, the arpCompare comparison) equal the
     target's ResolvedAppName and publisher: an update that renames the entry, Contoso Alpha 1.0 to
     Contoso Alpha 1.1, still counts. An app with no scope counts as in scope. Otherwise NotInstalled
-    only when Machine was Read and the user's scope was Read or Deleted (the profile is gone from
-    ProfileList); else Unknown. A blank UserSid leaves the user's scope unknown, so Unknown; a SID
-    missing from ScopeRead counts as Unread (F29). A mapped executable whose target is absent stays
+    only when Machine was Read and the user's scope was Read, Deleted (the profile is gone from
+    ProfileList), or NoProfile (a service or virtual account, which never has one); else Unknown.
+    A blank UserSid leaves the user's scope unknown, so Unknown; a SID missing from ScopeRead counts
+    as Unread (F29). A mapped executable whose target is absent stays
     mapped.
 .PARAMETER Target
     The Resolve-AUTarget result.
 .PARAMETER InstalledApps
     The installed-app entries, with their internal Scope (Machine or a SID).
 .PARAMETER ScopeRead
-    Machine or a SID to Read, Unread, or Deleted.
+    Machine or a SID to Read, Unread, Deleted, or NoProfile.
 .PARAMETER UserSid
     The entry's user SID.
+.PARAMETER AppIndex
+    New-AUAppIndex of InstalledApps, built once per run; built here when it isn't given. Only the
+    apps it gives for the target (Get-AUTargetAppCandidates) are checked.
 #>
     param (
         [pscustomobject]$Target,
         [object[]]$InstalledApps,
         [hashtable]$ScopeRead,
-        [string]$UserSid
+        [string]$UserSid,
+        [pscustomobject]$AppIndex
     )
 
     if ($null -eq $Target -or $Target.MatchSection -cnotin @('Customer', 'PowerStacks', 'Retained')) { return 'Unmatched' }
     $Sid = ([string]$UserSid).Trim()
     $Keys = Get-AUTargetKeys $Target
+    if ($null -eq $AppIndex) { $AppIndex = New-AUAppIndex $InstalledApps }
 
-    foreach ($App in @($InstalledApps))
+    foreach ($App in (Get-AUTargetAppCandidates $AppIndex $Keys))
     {
-        if ($null -eq $App) { continue }
         $Scope = ([string]$App.Scope).Trim()
         if ($Scope -and $Scope -ne 'Machine' -and -not ($Sid -and [string]::Equals($Scope, $Sid, [StringComparison]::OrdinalIgnoreCase))) { continue }
         if (Test-AUTargetApp $App $Keys) { return 'Installed' }
@@ -3923,7 +4081,7 @@ function Get-AUInstallStatus
     }
     if ((& $StateOf 'Machine') -ne 'Read') { return 'Unknown' }
     # The target may be a per-user install, and with no SID that scope can't have been read.
-    if (-not $Sid -or (& $StateOf $Sid) -notin @('Read', 'Deleted')) { return 'Unknown' }
+    if (-not $Sid -or (& $StateOf $Sid) -notin @('Read', 'Deleted', 'NoProfile')) { return 'Unknown' }
     return 'NotInstalled'
 }#endfunction
 
@@ -3948,11 +4106,15 @@ function Test-AUMainExe
     The Resolve-AUTarget result.
 .PARAMETER InstalledApps
     The installed-app entries.
+.PARAMETER AppIndex
+    New-AUAppIndex of InstalledApps, built once per run; built here when it isn't given. Only the
+    apps whose DisplayIcon file is the run path (its ByIconFile lookup) are checked.
 #>
     param (
         [pscustomobject]$Facts,
         [pscustomobject]$Target,
-        [object[]]$InstalledApps
+        [object[]]$InstalledApps,
+        [pscustomobject]$AppIndex
     )
 
     if ($Target.RuleType -ceq 'identity') { return $true }
@@ -3965,20 +4127,12 @@ function Test-AUMainExe
     if (-not $RunPath) { return $false }
     $Leaf = $RunPath.Substring($RunPath.LastIndexOf('\') + 1)
     if (-not $Leaf) { return $false }
+    if ($null -eq $AppIndex) { $AppIndex = New-AUAppIndex $InstalledApps }
     $Keys = $null
 
-    foreach ($App in @($InstalledApps))
+    # The index holds each app by its DisplayIcon file, normalized as RunPath is here.
+    foreach ($App in (Get-AUIndexedApps $AppIndex $AppIndex.ByIconFile $RunPath))
     {
-        if ($null -eq $App) { continue }
-        # Most apps' DisplayIcon doesn't name this file at all, so that cheap test runs first.
-        $Icon = [string]$App.DisplayIcon
-        if (-not $Icon -or $Icon.IndexOf($Leaf, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-        $File = Get-AUCommandFile $Icon
-        if (-not $File) { continue }
-        $File = $File.Trim().Replace('/', '\')
-        if ($File.StartsWith('\\?\')) { $File = $File.Substring(4) }
-        if (-not [string]::Equals($File, $RunPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
-
         if ($null -eq $Keys) { $Keys = Get-AUTargetKeys $Target }
         if (Test-AUTargetApp $App $Keys) { return $true }
     }
@@ -4007,12 +4161,15 @@ function Get-AURole
     The Get-AUClassification result.
 .PARAMETER InstalledApps
     The installed-app entries, for the target app's DisplayIcon.
+.PARAMETER AppIndex
+    New-AUAppIndex of InstalledApps, passed to Test-AUMainExe.
 #>
     param (
         [pscustomobject]$Facts,
         [pscustomobject]$Target,
         [pscustomobject]$Classification,
-        [object[]]$InstalledApps
+        [object[]]$InstalledApps,
+        [pscustomobject]$AppIndex
     )
 
     if ([string]$Facts.LocationClass -in $script:AUInstallerLocations) { return 'Installer' }
@@ -4020,7 +4177,7 @@ function Get-AURole
     if ($Facts.IsServiceBinary -eq $true) { return 'Service' }
     if ([string]::Equals([string]$Facts.Subsystem, 'Console', [StringComparison]::OrdinalIgnoreCase)) { return 'CLI' }
     if ($null -eq $Target -or $Target.MatchSection -cnotin @('Customer', 'PowerStacks', 'Retained')) { return 'Unmatched' }
-    if (Test-AUMainExe $Facts $Target $InstalledApps) { return 'App' }
+    if (Test-AUMainExe $Facts $Target $InstalledApps $AppIndex) { return 'App' }
     return 'Helper'
 }#endfunction
 
@@ -4145,16 +4302,20 @@ function New-AULedgerEntry
     The user SID.
 .PARAMETER ExeInfo
     The SRUM ExeInfo value.
+.PARAMETER ExeName
+    The exe name, when the caller already has it (a ledger record); ExeInfo isn't parsed then.
 #>
     param (
         [string]$UserSid,
-        [string]$ExeInfo
+        [string]$ExeInfo,
+        [AllowNull()][object]$ExeName
     )
 
+    if (-not $PSBoundParameters.ContainsKey('ExeName')) { $ExeName = (ConvertFrom-AUExeInfo $ExeInfo).ExeName }
     return [pscustomobject]@{
         UserSid                = $UserSid
         ExeInfo                = $ExeInfo
-        ExeName                = (ConvertFrom-AUExeInfo $ExeInfo).ExeName
+        ExeName                = $ExeName
         FirstSeen              = $null
         Counted                = @{}
         ArchivedFocus          = [double]0
@@ -4286,10 +4447,19 @@ function ConvertFrom-AULedgerRecord
     $ExeInfo = ([string]$Record.ExeInfo).Trim()
     if (-not $ExeInfo) { throw 'A ledger entry has no ExeInfo.' }
     $UserSid = ([string]$Record.UserSid).Trim()
-    $Entry = New-AULedgerEntry $UserSid $ExeInfo
-    $Entry.ExeName = $(if ([string]::IsNullOrWhiteSpace([string]$Record.ExeName)) { $null } else { [string]$Record.ExeName })
+    $Entry = New-AULedgerEntry $UserSid $ExeInfo -ExeName $(if ([string]::IsNullOrWhiteSpace([string]$Record.ExeName)) { $null } else { [string]$Record.ExeName })
+    # ConvertFrom-AULedgerDate runs for every date: a ledger date parses here directly (the same
+    # format and kind check), and anything else goes to the function, which decides it (Task 21).
+    $Invariant = [Globalization.CultureInfo]::InvariantCulture
+    $Roundtrip = [Globalization.DateTimeStyles]::RoundtripKind
+    $Date = [datetime]::MinValue
     $Entry.FirstSeen = ConvertFrom-AULedgerDate $Record.FirstSeen
-    foreach ($Name in $script:AULedgerLastTimeFields) { $Entry.$Name = ConvertFrom-AULedgerDate $Record.$Name }
+    foreach ($Name in $script:AULedgerLastTimeFields)
+    {
+        $Value = $Record.$Name
+        if ($Value -is [string] -and [datetime]::TryParseExact($Value, $script:AULedgerDateFormat, $Invariant, $Roundtrip, [ref]$Date) -and $Date.Kind -eq [DateTimeKind]::Utc) { $Entry.$Name = $Date }
+        else { $Entry.$Name = ConvertFrom-AULedgerDate $Value }
+    }
     $Entry.ArchivedFocus = [double]$Record.ArchivedFocus
     $Entry.ArchivedInput = [double]$Record.ArchivedInput
     foreach ($Item in @($Record.Counted))
@@ -4298,7 +4468,10 @@ function ConvertFrom-AULedgerRecord
         $Key = ([string]$Item.K).Trim()
         if (-not $Key) { throw "A counted record of $ExeInfo has no key." }
         if ($Entry.Counted.ContainsKey($Key)) { throw "Counted record $Key of $ExeInfo appears twice." }
-        $Entry.Counted[$Key] = @{ F = [double]$Item.F; I = [double]$Item.I; T = (ConvertFrom-AULedgerDate $Item.T) }
+        $Value = $Item.T
+        if ($Value -is [string] -and [datetime]::TryParseExact($Value, $script:AULedgerDateFormat, $Invariant, $Roundtrip, [ref]$Date) -and $Date.Kind -eq [DateTimeKind]::Utc) { $Time = $Date }
+        else { $Time = ConvertFrom-AULedgerDate $Value }
+        $Entry.Counted[$Key] = @{ F = [double]$Item.F; I = [double]$Item.I; T = $Time }
     }
     $Entry.Facts = $Record.Facts
     $Entry.FactsVerified = ($Record.FactsVerified -eq $true)
@@ -4330,11 +4503,17 @@ function ConvertTo-AULedgerRecord
 
     $Keys = [string[]]@($Entry.Counted.Keys)
     [Array]::Sort($Keys, [StringComparer]::Ordinal)
-    $Counted = New-Object Collections.Generic.List[object]
+    $Counted = [Collections.Generic.List[object]]::new()
+    # Format-AULedgerDate runs for every date: a Utc date is formatted here directly (Format-AUDate's
+    # format), and anything else goes to the function, which decides it (Task 21).
+    $Invariant = [Globalization.CultureInfo]::InvariantCulture
     foreach ($Key in $Keys)
     {
         $Record = $Entry.Counted[$Key]
-        $Counted.Add([ordered]@{ K = $Key; F = [double]$Record.F; I = [double]$Record.I; T = (Format-AULedgerDate $Record.T) })
+        $Time = $Record.T
+        if ($Time -is [datetime] -and $Time.Kind -eq [DateTimeKind]::Utc) { $Time = $Time.ToString($script:AUUtcDateFormat, $Invariant) }
+        else { $Time = Format-AULedgerDate $Time }
+        $Counted.Add([ordered]@{ K = $Key; F = [double]$Record.F; I = [double]$Record.I; T = $Time })
     }
     $StoredTarget = $null
     if ($null -ne $Entry.StoredTarget)
@@ -4352,7 +4531,12 @@ function ConvertTo-AULedgerRecord
         ArchivedFocus = [double]$Entry.ArchivedFocus
         ArchivedInput = [double]$Entry.ArchivedInput
     }
-    foreach ($Name in $script:AULedgerLastTimeFields) { $Result[$Name] = Format-AULedgerDate $Entry.$Name }
+    foreach ($Name in $script:AULedgerLastTimeFields)
+    {
+        $Time = $Entry.$Name
+        if ($Time -is [datetime] -and $Time.Kind -eq [DateTimeKind]::Utc) { $Result[$Name] = $Time.ToString($script:AUUtcDateFormat, $Invariant) }
+        else { $Result[$Name] = Format-AULedgerDate $Time }
+    }
     $Result['Facts'] = $Entry.Facts
     $Result['FactsVerified'] = ($Entry.FactsVerified -eq $true)
     $Result['StoredTarget'] = $StoredTarget
@@ -4626,9 +4810,9 @@ function Merge-AUSrumRecords
     }
 
     $Entries = $Ledger.Entries
-    $Present = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
-    $OpenFirstSeen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $Interactive = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Present = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    $OpenFirstSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $Interactive = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     $Earliest = $null
     $LowestId = $null
     $Merged = 0
@@ -4665,7 +4849,7 @@ function Merge-AUSrumRecords
         }
         if (-not $Present.ContainsKey($Key))
         {
-            $Present[$Key] = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $Present[$Key] = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             if ($null -eq $Entry.FirstSeen) { [void]$OpenFirstSeen.Add($Key) }
         }
         [void]$Present[$Key].Add($RecordKey)
@@ -4681,15 +4865,28 @@ function Merge-AUSrumRecords
         {
             $UserType = 'Unknown'
             if ($null -ne $UserTypes -and $null -ne $UserTypes[$UserSid]) { $UserType = [string]$UserTypes[$UserSid] }
-            $Interactive[$UserSid] = @{ Type = $UserType; Interactive = (Test-AUInteractiveUserType $UserType) }
+            $Interactive[$UserSid] = @{ Type = $UserType; Interactive = (Test-AUInteractiveUserType $UserType); Credited = ([Collections.Generic.Dictionary[double,object]]::new()) }
         }
         $User = $Interactive[$UserSid]
         if (-not $User.Interactive) { continue }
         if ($null -eq $Entry.LastInteractiveRunTime -or $Time -gt $Entry.LastInteractiveRunTime) { $Entry.LastInteractiveRunTime = $Time }
-        if (($null -eq $Entry.LastFocusOrInputTime -or $Time -gt $Entry.LastFocusOrInputTime) -and
-            (Test-AUFocusRecord -UserType $User.Type -FocusSeconds $Focus -InputSeconds $InputSeconds -MinFocusSeconds $MinFocusSeconds))
+        if ($null -eq $Entry.LastFocusOrInputTime -or $Time -gt $Entry.LastFocusOrInputTime)
         {
-            $Entry.LastFocusOrInputTime = $Time
+            # Test-AUFocusRecord decides; its answer is kept per user, focus, and input seconds (exact
+            # double keys), because the same values recur across tens of thousands of rows.
+            $ByFocus = $null
+            if (-not $User.Credited.TryGetValue($Focus, [ref]$ByFocus))
+            {
+                $ByFocus = [Collections.Generic.Dictionary[double,bool]]::new()
+                $User.Credited[$Focus] = $ByFocus
+            }
+            $Credited = $false
+            if (-not $ByFocus.TryGetValue($InputSeconds, [ref]$Credited))
+            {
+                $Credited = [bool](Test-AUFocusRecord -UserType $User.Type -FocusSeconds $Focus -InputSeconds $InputSeconds -MinFocusSeconds $MinFocusSeconds)
+                $ByFocus[$InputSeconds] = $Credited
+            }
+            if ($Credited) { $Entry.LastFocusOrInputTime = $Time }
         }
     }
 
@@ -4782,7 +4979,7 @@ function Invoke-AULedgerFold
     )
 
     $Entries = $Ledger.Entries
-    $Groups = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Groups = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     $Keys = [string[]]@($Entries.Keys)
     [Array]::Sort($Keys, [StringComparer]::Ordinal)
     foreach ($Key in $Keys)
@@ -4793,7 +4990,7 @@ function Invoke-AULedgerFold
         $Identity = Get-AUFoldIdentity $Entry
         if ($null -eq $Identity) { continue }
         $GroupKey = ([string]$Entry.UserSid).Trim() + [char]31 + $ExeName + [char]31 + $Identity
-        if (-not $Groups.ContainsKey($GroupKey)) { $Groups[$GroupKey] = New-Object Collections.Generic.List[string] }
+        if (-not $Groups.ContainsKey($GroupKey)) { $Groups[$GroupKey] = [Collections.Generic.List[string]]::new() }
         $Groups[$GroupKey].Add($Key)
     }
 
@@ -4860,6 +5057,8 @@ function ConvertTo-AUOutputDate
     )
 
     if ($null -eq $Value) { return $null }
+    # A Utc date, formatted as Format-AUDate does, without the call: this runs for every output date.
+    if ($Value -is [datetime] -and $Value.Kind -eq [DateTimeKind]::Utc) { return $Value.ToString($script:AUUtcDateFormat, [Globalization.CultureInfo]::InvariantCulture) }
     try { return (Format-AUDate $Value) }
     catch
     {
@@ -4905,8 +5104,20 @@ function New-AUAppIndex
 {
     <#
 .SYNOPSIS
-    Returns the installed apps prepared for Get-AUTargetAppNames: the apps, their trimmed
-    DisplayNames (ignoring case), and an empty per-target cache.
+    Returns the installed apps indexed once per run, so each target lookup reads a few entries
+    instead of every app (Task 21: thousands of entries times hundreds of apps).
+.DESCRIPTION
+    Apps (the non-null entries, in order), Names (trimmed DisplayNames, ignoring case), Cache (the
+    Get-AUTargetAppNames cache), and lookups from a key to the positions in Apps that hold it, in
+    order: ByCode and ByFamily (trimmed ProductCode and PackageFamily, ignoring case), ByName and
+    ByPublisher (trimmed DisplayName and Publisher, lowercased invariant), ByNameKey and
+    ByPublisherKey (Get-AUNormalizedText of the DisplayName and Publisher, exact), and ByIconFile
+    (the DisplayIcon file, Get-AUCommandFile, trimmed with / as \ and no \\?\ prefix, ignoring
+    case; Test-AUMainExe). A DisplayName or Publisher with a character outside ASCII goes in
+    OtherNames or OtherPublishers instead, because -like may match it to an ASCII pattern in ways
+    invariant lowercasing doesn't (the Kelvin sign and k). Candidates caches
+    Get-AUTargetAppCandidates. The index only narrows the apps to check; Test-AUTargetApp still
+    decides.
 .PARAMETER Apps
     The installed-app entries (Task 13 shape).
 #>
@@ -4914,20 +5125,154 @@ function New-AUAppIndex
         [object[]]$Apps
     )
 
-    $Names = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
-    $List = New-Object 'Collections.Generic.List[object]'
+    $NewMap = {
+        param ([StringComparer]$Comparer)
+        return , ([Collections.Generic.Dictionary[string,Collections.Generic.List[int]]]::new($Comparer))
+    }
+    $Index = [pscustomobject]@{
+        Apps            = $null
+        Names           = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+        Cache           = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+        ByCode          = & $NewMap ([StringComparer]::OrdinalIgnoreCase)
+        ByFamily        = & $NewMap ([StringComparer]::OrdinalIgnoreCase)
+        ByName          = & $NewMap ([StringComparer]::Ordinal)
+        ByPublisher     = & $NewMap ([StringComparer]::Ordinal)
+        ByNameKey       = & $NewMap ([StringComparer]::Ordinal)
+        ByPublisherKey  = & $NewMap ([StringComparer]::Ordinal)
+        ByIconFile      = & $NewMap ([StringComparer]::OrdinalIgnoreCase)
+        OtherNames      = [Collections.Generic.List[int]]::new()
+        OtherPublishers = [Collections.Generic.List[int]]::new()
+        Candidates      = [Collections.Generic.Dictionary[string,object[]]]::new([StringComparer]::Ordinal)
+    }
+    $Add = {
+        param ($Map, [string]$Key, [int]$Position)
+        $Positions = $null
+        if (-not $Map.TryGetValue($Key, [ref]$Positions))
+        {
+            $Positions = [Collections.Generic.List[int]]::new()
+            $Map[$Key] = $Positions
+        }
+        $Positions.Add($Position)
+    }
+    $List = [Collections.Generic.List[object]]::new()
     foreach ($App in @($Apps))
     {
         if ($null -eq $App) { continue }
+        $Position = $List.Count
         $List.Add($App)
         $Name = ([string]$App.DisplayName).Trim()
-        if ($Name -and -not $Names.ContainsKey($Name)) { $Names[$Name] = $Name }
+        if ($Name -and -not $Index.Names.ContainsKey($Name)) { $Index.Names[$Name] = $Name }
+        $Publisher = ([string]$App.Publisher).Trim()
+        $Code = ([string]$App.ProductCode).Trim()
+        $Family = ([string]$App.PackageFamily).Trim()
+        if ($Code) { & $Add $Index.ByCode $Code $Position }
+        if ($Family) { & $Add $Index.ByFamily $Family $Position }
+        if ($Name)
+        {
+            # -cmatch: a case-insensitive match folds the Kelvin sign to k, inside the ASCII range.
+            if ($Name -cmatch '[^\x00-\x7F]') { $Index.OtherNames.Add($Position) }
+            else { & $Add $Index.ByName $Name.ToLowerInvariant() $Position }
+        }
+        if ($Publisher -cmatch '[^\x00-\x7F]') { $Index.OtherPublishers.Add($Position) }
+        else { & $Add $Index.ByPublisher $Publisher.ToLowerInvariant() $Position }
+        $NameKey = Get-AUNormalizedText ([string]$App.DisplayName) -Kind Name
+        if ($NameKey) { & $Add $Index.ByNameKey $NameKey $Position }
+        $PublisherKey = Get-AUNormalizedText ([string]$App.Publisher) -Kind Publisher
+        if ($PublisherKey) { & $Add $Index.ByPublisherKey $PublisherKey $Position }
+        $IconFile = Get-AUCommandFile ([string]$App.DisplayIcon)
+        if ($IconFile)
+        {
+            $IconFile = $IconFile.Trim().Replace('/', '\')
+            if ($IconFile.StartsWith('\\?\')) { $IconFile = $IconFile.Substring(4) }
+            if ($IconFile) { & $Add $Index.ByIconFile $IconFile $Position }
+        }
     }
-    return [pscustomobject]@{
-        Apps  = $List.ToArray()
-        Names = $Names
-        Cache = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Index.Apps = $List.ToArray()
+    return $Index
+}#endfunction
+
+function Get-AUIndexedApps
+{
+    <#
+.SYNOPSIS
+    Returns the apps one index lookup holds for a key, in installed-app order; none for a missing key.
+.PARAMETER Index
+    The New-AUAppIndex result.
+.PARAMETER Map
+    One of its lookups, for example ByCode.
+.PARAMETER Key
+    The key.
+#>
+    param (
+        [pscustomobject]$Index,
+        [object]$Map,
+        [string]$Key
+    )
+
+    $Positions = $null
+    if (-not $Map.TryGetValue($Key, [ref]$Positions)) { return , ([object[]]@()) }
+    return , ([object[]]@(foreach ($Position in $Positions) { $Index.Apps[$Position] }))
+}#endfunction
+
+function Get-AUTargetAppCandidates
+{
+    <#
+.SYNOPSIS
+    Returns the installed apps that might be the target app, in installed-app order: every app
+    Test-AUTargetApp could accept, and few others.
+.DESCRIPTION
+    The apps with the target's ProductCode or PackageFamily; for its name and publisher patterns, the
+    apps whose DisplayName is the name pattern's literal text (Get-AUPatternLiteral), or, for a name
+    pattern with wildcards, the apps whose Publisher is the publisher pattern's literal text (each
+    with the non-ASCII names or publishers, which -like may fold differently); and for a normalized
+    target (Get-AUTargetKeys NameKey), the apps with that normalized name. When neither pattern is a
+    plain ASCII literal, every app. The result is cached in the index per target keys.
+.PARAMETER Index
+    The New-AUAppIndex result.
+.PARAMETER Keys
+    The Get-AUTargetKeys result.
+#>
+    param (
+        [pscustomobject]$Index,
+        [pscustomobject]$Keys
+    )
+
+    $Signature = @([string]$Keys.Code, [string]$Keys.Family, [string]$Keys.NamePattern, [string]$Keys.PublisherPattern, [string]($null -eq $Keys.NamePattern),
+        [string]($null -eq $Keys.PublisherPattern), [string]$Keys.NameKey, [string]$Keys.PublisherKey, [string]$Keys.PublisherLike) -join [string][char]31
+    $Cached = $null
+    if ($Index.Candidates.TryGetValue($Signature, [ref]$Cached)) { return , $Cached }
+
+    $Found = [Collections.Generic.SortedSet[int]]::new()
+    $Every = $false
+    $AddKey = {
+        param ($Map, [string]$Key)
+        $Positions = $null
+        if ($Map.TryGetValue($Key, [ref]$Positions)) { $Found.UnionWith($Positions) }
     }
+    if ($Keys.Code) { & $AddKey $Index.ByCode ([string]$Keys.Code) }
+    if ($Keys.Family) { & $AddKey $Index.ByFamily ([string]$Keys.Family) }
+    if ($null -ne $Keys.NamePattern -and $null -ne $Keys.PublisherPattern)
+    {
+        $Name = Get-AUPatternLiteral ([string]$Keys.NamePattern)
+        $Publisher = Get-AUPatternLiteral ([string]$Keys.PublisherPattern)
+        if ($null -ne $Name -and $Name -cnotmatch '[^\x00-\x7F]')
+        {
+            & $AddKey $Index.ByName $Name.ToLowerInvariant()
+            $Found.UnionWith($Index.OtherNames)
+        }
+        elseif ($null -ne $Publisher -and $Publisher -cnotmatch '[^\x00-\x7F]')
+        {
+            & $AddKey $Index.ByPublisher $Publisher.ToLowerInvariant()
+            $Found.UnionWith($Index.OtherPublishers)
+        }
+        else { $Every = $true }
+    }
+    if ($Keys.NameKey -and ($Keys.PublisherKey -or $Keys.PublisherLike)) { & $AddKey $Index.ByNameKey ([string]$Keys.NameKey) }
+
+    if ($Every) { $Result = [object[]]$Index.Apps }
+    else { $Result = [object[]]@(foreach ($Position in $Found) { $Index.Apps[$Position] }) }
+    $Index.Candidates[$Signature] = $Result
+    return , $Result
 }#endfunction
 
 function Get-AUTargetAppNames
@@ -4957,13 +5302,13 @@ function Get-AUTargetAppNames
     $Names = $Index.Cache[$Signature]
     if ($null -ne $Names) { return $Names }
 
-    $Found = New-Object 'Collections.Generic.List[string]'
+    $Found = [Collections.Generic.List[string]]::new()
     $Resolved = ([string]$Target.ResolvedAppName).Trim()
     if ($Resolved -and $Index.Names.ContainsKey($Resolved)) { $Found.Add($Index.Names[$Resolved]) }
     else
     {
         $Keys = Get-AUTargetKeys $Target
-        foreach ($App in $Index.Apps)
+        foreach ($App in (Get-AUTargetAppCandidates $Index $Keys))
         {
             $Name = ([string]$App.DisplayName).Trim()
             if (-not $Name -or $Found.Contains($Name)) { continue }
@@ -5006,13 +5351,13 @@ function Get-AUKnownExes
         [object[]]$Entries
     )
 
-    $Known = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Known = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     $Add = {
         param ([string]$Name, [string]$Exe, [bool]$IsPattern)
         $Set = $Known[$Name]
         if ($null -eq $Set)
         {
-            $Set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $Set = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             $Known[$Name] = $Set
         }
         $Exe = $Exe.ToLowerInvariant()
@@ -5020,24 +5365,24 @@ function Get-AUKnownExes
         [void]$Set.Add($Exe)
     }
     $Index = New-AUAppIndex $Apps
-    $AppsByName = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $AppsByName = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($App in $Index.Apps)
     {
         $Name = ([string]$App.DisplayName).Trim()
         if (-not $Name) { continue }
-        if (-not $AppsByName.ContainsKey($Name)) { $AppsByName[$Name] = New-Object 'Collections.Generic.List[object]' }
+        if (-not $AppsByName.ContainsKey($Name)) { $AppsByName[$Name] = [Collections.Generic.List[object]]::new() }
         $AppsByName[$Name].Add($App)
     }
     $AllNames = [string[]]@($AppsByName.Keys)
 
     # Windows Installer components of each app's product.
-    $ByCode = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $ByCode = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($App in $Index.Apps)
     {
         $Code = ([string]$App.ProductCode).Trim()
         $Name = ([string]$App.DisplayName).Trim()
         if (-not $Code -or -not $Name) { continue }
-        if (-not $ByCode.ContainsKey($Code)) { $ByCode[$Code] = New-Object 'Collections.Generic.List[string]' }
+        if (-not $ByCode.ContainsKey($Code)) { $ByCode[$Code] = [Collections.Generic.List[string]]::new() }
         if (-not $ByCode[$Code].Contains($Name)) { $ByCode[$Code].Add($Name) }
     }
     if ($null -ne $MsiFileMap -and $ByCode.Count -gt 0)
@@ -5125,7 +5470,7 @@ function Get-AUAppUsage
 .PARAMETER WatchingSince
     The ledger's WatchingSince (Utc), or $null.
 .PARAMETER ScopeRead
-    Machine or a SID to Read, Unread, or Deleted. A scope that's missing counts as Unread.
+    Machine or a SID to Read, Unread, Deleted, or NoProfile. A scope that's missing counts as Unread.
 .PARAMETER Apps
     The installed-app entries (Task 13 shape), with their internal Scope.
 .PARAMETER CollectionOk
@@ -5141,8 +5486,8 @@ function Get-AUAppUsage
         [bool]$CollectionOk
     )
 
-    $Result = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
-    $Inventory = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    $Result = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    $Inventory = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($App in @($InventoryApps))
     {
         if ($null -eq $App) { continue }
@@ -5162,7 +5507,7 @@ function Get-AUAppUsage
     }
 
     $Index = New-AUAppIndex $Apps
-    $States = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $States = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($Trimmed in $Inventory.Values)
     {
         if ($States.ContainsKey($Trimmed)) { continue }
@@ -5170,8 +5515,8 @@ function Get-AUAppUsage
             LastUsed  = $null
             LastRan   = $null
             Focus     = [double]0
-            Users     = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-            Exes      = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            Users     = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            Exes      = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             Service   = $false
             Credited  = $false
             Ran       = $false
@@ -5181,7 +5526,7 @@ function Get-AUAppUsage
 
     # Exe names (ExeName, or ExeInfo for a package) of unmatched entries that ran since WatchingSince.
     # An app whose known exe ran unmatched (an unverified build, say) is Ambiguous, never NotUsed (D30).
-    $UnmatchedRan = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $UnmatchedRan = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
     # Inline per-entry work: this loop runs once per ledger entry, thousands of times.
     foreach ($Entry in @($Entries))
@@ -5203,7 +5548,7 @@ function Get-AUAppUsage
             if (-not $Exe) { $Exe = ([string]$Entry.ExeInfo).Trim() }
             if ($Exe) { [void]$UnmatchedRan.Add($Exe) }
             if ($null -eq $Target) { continue }
-            $Candidates = New-Object 'Collections.Generic.List[string]'
+            $Candidates = [Collections.Generic.List[string]]::new()
             foreach ($Candidate in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Candidate)) { $Candidates.Add(([string]$Candidate).Trim()) } }
             if ($Candidates.Count -lt 2) { continue }
             foreach ($Name in $Candidates) { if ($States.ContainsKey($Name)) { $States[$Name].Ambiguous = $true } }
@@ -5234,9 +5579,9 @@ function Get-AUAppUsage
     $UnmatchedNames = [string[]]@($UnmatchedRan)
 
     # Coverage (D32): every scope holding the app must have been read this run.
-    $ReadState = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $ReadState = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     if ($null -ne $ScopeRead) { foreach ($Key in $ScopeRead.Keys) { $ReadState[([string]$Key).Trim()] = [string]$ScopeRead[$Key] } }
-    $Covered = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Covered = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($App in $Index.Apps)
     {
         $Name = ([string]$App.DisplayName).Trim()
@@ -5321,7 +5666,7 @@ function Get-AUExeGroups
     )
 
     $Separator = [string][char]31
-    $Groups = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $Groups = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     # Inline per-entry work: this loop runs once per ledger entry, thousands of times.
     foreach ($Entry in @($Entries))
     {
@@ -5341,7 +5686,7 @@ function Get-AUExeGroups
         $Group = $Groups[$Key]
         if ($null -eq $Group)
         {
-            $Group = [pscustomobject]@{ Key = $Key; Entries = New-Object 'Collections.Generic.List[object]'; Representative = $null; Matched = $Matched }
+            $Group = [pscustomobject]@{ Key = $Key; Entries = [Collections.Generic.List[object]]::new(); Representative = $null; Matched = $Matched }
             $Groups[$Key] = $Group
         }
         $Group.Entries.Add($Entry)
@@ -5400,7 +5745,7 @@ function ConvertTo-AUExeUsage
         [object[]]$Entries
     )
 
-    $Output = New-Object 'Collections.Generic.List[object]'
+    $Output = [Collections.Generic.List[object]]::new()
     foreach ($Group in @(Get-AUExeGroups $Entries))
     {
         $Rep = $Group.Representative
@@ -5441,7 +5786,7 @@ function ConvertTo-AUExeUsage
         }
         elseif ($null -ne $Target)
         {
-            $Names = New-Object 'Collections.Generic.List[string]'
+            $Names = [Collections.Generic.List[string]]::new()
             foreach ($Name in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Name)) { $Names.Add(([string]$Name).Trim()) } }
             if ($Names.Count -gt 1) { $Candidates = $Names.ToArray() }
         }
@@ -5450,7 +5795,7 @@ function ConvertTo-AUExeUsage
         $LastUsed = $null
         $LastRan = $null
         $Focus = [double]0
-        $Users = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $Users = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         $OtherRun = $false
         foreach ($Entry in $Group.Entries)
         {
@@ -10480,7 +10825,12 @@ function Add-AUDeletedScopes
     Marks each SID that's no longer in ProfileList Deleted in ScopeRead, and returns how many (F29).
 .DESCRIPTION
     A SID already in ScopeRead keeps its state. With no users (ProfileList couldn't be read),
-    nothing is marked, because a profile can't be known to be gone.
+    nothing is marked, because a profile can't be known to be gone. Only interactive SIDs
+    (Test-AUInteractiveUserType: CloudOnly, Domain, Local) are marked Deleted and counted. Any other
+    SID, such as SYSTEM, a service account, or the Window Manager (S-1-5-90-*) and Font Driver Host
+    (S-1-5-96-*) virtual accounts, never has a profile, so it's marked NoProfile instead: not a
+    deleted user, and read for install status exactly as Deleted is, because it has no per-user
+    apps to read (Task 21).
 .PARAMETER ScopeRead
     The discovery's ScopeRead.
 .PARAMETER Users
@@ -10505,6 +10855,11 @@ function Add-AUDeletedScopes
         $Known = $false
         foreach ($Name in $ScopeRead.Keys) { if ([string]::Equals([string]$Name, $Value, [StringComparison]::OrdinalIgnoreCase)) { $Known = $true; break } }
         if ($Known) { continue }
+        if (-not (Test-AUInteractiveUserType (Get-AUUserType -Sid $Value -MachineDomainSid '')))
+        {
+            $ScopeRead[$Value] = 'NoProfile'
+            continue
+        }
         $ScopeRead[$Value] = 'Deleted'
         $Count++
     }
@@ -10527,7 +10882,8 @@ function Get-AUEntryFacts
 .PARAMETER Entry
     The ledger entry.
 .PARAMETER ExeInfo
-    The ConvertFrom-AUExeInfo result for the entry.
+    The ConvertFrom-AUExeInfo result for the entry. When it isn't given, the entry's ExeInfo is
+    parsed here, only if the stored facts aren't verified (they don't need it).
 .PARAMETER Context
     The run context: ResourcePaths, VolumeCache, ReadBudget, MsiFileMap, and ServiceBinaries.
 #>
@@ -10548,6 +10904,7 @@ function Get-AUEntryFacts
         return $Stored
     }
 
+    if ($null -eq $ExeInfo) { $ExeInfo = ConvertFrom-AUExeInfo ([string]$Entry.ExeInfo) }
     $Found = $null
     if ($ExeInfo.Kind -eq 'Win32')
     {
@@ -10577,22 +10934,25 @@ function Set-AUEntryResult
 .PARAMETER Entry
     The ledger entry.
 .PARAMETER Context
-    The run context: Mappings, CustomerRulesUnavailable, Apps, ScopeRead, UserTypes,
-    MachineDomainSid, and what Get-AUEntryFacts needs.
+    The run context: Mappings, CustomerRulesUnavailable, Apps, AppIndex (New-AUAppIndex of Apps,
+    built once per run; built here when it's missing), ScopeRead, UserTypes, MachineDomainSid, and
+    what Get-AUEntryFacts needs.
 #>
     param (
         [pscustomobject]$Entry,
         [pscustomobject]$Context
     )
 
-    $ExeInfo = ConvertFrom-AUExeInfo ([string]$Entry.ExeInfo)
-    $Facts = Get-AUEntryFacts -Entry $Entry -ExeInfo $ExeInfo -Context $Context
+    # Get-AUEntryFacts parses the ExeInfo only when it needs it: verified facts don't.
+    $Facts = Get-AUEntryFacts -Entry $Entry -Context $Context
     $Entry.Facts = $Facts
     $Entry.FactsVerified = ($null -ne $Facts -and $Facts.FactsVerified -eq $true)
 
     $Mappings = $Context.Mappings
     $Unavailable = [bool]$Context.CustomerRulesUnavailable
-    $Identity = Resolve-AUIdentity -Facts $Facts -Mappings $Mappings -InstalledApps $Context.Apps
+    $AppIndex = $Context.AppIndex
+    if ($null -eq $AppIndex) { $AppIndex = New-AUAppIndex $Context.Apps }
+    $Identity = Resolve-AUIdentity -Facts $Facts -Mappings $Mappings -InstalledApps $Context.Apps -AppIndex $AppIndex
     $Target = Resolve-AUTarget -Identity $Identity -StoredTarget $Entry.StoredTarget -Mappings $Mappings -CustomerRulesUnavailable:$Unavailable
     $Stored = ConvertTo-AUStoredTarget $Target
     if ($null -ne $Stored) { $Entry.StoredTarget = $Stored }
@@ -10605,7 +10965,7 @@ function Set-AUEntryResult
     $Section = [string]$Target.MatchSection
     if ($Target.MatchSection -ceq 'Customer' -or $Target.RetainedFrom -ceq 'Customer') { $Section = 'Customer' }
     $Classification = Get-AUClassification -Facts $Facts -Mappings $Mappings -MatchSection $Section
-    $Role = Get-AURole -Facts $Facts -Target $Target -Classification $Classification -InstalledApps $Context.Apps
+    $Role = Get-AURole -Facts $Facts -Target $Target -Classification $Classification -InstalledApps $Context.Apps -AppIndex $AppIndex
 
     $Sid = ([string]$Entry.UserSid).Trim()
     $UserType = $Context.UserTypes[$Sid]
@@ -10614,14 +10974,20 @@ function Set-AUEntryResult
         $UserType = Get-AUUserType -Sid $Sid -MachineDomainSid $Context.MachineDomainSid
         $Context.UserTypes[$Sid] = $UserType
     }
-    $InstallStatus = Get-AUInstallStatus -Target $Target -InstalledApps $Context.Apps -ScopeRead $Context.ScopeRead -UserSid $Sid
-    $Entry | Add-Member -Force -NotePropertyMembers ([ordered]@{
-            Target         = $Target
-            Classification = $Classification
-            Role           = $Role
-            UserType       = [string]$UserType
-            InstallStatus  = $InstallStatus
-        })
+    $InstallStatus = Get-AUInstallStatus -Target $Target -InstalledApps $Context.Apps -ScopeRead $Context.ScopeRead -UserSid $Sid -AppIndex $AppIndex
+    # As Add-Member -Force -NotePropertyMembers, without the cmdlet: this runs once per entry.
+    $Results = [ordered]@{
+        Target         = $Target
+        Classification = $Classification
+        Role           = $Role
+        UserType       = [string]$UserType
+        InstallStatus  = $InstallStatus
+    }
+    foreach ($Name in $Results.Keys)
+    {
+        if ($null -ne $Entry.PSObject.Properties[$Name]) { $Entry.PSObject.Properties.Remove($Name) }
+        $Entry.PSObject.Properties.Add([Management.Automation.PSNoteProperty]::new($Name, $Results[$Name]))
+    }
 }#endfunction
 
 function Invoke-AUCollection
@@ -10644,8 +11010,8 @@ function Invoke-AUCollection
        Merge-AUSrumRecords runs only when the read is OK with rows (F10), with UserTypes from the
        rows' own SIDs (case-insensitive), and with -NoArchive when the copy was repaired or the read
        is incomplete.
-    5. Ledger SIDs missing from ProfileList become Deleted in ScopeRead (F29), after the merge so a
-       deleted user's new rows count too.
+    5. Interactive ledger SIDs missing from ProfileList become Deleted in ScopeRead (F29), after the
+       merge so a deleted user's new rows count too. Service and virtual accounts become NoProfile.
     6. Every ledger entry is recalculated (Set-AUEntryResult; Package-kind entries only with
        IncludeStore), with one read budget and one service map for the run (F36).
     7. Invoke-AULedgerFold, then Get-AUKnownExes, Get-AUAppUsage, ConvertTo-AUExeUsage, and
@@ -10801,6 +11167,7 @@ function Invoke-AUCollection
             Mappings                 = $Run.Mappings
             CustomerRulesUnavailable = [bool]$Run.CustomerRulesUnavailable
             Apps                     = $Apps
+            AppIndex                 = (New-AUAppIndex $Apps)
             ScopeRead                = $ScopeRead
             MsiFileMap               = $MsiFileMap
             ServiceBinaries          = (Get-AUServiceBinaries)
