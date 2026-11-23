@@ -10722,6 +10722,10 @@ function Invoke-AppUsage
         [string]$ComputerName = $env:COMPUTERNAME
     )
 
+    # The script's own preference (powershell.exe -File), whatever the caller's: under Stop, any
+    # non-terminating error, such as the logger's when the log is locked, would end the run. Every
+    # call that must stop on an error passes -ErrorAction Stop.
+    $ErrorActionPreference = 'Continue'
     $Version = [string]$ScriptVersion
     # The inventory's setting names the device columns (Get-AUColumnName).
     $ApiMode = [string]$LogAPIMode
@@ -11815,6 +11819,8 @@ if ($CollectAppInventory)
             # token request, so an expired secret or a missing role never discards a row.
             $AUSender = {
                 param ([byte[]]$Body, [string]$Mode, [string]$Type, [bool]$SingleAttempt)
+                # The script's own preference, whatever the caller's, so a logging error never ends the send.
+                $ErrorActionPreference = 'Continue'
                 if ($SingleAttempt)
                 {
                     # Invoke-LogSubmission reads this setting; this scope's copy holds for this call only.
@@ -11849,11 +11855,13 @@ if ($CollectAppInventory)
                         {
                         }
                     }
-                    Write-CMTraceLog "App inventory row upload failed: $($_.Exception.Message)" -WarningMsg
+                    try { Write-CMTraceLog "App inventory row upload failed: $($_.Exception.Message)" -WarningMsg } catch { }
                 }
-                Write-CMTraceLog "App inventory row upload response: $Response"
+                # The outcome is decided from the response before anything is logged, so a failed log line can't change it.
                 $Ok = ("$Response" -match "^$(if($Mode -eq 'LogIngestionAPI'){204}else{200}) :")
-                New-Object PSObject -Property @{ Ok = $Ok; Permanent = ((-not $Ok) -and (Test-AUPermanentStatus $Code)) }
+                $Outcome = New-Object PSObject -Property @{ Ok = $Ok; Permanent = ((-not $Ok) -and (Test-AUPermanentStatus $Code)) }
+                try { Write-CMTraceLog "App inventory row upload response: $Response" } catch { }
+                $Outcome
             }
 
             $AUOutcome = Send-AUInventoryRun -MainColumns $MainApp -InstalledAppsJson $InstalledAppJson -ExeUsageJson (ConvertTo-AUExeUsageJson -ExeEntries $AUResult.ExeEntries) -StatusTokens $AUResult.StatusTokens -RunId $AUResult.RunId -OutboxDir $AUResult.OutboxPath -LogAPIMode $LogAPIMode -LogType $AppLog -Sender $AUSender

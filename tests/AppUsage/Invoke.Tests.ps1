@@ -495,6 +495,20 @@ Describe 'Invoke-AppUsage never throws and stays silent (D28, D40)' {
         $All[0].RunId | Should -BeExactly $script:Run
         $All[0].ExeEntries | Should -Not -BeNullOrEmpty
     }
+
+    It 'keeps its results when the caller''s error preference is Stop and the log is locked' {
+        # GitHub's shell: powershell runs under Stop, and the real logger writes an error when the log is locked.
+        function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) Write-Error 'Write-CMTraceLog failed: the log is being used by another process.' }
+        Mock Get-AUUsers { Write-Error 'stray error'; $script:Users }
+        $ErrorActionPreference = 'Stop'
+        try { $All = @(Invoke-AppUsage -RunId $script:Run 2>$null) }
+        finally { $ErrorActionPreference = 'Continue' }
+        $Results = @($All | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] })
+        $Results.Count | Should -Be 1
+        $Results[0].RunId | Should -BeExactly $script:Run
+        Get-TestTokens $Results[0] | Should -Not -Contain 'AppUsageFailed'
+        $Results[0].ExeEntries | Should -Not -BeNullOrEmpty
+    }
 }
 
 Describe 'Invoke-AppUsage results' {

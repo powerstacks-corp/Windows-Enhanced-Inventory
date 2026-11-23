@@ -568,13 +568,26 @@ Describe 'The App Inventory row sender (fix round 1)' {
         $Lock = [IO.File]::Open($script:CMLog, [IO.FileMode]::Create, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try
         {
-            $Run = Invoke-TestMetered -Settings $script:Retries -RealUpload -RealLogger
+            # The preference the script runs with (powershell.exe -File). Under Stop, version 19's own
+            # first log line in this section would stop the section when the log is locked; the next
+            # test covers the sender under Stop.
+            $Run = Invoke-TestMetered -Settings ($script:Retries + @{ ErrorActionPreference = 'Continue' }) -RealUpload -RealLogger
         }
         finally
         {
             $Lock.Dispose()
             $script:CMLog = $SavedLog
         }
+        $script:Web.Calls.Count | Should -Be 1
+        $Run.Response | Should -Match '^204 : Upload payload size is [\d.]+Kb \(1 row\) $'
+        @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter '*.json' -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty
+    }
+
+    It 'reports an accepted row as sent when the caller''s error preference is Stop and logging the upload fails' {
+        # The logger writes an error when the log is locked; under Stop that error would be terminating.
+        # This one fails only for the sender's own lines, so the rest of the section runs.
+        function Write-CMTraceLog { param ([Parameter(Position = 0)]$Message, [Parameter(ValueFromRemainingArguments = $true)]$Rest) if ([string]$Message -like 'App inventory row upload*') { Write-Error 'Write-CMTraceLog failed: the log is being used by another process.' } }
+        $Run = Invoke-TestMetered -Settings ($script:Retries + @{ ErrorActionPreference = 'Stop' }) -RealUpload -RealLogger
         $script:Web.Calls.Count | Should -Be 1
         $Run.Response | Should -Match '^204 : Upload payload size is [\d.]+Kb \(1 row\) $'
         @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter '*.json' -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty
