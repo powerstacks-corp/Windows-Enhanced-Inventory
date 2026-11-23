@@ -6017,15 +6017,19 @@ function Remove-AUShadowCopy
     }
 }#endfunction
 
-function Test-AUShadowFromRun
+function Get-AUShadowOrigin
 {
     <#
 .SYNOPSIS
-    Returns true when the shadow copy exists and was made while the run folder existed.
+    Returns Run when the shadow copy exists and was made while the run folder existed, Other when it
+    doesn't or wasn't, and Unknown when Win32_ShadowCopy couldn't be read.
 .DESCRIPTION
     A stale run's marker names the shadow copy it made. It's deleted only when Win32_ShadowCopy has
-    it and its InstallDate falls between the run folder's creation and now, so a marker can never
-    point the sweep at another shadow copy. Never throws.
+    it and its InstallDate falls between the run folder's creation and now (Run), so a marker can
+    never point the sweep at another shadow copy. A shadow copy that isn't there, or a marker that
+    isn't a shadow copy ID, is Other. When the query fails, it's Unknown, and the sweep keeps the
+    folder and its marker for the next run, so a passing WMI error never leaves the shadow copy
+    with nothing that names it. Never throws.
 .PARAMETER ShadowId
     The shadow copy ID from the marker, a GUID in braces.
 .PARAMETER SinceUtc
@@ -6036,15 +6040,17 @@ function Test-AUShadowFromRun
         [datetime]$SinceUtc
     )
 
+    if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { return 'Other' }
+    try { $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop | Select-Object -First 1 }
+    catch { return 'Unknown' }
     try
     {
-        if ($ShadowId -notmatch '^\{[0-9A-Fa-f-]+\}$') { return $false }
-        $Shadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$ShadowId'" -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop | Select-Object -First 1
-        if (-not $Shadow -or $Shadow.InstallDate -isnot [datetime]) { return $false }
+        if (-not $Shadow -or $Shadow.InstallDate -isnot [datetime]) { return 'Other' }
         $Installed = $Shadow.InstallDate.ToUniversalTime()
-        return ($Installed -ge $SinceUtc.ToUniversalTime() -and $Installed -le [datetime]::UtcNow)
+        if ($Installed -ge $SinceUtc.ToUniversalTime() -and $Installed -le [datetime]::UtcNow) { return 'Run' }
+        return 'Other'
     }
-    catch { return $false }
+    catch { return 'Other' }
 }#endfunction
 
 function Read-AUShadowMarker
@@ -6086,8 +6092,9 @@ function Clear-AUStaleRuns
     folder that Test-AUTrustedFolder trusts, it isn't the current run, and it was created more than
     MaxAgeHours ago. Its marker's shadow copy is deleted only when the marker is trusted
     (Read-AUShadowMarker) and the shadow copy was made during the folder's lifetime
-    (Test-AUShadowFromRun); then the folder is removed (Remove-AUFolderTree). Anything else is left
-    alone. Never throws.
+    (Get-AUShadowOrigin is Run); then the folder is removed (Remove-AUFolderTree). When the shadow
+    copy couldn't be checked (Unknown), the folder and its marker stay for the next run. Anything
+    else is left alone. Never throws.
 .PARAMETER Root
     The protected work root.
 .PARAMETER Except
@@ -6124,7 +6131,13 @@ function Clear-AUStaleRuns
                 $ShadowId = Read-AUShadowMarker -Folder $Folder.FullName
                 if ($ShadowId)
                 {
-                    if (Test-AUShadowFromRun -ShadowId $ShadowId -SinceUtc $CreatedUtc) { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+                    $Origin = Get-AUShadowOrigin -ShadowId $ShadowId -SinceUtc $CreatedUtc
+                    if ($Origin -eq 'Unknown')
+                    {
+                        Write-CMTraceLog -Message "App Usage: couldn't check shadow copy $ShadowId, so the stale run folder $($Folder.FullName) and its marker stay for the next run." -Component 'AppUsage' -Type 2
+                        continue
+                    }
+                    if ($Origin -eq 'Run') { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
                     else { Write-CMTraceLog -Message "App Usage: left shadow copy $ShadowId alone; it isn't one that $($Folder.FullName) made." -Component 'AppUsage' -Type 2 }
                 }
                 Remove-AUFolderTree -Path $Folder.FullName

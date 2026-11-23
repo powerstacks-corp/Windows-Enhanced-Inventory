@@ -229,6 +229,34 @@ Describe 'Stale run cleanup (F28)' {
         Should -Invoke Remove-AUShadowCopy -Times 0
     }
 
+    It 'keeps a stale run folder and its marker for the next run when its shadow copy can''t be checked (deferred 217)' {
+        $Old = New-StaleRun $script:Root 'old-run' 25
+        Write-AUShadowMarker -Folder $Old -ShadowId $script:Id
+        Mock Get-CimInstance { throw 'The RPC server is unavailable.' } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        $null = New-AUWorkDir -RunId 'current' -Root $script:Root
+        Test-Path -LiteralPath $Old | Should -BeTrue
+        Read-AUShadowMarker -Folder $Old | Should -BeExactly $script:Id
+        Should -Invoke Remove-AUShadowCopy -Times 0
+
+        # Once WMI answers again, the next run removes both.
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:Id; InstallDate = $script:InstallDate } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        $null = New-AUWorkDir -RunId 'next' -Root $script:Root
+        Test-Path -LiteralPath $Old | Should -BeFalse
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:Id }
+    }
+
+    It 'tells a shadow copy the run made from another one, and from one it couldn''t check' {
+        $Since = [datetime]::UtcNow.AddHours(-3)
+        Get-AUShadowOrigin -ShadowId $script:Id -SinceUtc $Since | Should -BeExactly 'Run'
+        $script:InstallDate = (Get-Date).AddHours(-30)
+        Get-AUShadowOrigin -ShadowId $script:Id -SinceUtc $Since | Should -BeExactly 'Other'
+        Get-AUShadowOrigin -ShadowId 'not-an-id' -SinceUtc $Since | Should -BeExactly 'Other'
+        Mock Get-CimInstance { } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Get-AUShadowOrigin -ShadowId $script:Id -SinceUtc $Since | Should -BeExactly 'Other'
+        Mock Get-CimInstance { throw 'WMI failed' } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Get-AUShadowOrigin -ShadowId $script:Id -SinceUtc $Since | Should -BeExactly 'Unknown'
+    }
+
     It 'never acts on a marker that a standard user owns' {
         $Old = New-StaleRun $script:Root 'old-run' 25
         $Marker = Join-Path $Old 'shadow.id'
@@ -484,7 +512,7 @@ Describe 'WMI time limits (review minor 2)' {
         Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; InstallDate = (Get-Date) } }
         Mock Remove-CimInstance { } -RemoveParameterType 'InputObject'
         Remove-AUShadowCopy -ShadowId $script:ShadowId | Should -BeTrue
-        Test-AUShadowFromRun -ShadowId $script:ShadowId -SinceUtc ([datetime]::UtcNow.AddHours(-1)) | Should -Not -BeNullOrEmpty
+        Get-AUShadowOrigin -ShadowId $script:ShadowId -SinceUtc ([datetime]::UtcNow.AddHours(-1)) | Should -Not -BeNullOrEmpty
         Should -Invoke Get-CimInstance -Times 2 -Exactly -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' -and $OperationTimeoutSec -eq 30 }
         Should -Invoke Remove-CimInstance -Times 1 -Exactly -ParameterFilter { $OperationTimeoutSec -eq 30 }
     }
