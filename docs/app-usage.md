@@ -303,6 +303,10 @@ A check that has nothing to go on, or that would rule out every app, is skipped.
 
 When two or more apps are left after every check, the executable is reported as unmatched, and `CandidateTargets` lists the apps it could belong to. Those apps aren't reported as unused because of it: when the executable runs, an app among them with no use or runs of its own is reported as `Ambiguous`. To settle it yourself, give your rule a narrower `target.displayName`.
 
+#### Microsoft 365 Apps in Two or More Languages
+
+When Microsoft 365 Apps is installed in two or more languages, each language has its own entry in **Installed apps**, for example `Microsoft 365 Apps for enterprise - en-us` and `Microsoft 365 Apps for enterprise - de-de`. The languages share one install folder and the same executables, so no check can tell them apart. Every language entry is reported as `Ambiguous`, never `Used` or `NotUsed`, and the Office executables are reported as unmatched with the language entries in `CandidateTargets`. This is a known limitation. If it affects your reports, contact PowerStacks support.
+
 ### Targets From Earlier Runs
 
 When a rule matches an executable, the script saves the target (the installed app, the rule ID, and whose rule it was) with the executable's usage on the device. The saved target keeps the executable matched after the evidence for the match is gone, for example after the app is uninstalled, so its usage stays credited to the app and the app can be reported as not installed.
