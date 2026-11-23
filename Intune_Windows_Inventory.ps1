@@ -6974,6 +6974,960 @@ function Read-AUSrum
     return $Read
 }#endfunction
 
+# Executable facts (Task 14; D24, D30, F13, F36 to F38). SRUM gives kernel paths and a build
+# fingerprint. A kernel path is translated by suffix probing under each fixed drive (QueryDosDevice
+# needs compiling, D25), and a file's facts are read only when its PE TimeDateStamp and CheckSum
+# equal the build's (D24). Files are only ever opened to read their headers and version info, and a file
+# outside the allowlisted system folders is read in a timed runspace, so a lock on it can't stall the run.
+$script:AUFileShare = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+$script:AUUnixEpoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
+# The PE header bytes read at e_lfanew: the signature (4), the file header (20), and the optional
+# header through Subsystem (70). CheckSum and Subsystem sit at the same offsets in PE32 and PE32+.
+$script:AUPeHeaderBytes = 94
+$script:AUServicesKey = 'SYSTEM\CurrentControlSet\Services'
+$script:AUServiceQueryTimeoutSeconds = 30
+
+function Get-AUFixedDrives
+{
+    <#
+.SYNOPSIS
+    Returns the roots of the ready fixed drives, such as C: and E:, for kernel path probing.
+.DESCRIPTION
+    A separate function so tests can point probing at TestDrive folders. Returns nothing when the
+    drives can't be listed; callers wrap the call in @(). Never throws.
+#>
+    $Roots = New-Object 'System.Collections.Generic.List[string]'
+    try
+    {
+        foreach ($Drive in [IO.DriveInfo]::GetDrives())
+        {
+            if ($Drive.DriveType -ne [IO.DriveType]::Fixed) { continue }
+            $Ready = $false
+            try { $Ready = $Drive.IsReady } catch { $Ready = $false }
+            if ($Ready) { $Roots.Add($Drive.Name.Substring(0, 2).ToUpperInvariant()) }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the fixed drives: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    # Unrolled, so a pipeline gets one root at a time.
+    return $Roots.ToArray()
+}#endfunction
+
+function ConvertTo-AUIoPath
+{
+    <#
+.SYNOPSIS
+    Returns the form of a drive-letter path to open: with the \\?\ prefix when it's 260 characters or longer.
+.DESCRIPTION
+    Only for opening the file. Facts and run paths never carry the prefix.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ($Path.Length -ge 260 -and $Path -match '^[A-Za-z]:\\') { return '\\?\' + $Path }
+    return $Path
+}#endfunction
+
+function Get-AULongPath
+{
+    <#
+.SYNOPSIS
+    Expands any 8.3 short name in a drive-letter path to its long name.
+.DESCRIPTION
+    Only a segment holding ~ is looked up, by listing its parent folder with the segment as the
+    pattern; it's replaced when exactly one entry answers to it. A segment that isn't found, or a
+    failure, leaves the path as given. Never throws.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrEmpty($Path) -or $Path.IndexOf('~') -lt 0) { return $Path }
+    try
+    {
+        $Parts = $Path.Split('\')
+        $Current = $Parts[0]
+        for ($i = 1; $i -lt $Parts.Count; $i++)
+        {
+            $Segment = $Parts[$i]
+            if ($Segment.IndexOf('~') -ge 0 -and $Segment.IndexOfAny([char[]]@('*', '?')) -lt 0)
+            {
+                $Parent = New-Object IO.DirectoryInfo ((ConvertTo-AUIoPath $Current) + '\')
+                $Found = @($Parent.GetFileSystemInfos($Segment))
+                if ($Found.Count -eq 1) { $Segment = $Found[0].Name }
+            }
+            $Current = $Current + '\' + $Segment
+        }
+        return $Current
+    }
+    catch { return $Path }
+}#endfunction
+
+function Get-AUPeFingerprint
+{
+    <#
+.SYNOPSIS
+    Reads a file's PE build fingerprint: LinkTimeUtc (Utc kind), CheckSum ([uint32]), and Subsystem.
+.DESCRIPTION
+    Reads only the DOS header and the PE headers, with a FileStream opened for reading that lets
+    others read, write, and delete the file; no compiling. LinkTimeUtc is the file header's
+    TimeDateStamp and CheckSum the optional header's, the same types ConvertFrom-AUExeInfo gives, so
+    the comparison is exact. Subsystem is GUI (2), Console (3), or Other for any other value (Native,
+    EFI, and so on). Returns $null for a missing file, a folder, or a file that isn't a PE image.
+    Never throws.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $Stream = $null
+    try
+    {
+        $IoPath = ConvertTo-AUIoPath $Path
+        if (-not [IO.File]::Exists($IoPath)) { return $null }
+        $Stream = New-Object IO.FileStream ($IoPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $script:AUFileShare)
+        $ReadAll = {
+            param ([byte[]]$Buffer)
+            $Total = 0
+            while ($Total -lt $Buffer.Length)
+            {
+                $Count = $Stream.Read($Buffer, $Total, $Buffer.Length - $Total)
+                if ($Count -le 0) { break }
+                $Total += $Count
+            }
+            return ($Total -eq $Buffer.Length)
+        }
+
+        $Dos = New-Object byte[] 64
+        if (-not (& $ReadAll $Dos) -or $Dos[0] -ne 0x4D -or $Dos[1] -ne 0x5A) { return $null }
+        $Offset = [BitConverter]::ToInt32($Dos, 0x3C)
+        if ($Offset -lt 64 -or [long]$Offset + $script:AUPeHeaderBytes -gt $Stream.Length) { return $null }
+        $Stream.Position = $Offset
+        $Header = New-Object byte[] $script:AUPeHeaderBytes
+        if (-not (& $ReadAll $Header)) { return $null }
+        if ([BitConverter]::ToUInt32($Header, 0) -ne 0x00004550) { return $null }
+        if ([BitConverter]::ToUInt16($Header, 20) -lt 70) { return $null }
+        $Magic = [BitConverter]::ToUInt16($Header, 24)
+        if ($Magic -ne 0x10B -and $Magic -ne 0x20B) { return $null }
+
+        $Subsystem = 'Other'
+        switch ([BitConverter]::ToUInt16($Header, 24 + 68))
+        {
+            2 { $Subsystem = 'GUI' }
+            3 { $Subsystem = 'Console' }
+        }
+        return [pscustomobject]@{
+            LinkTimeUtc = $script:AUUnixEpoch.AddSeconds([double][BitConverter]::ToUInt32($Header, 8))
+            CheckSum    = [BitConverter]::ToUInt32($Header, 24 + 64)
+            Subsystem   = $Subsystem
+        }
+    }
+    catch { return $null }
+    finally { if ($null -ne $Stream) { $Stream.Dispose() } }
+}#endfunction
+
+function Test-AUFingerprintMatch
+{
+    <#
+.SYNOPSIS
+    Tests whether a file's fingerprint is the build an ExeInfo names: equal LinkTimeUtc and CheckSum.
+.DESCRIPTION
+    False when either is missing, or the ExeInfo isn't a Win32 fingerprint with both values.
+.PARAMETER Fingerprint
+    The Get-AUPeFingerprint result.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result.
+#>
+    param (
+        [pscustomobject]$Fingerprint,
+        [pscustomobject]$ExeInfo
+    )
+
+    if ($null -eq $Fingerprint -or $null -eq $ExeInfo -or $ExeInfo.Kind -ne 'Win32') { return $false }
+    if ($null -eq $ExeInfo.LinkTimeUtc -or $null -eq $ExeInfo.CheckSum) { return $false }
+    return ($Fingerprint.LinkTimeUtc.Ticks -eq ([datetime]$ExeInfo.LinkTimeUtc).Ticks -and [uint32]$Fingerprint.CheckSum -eq [uint32]$ExeInfo.CheckSum)
+}#endfunction
+
+function Get-AUVersionInfo
+{
+    <#
+.SYNOPSIS
+    Returns a file's version info ([Diagnostics.FileVersionInfo]). A separate function so tests can make it fail.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    return [Diagnostics.FileVersionInfo]::GetVersionInfo((ConvertTo-AUIoPath $Path))
+}#endfunction
+
+# Folders under the System32 and SysWOW64 allowlist entries that standard users can write to on
+# stock Windows; files there are read with the timed read.
+$script:AUUserWritableSystemFolders = @('Tasks', 'Tasks_Migrated', 'spool\drivers\color', 'spool\PRINTERS', 'spool\SERVERS', 'Microsoft\Crypto\RSA\MachineKeys', 'com\dmp', 'FxsTmp')
+
+function Get-AUDirectReadRoots
+{
+    <#
+.SYNOPSIS
+    Returns the folders whose files may be read directly (Allowed) and the user-writable folders inside them (Excluded).
+.DESCRIPTION
+    Allowed: %ProgramFiles%, %ProgramFiles(x86)%, %ProgramFiles%\WindowsApps, and %SystemRoot%\
+    System32, SysWOW64, WinSxS, Microsoft.NET, SystemApps, and ImmersiveControlPanel. Excluded: the
+    folders in AUUserWritableSystemFolders under System32 and SysWOW64, such as System32\Tasks and
+    System32\spool\drivers\color. The locations come from the machine's registry
+    (ProgramFilesDir, ProgramFilesDir (x86), and SystemRoot), never from user variables, with the
+    known-folder API as the fallback. No trailing backslash. A location that can't be found is left
+    out, so its files get the timed read. Never throws.
+#>
+    $Read = {
+        param ([string]$KeyPath, [string]$Name)
+        $Base = $null
+        $Key = $null
+        try
+        {
+            $Base = Open-AURegistryBase -Hive Machine
+            $Key = $Base.OpenSubKey($KeyPath)
+            if ($null -eq $Key) { return $null }
+            return [string]$Key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        catch { return $null }
+        finally
+        {
+            if ($null -ne $Key) { $Key.Close() }
+            if ($null -ne $Base) { $Base.Close() }
+        }
+    }
+    $Clean = {
+        param ([string]$Folder, [string]$Fallback)
+        if ([string]::IsNullOrWhiteSpace($Folder) -or $Folder.IndexOf('%') -ge 0) { $Folder = $Fallback }
+        if ([string]::IsNullOrWhiteSpace($Folder)) { return $null }
+        $Folder = $Folder.Trim().TrimEnd('\')
+        if ($Folder -notmatch '^[A-Za-z]:\\[^\\]') { return $null }
+        return $Folder
+    }
+
+    $Allowed = New-Object 'System.Collections.Generic.List[string]'
+    $Excluded = New-Object 'System.Collections.Generic.List[string]'
+    try
+    {
+        $ProgramFiles = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows\CurrentVersion' 'ProgramFilesDir') ([Environment]::GetFolderPath('ProgramFiles'))
+        $ProgramFilesX86 = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows\CurrentVersion' 'ProgramFilesDir (x86)') ([Environment]::GetFolderPath('ProgramFilesX86'))
+        $SystemRoot = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'SystemRoot') ([Environment]::GetFolderPath('Windows'))
+        if ($ProgramFiles) { $Allowed.Add($ProgramFiles); $Allowed.Add($ProgramFiles + '\WindowsApps') }
+        if ($ProgramFilesX86) { $Allowed.Add($ProgramFilesX86) }
+        if ($SystemRoot)
+        {
+            foreach ($Folder in @('System32', 'SysWOW64', 'WinSxS', 'Microsoft.NET', 'SystemApps', 'ImmersiveControlPanel')) { $Allowed.Add($SystemRoot + '\' + $Folder) }
+            foreach ($System in @('System32', 'SysWOW64'))
+            {
+                foreach ($Folder in $script:AUUserWritableSystemFolders) { $Excluded.Add($SystemRoot + '\' + $System + '\' + $Folder) }
+            }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't find the system folders; every file gets the timed read: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    return [pscustomobject]@{ Allowed = $Allowed.ToArray(); Excluded = $Excluded.ToArray() }
+}#endfunction
+
+function Test-AUDirectRead
+{
+    <#
+.SYNOPSIS
+    Tests whether a file may be read directly: true only inside an allowlisted system folder that standard users can't write to.
+.DESCRIPTION
+    The path is normalized with GetFullPath (forward slashes, a \\?\ prefix, . and .. segments, and
+    existing 8.3 short names resolved) and
+    compared ignoring case with each folder plus a trailing backslash: Excluded first, then Allowed
+    (Get-AUDirectReadRoots). Anything else (a user profile, C:\Windows\Temp, C:\Windows\Tasks,
+    C:\Windows\Tracing, the rest of C:\Windows, ProgramData, another drive) may
+    be writable by a standard user, who could hold an opportunistic lock or a slow filter on the
+    file and make SYSTEM's open wait indefinitely, so it's read through Read-AUFile's timed
+    runspace. A path that doesn't normalize is false.
+.PARAMETER Path
+    The drive-letter path.
+.PARAMETER Roots
+    The Get-AUDirectReadRoots result (a read budget's DirectRoots), or $null to read it now.
+#>
+    param (
+        [string]$Path,
+        [pscustomobject]$Roots
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $Full = $Path.Trim().Replace('/', '\')
+    if ($Full.StartsWith('\\?\')) { $Full = $Full.Substring(4) }
+    if ($Full -notmatch '^[A-Za-z]:\\') { return $false }
+    try { $Full = [IO.Path]::GetFullPath($Full) }
+    catch { return $false }
+    if ($null -eq $Roots) { $Roots = Get-AUDirectReadRoots }
+    foreach ($Folder in @($Roots.Excluded)) { if ($Folder -and $Full.StartsWith($Folder + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false } }
+    foreach ($Folder in @($Roots.Allowed)) { if ($Folder -and $Full.StartsWith($Folder + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}#endfunction
+
+function Read-AUFileDirect
+{
+    <#
+.SYNOPSIS
+    Reads a file's PE fingerprint and, optionally, its version info and its fingerprint again: Status, Before, Info, After, Error.
+.DESCRIPTION
+    The version info is read only when the file is a PE image, and the fingerprint is read again
+    after it, so a file replaced mid-read shows a different After. Error holds a version-read
+    failure's message. Status is OK. Read-AUFile runs this same function in its timed runspace.
+    Never throws.
+.PARAMETER Path
+    The drive-letter path.
+.PARAMETER WithVersion
+    Also read the version info and the fingerprint after it.
+#>
+    param (
+        [string]$Path,
+        [switch]$WithVersion
+    )
+
+    $Result = [pscustomobject]@{ Status = 'OK'; Before = $null; Info = $null; After = $null; Error = $null }
+    $Result.Before = Get-AUPeFingerprint $Path
+    if ($WithVersion -and $null -ne $Result.Before)
+    {
+        try { $Result.Info = Get-AUVersionInfo $Path }
+        catch { $Result.Error = $_.Exception.Message }
+        $Result.After = Get-AUPeFingerprint $Path
+    }
+    return $Result
+}#endfunction
+
+function Get-AUFileReadScript
+{
+    <#
+.SYNOPSIS
+    Returns the script Read-AUFile runs in its runspace: the file-read functions and constants, then Read-AUFileDirect on $args.
+.DESCRIPTION
+    Built from this region's own function definitions, so the timed read is the same code as the
+    direct one. A separate function so tests can substitute a slow read.
+#>
+    $Builder = New-Object Text.StringBuilder
+    [void]$Builder.AppendLine("`$script:AUFileShare = [IO.FileShare]$([int]$script:AUFileShare)")
+    [void]$Builder.AppendLine("`$script:AUPeHeaderBytes = $script:AUPeHeaderBytes")
+    [void]$Builder.AppendLine("`$script:AUUnixEpoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)")
+    foreach ($Name in @('ConvertTo-AUIoPath', 'Get-AUPeFingerprint', 'Get-AUVersionInfo', 'Read-AUFileDirect'))
+    {
+        $Body = (Get-Command -Name $Name -CommandType Function).ScriptBlock.ToString()
+        [void]$Builder.AppendLine("function $Name {").AppendLine($Body).AppendLine('}')
+    }
+    [void]$Builder.AppendLine('Read-AUFileDirect -Path $args[0] -WithVersion:$args[1]')
+    return $Builder.ToString()
+}#endfunction
+
+function New-AUReadBudget
+{
+    <#
+.SYNOPSIS
+    Returns a run's budget for timed file reads: a per-file timeout and a total for the run.
+.DESCRIPTION
+    Task 15 creates one read budget per run, passes it to Find-AUExePath and Get-AUExeFacts, and
+    closes it with Close-AUReadBudget in a finally block. RemainingMs falls by the time every timed
+    read takes; once it's spent, the remaining files outside the direct-read folders are skipped
+    (unverified, no facts). Reads, TimedOut, and Skipped count what happened. DirectRoots is read
+    once (Get-AUDirectReadRoots). The runspace is created on the first timed read.
+.PARAMETER TotalSeconds
+    The run's total for timed reads.
+.PARAMETER FileTimeoutSeconds
+    The longest wait for one file.
+#>
+    param (
+        [double]$TotalSeconds = 120,
+        [double]$FileTimeoutSeconds = 5
+    )
+
+    return [pscustomobject]@{
+        TimeoutMs   = [int][Math]::Max(1, [Math]::Round($FileTimeoutSeconds * 1000))
+        RemainingMs = [double]([Math]::Max(0, $TotalSeconds * 1000))
+        Runspace    = $null
+        ScriptText  = $null
+        Reads       = 0
+        TimedOut    = 0
+        Skipped     = 0
+        DirectRoots = (Get-AUDirectReadRoots)
+    }
+}#endfunction
+
+function Close-AUReadBudget
+{
+    <#
+.SYNOPSIS
+    Closes a read budget's runspace, if it has one. Never waits on a read: a timed-out runspace was already let go. Never throws.
+.PARAMETER ReadBudget
+    The New-AUReadBudget result.
+#>
+    param (
+        [pscustomobject]$ReadBudget
+    )
+
+    if ($null -eq $ReadBudget -or $null -eq $ReadBudget.Runspace) { return }
+    $Runspace = $ReadBudget.Runspace
+    $ReadBudget.Runspace = $null
+    try { $Runspace.Dispose() } catch { Write-CMTraceLog -Message "App Usage: couldn't close the file-read runspace: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+}#endfunction
+
+function Read-AUFile
+{
+    <#
+.SYNOPSIS
+    Reads a file with Read-AUFileDirect, in a timed runspace unless it's in an allowlisted system folder.
+.DESCRIPTION
+    A file in an allowlisted system folder (Test-AUDirectRead) is read directly. Any other file is read in
+    a background runspace that is waited on for at most the budget's per-file timeout, or what's
+    left of its total. On a timeout the read is logged and let go: the pipeline is told to stop and
+    the runspace to close, neither waited on, and the next read gets a new runspace. A timed-out
+    read gives Status TimedOut, and a spent budget Status Skipped without reading. Either way the
+    caller treats the file as unverified with no facts. Status Failed when the runspace fails.
+    Never throws.
+.PARAMETER Path
+    The drive-letter path.
+.PARAMETER WithVersion
+    Also read the version info and the fingerprint after it.
+.PARAMETER ReadBudget
+    The run's New-AUReadBudget result (Task 15 creates one per run and closes it in a finally
+    block). With none, a budget for this one read is made and closed.
+#>
+    param (
+        [string]$Path,
+        [switch]$WithVersion,
+        [pscustomobject]$ReadBudget
+    )
+
+    $Roots = $null
+    if ($null -ne $ReadBudget) { $Roots = $ReadBudget.DirectRoots }
+    if (Test-AUDirectRead $Path $Roots) { return Read-AUFileDirect $Path -WithVersion:$WithVersion }
+    $Own = $null
+    if ($null -eq $ReadBudget) { $Own = New-AUReadBudget; $ReadBudget = $Own }
+    $Result = [pscustomobject]@{ Status = 'Failed'; Before = $null; Info = $null; After = $null; Error = $null }
+    $Shell = $null
+    $Started = $false
+    $Finished = $false
+    $Timer = [Diagnostics.Stopwatch]::StartNew()
+    try
+    {
+        if ($ReadBudget.RemainingMs -le 0)
+        {
+            if ($ReadBudget.Skipped -eq 0) { Write-CMTraceLog -Message 'App Usage: the file-read time budget is spent; files outside the direct-read system folders are now treated as unverified.' -Component 'AppUsage' -Type 2 }
+            $ReadBudget.Skipped++
+            $Result.Status = 'Skipped'
+            return $Result
+        }
+        $Wait = [int][Math]::Max(1, [Math]::Min([double]$ReadBudget.TimeoutMs, $ReadBudget.RemainingMs))
+        $ReadBudget.Reads++
+        if ($null -eq $ReadBudget.ScriptText) { $ReadBudget.ScriptText = Get-AUFileReadScript }
+        if ($null -eq $ReadBudget.Runspace)
+        {
+            $Runspace = [runspacefactory]::CreateRunspace()
+            $Runspace.Open()
+            $ReadBudget.Runspace = $Runspace
+        }
+        $Shell = [PowerShell]::Create()
+        $Shell.Runspace = $ReadBudget.Runspace
+        [void]$Shell.AddScript($ReadBudget.ScriptText).AddArgument($Path).AddArgument([bool]$WithVersion)
+        $Async = $Shell.BeginInvoke()
+        $Started = $true
+        if ($Async.AsyncWaitHandle.WaitOne($Wait))
+        {
+            $Finished = $true
+            $Output = @($Shell.EndInvoke($Async))
+            if ($Output.Count -gt 0 -and $null -ne $Output[-1] -and $Output[-1].Status -eq 'OK') { $Result = $Output[-1] }
+            return $Result
+        }
+
+        # Let the stuck read go without waiting on it: its thread stays blocked until the lock is
+        # released or the process exits. Each timeout costs the budget at least min(5 s, what's left),
+        # so a run abandons at most about 24 runspaces (120 s / 5 s), plus one for a last short wait.
+        $ReadBudget.TimedOut++
+        Write-CMTraceLog -Message "App Usage: reading $Path took longer than $Wait ms; it's treated as unverified." -Component 'AppUsage' -Type 2
+        try { [void]$Shell.BeginStop($null, $null) } catch { }
+        $Abandoned = $ReadBudget.Runspace
+        $ReadBudget.Runspace = $null
+        try { $Abandoned.CloseAsync() } catch { }
+        $Result.Status = 'TimedOut'
+        return $Result
+    }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't read $($Path): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        # A runspace that failed isn't used again; the next read gets a new one. CloseAsync doesn't wait.
+        $Broken = $ReadBudget.Runspace
+        $ReadBudget.Runspace = $null
+        if ($null -ne $Broken) { try { $Broken.CloseAsync() } catch { } }
+        return $Result
+    }
+    finally
+    {
+        if ($Result.Status -ne 'Skipped') { $ReadBudget.RemainingMs -= $Timer.Elapsed.TotalMilliseconds }
+        # Disposing a shell that never started, or whose read finished, doesn't wait; a timed-out one would.
+        if ($null -ne $Shell -and ($Finished -or -not $Started)) { try { $Shell.Dispose() } catch { } }
+        if ($null -ne $Own) { Close-AUReadBudget $Own }
+    }
+}#endfunction
+
+function Get-AUKernelProbe
+{
+    <#
+.SYNOPSIS
+    Probes one kernel path under the fixed drives: the existing candidate files, each with whether its fingerprint verifies.
+.DESCRIPTION
+    Returns Volume (lowercase), CachedRoot, and Candidates (Root, Path, Verified) for every drive
+    where the file exists and is named the ExeInfo exe name, with 8.3 names expanded. A cached
+    volume's drive (CachedRoot, else $null) is tried first; when no file there verifies, every
+    fixed drive is probed, so a wrong cache entry never hides a file. Returns $null for a refused
+    path: not \Device\HarddiskVolumeN\, an empty, . or .. segment, a stream name, wildcards, or
+    invalid characters; or a Package, Other, or fingerprint-less entry. The fingerprints are read
+    with Read-AUFile.
+.PARAMETER KernelPath
+    The Resource row's KernelPath.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER VolumeCache
+    The run's volume-to-drive map, or $null.
+.PARAMETER ReadBudget
+    The run's New-AUReadBudget result, or $null.
+#>
+    param (
+        [string]$KernelPath,
+        [pscustomobject]$ExeInfo,
+        [hashtable]$VolumeCache,
+        [pscustomobject]$ReadBudget
+    )
+
+    if ($null -eq $ExeInfo -or $ExeInfo.Kind -ne 'Win32' -or $null -eq $ExeInfo.LinkTimeUtc -or $null -eq $ExeInfo.CheckSum) { return $null }
+    if ([string]::IsNullOrWhiteSpace($KernelPath)) { return $null }
+    $Match = [regex]::Match($KernelPath.Trim(), '^\\Device\\(?<Volume>HarddiskVolume\d+)\\(?<Rest>.+)$', 'IgnoreCase')
+    if (-not $Match.Success) { return $null }
+    $Volume = $Match.Groups['Volume'].Value.ToLowerInvariant()
+    $Rest = $Match.Groups['Rest'].Value
+    if ($Rest.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0 -or $Rest.IndexOfAny([char[]]@(':', '*', '?')) -ge 0) { return $null }
+    foreach ($Segment in $Rest.Split('\'))
+    {
+        if ($Segment.Trim() -eq '' -or $Segment -eq '.' -or $Segment -eq '..') { return $null }
+    }
+
+    $Cached = $null
+    if ($null -ne $VolumeCache) { $Cached = [string]$VolumeCache[$Volume] }
+    if (-not $Cached) { $Cached = $null }
+
+    $Candidates = New-Object 'System.Collections.Generic.List[object]'
+    $Probe = {
+        param ([string]$Root)
+        $Candidate = $Root.TrimEnd('\') + '\' + $Rest
+        # An attribute query, not an open, so it can't be held up by a lock on the file.
+        if (-not [IO.File]::Exists((ConvertTo-AUIoPath $Candidate))) { return }
+        $Path = Get-AULongPath $Candidate
+        $Leaf = $Path.Substring($Path.LastIndexOf('\') + 1)
+        if ($ExeInfo.ExeName -and -not [string]::Equals($Leaf, [string]$ExeInfo.ExeName, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $Read = Read-AUFile $Path -ReadBudget $ReadBudget
+        $Verified = ($Read.Status -eq 'OK' -and (Test-AUFingerprintMatch $Read.Before $ExeInfo))
+        $Candidates.Add([pscustomobject]@{ Root = [string]$Root; Path = $Path; Verified = $Verified })
+    }
+    if ($Cached) { & $Probe $Cached }
+    if (-not $Cached -or -not @($Candidates | Where-Object { $_.Verified }).Count)
+    {
+        foreach ($Root in @(Get-AUFixedDrives))
+        {
+            if (-not $Root -or ($Cached -and [string]::Equals([string]$Root, $Cached, [StringComparison]::OrdinalIgnoreCase))) { continue }
+            & $Probe ([string]$Root)
+        }
+    }
+    return [pscustomobject]@{ Volume = $Volume; CachedRoot = $Cached; Candidates = $Candidates.ToArray() }
+}#endfunction
+
+function Select-AUVerifiedPath
+{
+    <#
+.SYNOPSIS
+    Returns a probe's one verified path, caching its volume's drive, or $null when none or two or more verify.
+.DESCRIPTION
+    Only a single, unambiguous verified hit sets the cache, and it replaces a cached drive that
+    turned out wrong.
+.PARAMETER Probe
+    The Get-AUKernelProbe result.
+.PARAMETER KernelPath
+    The probed kernel path, for the log.
+.PARAMETER VolumeCache
+    The run's volume-to-drive map, or $null.
+#>
+    param (
+        [pscustomobject]$Probe,
+        [string]$KernelPath,
+        [hashtable]$VolumeCache
+    )
+
+    if ($null -eq $Probe) { return $null }
+    $Verified = @($Probe.Candidates | Where-Object { $_.Verified })
+    if ($Verified.Count -eq 0) { return $null }
+    if ($Verified.Count -gt 1)
+    {
+        Write-CMTraceLog -Message "App Usage: $KernelPath verifies under $($Verified.Count) drives; the path stays untranslated." -Component 'AppUsage'
+        return $null
+    }
+    if ($null -ne $VolumeCache -and -not [string]::Equals([string]$Probe.CachedRoot, $Verified[0].Root, [StringComparison]::OrdinalIgnoreCase)) { $VolumeCache[$Probe.Volume] = $Verified[0].Root }
+    return $Verified[0].Path
+}#endfunction
+
+function Resolve-AUKernelPath
+{
+    <#
+.SYNOPSIS
+    Translates a SRUM kernel path (\Device\HarddiskVolumeN\...) to the drive-letter path of the same build, or $null.
+.DESCRIPTION
+    Strips the volume prefix and tries the rest under each fixed drive (Get-AUKernelProbe). A
+    candidate counts only when its PE TimeDateStamp and CheckSum equal the ExeInfo fingerprint and
+    its file name is the ExeInfo exe name (D24). Exactly one verified candidate is returned, with
+    any 8.3 short names expanded; none, or two or more (ambiguous), gives $null. A verified path
+    caches the volume's drive: a cached volume tries that drive first, and every drive when nothing
+    there verifies. A Package or Other entry, or a Win32 entry without a fingerprint, is never
+    probed. Never throws.
+.PARAMETER KernelPath
+    The Resource row's KernelPath.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER VolumeCache
+    The run's volume-to-drive map (lowercase volume name to drive root), or $null.
+.PARAMETER ReadBudget
+    The run's New-AUReadBudget result, or $null.
+#>
+    param (
+        [string]$KernelPath,
+        [pscustomobject]$ExeInfo,
+        [hashtable]$VolumeCache,
+        [pscustomobject]$ReadBudget
+    )
+
+    try { return (Select-AUVerifiedPath (Get-AUKernelProbe $KernelPath $ExeInfo $VolumeCache $ReadBudget) $KernelPath $VolumeCache) }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't translate $($KernelPath): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        return $null
+    }
+}#endfunction
+
+function Find-AUExePath
+{
+    <#
+.SYNOPSIS
+    Returns an entry's run path from its candidate kernel paths, as Path and Verified, or $null (F37, D24, D30).
+.DESCRIPTION
+    The candidates are the Resource rows with the entry's user and exe name; each distinct kernel
+    path (ignoring case) is probed with Get-AUKernelProbe.
+    - Exactly one distinct path verifies: that path, Verified $true.
+    - Two or more distinct paths verify (System32 and SysWOW64 copies of one build, say): $null.
+    - None verifies, but exactly one distinct path exists: that path, Verified $false. The app was
+      updated in place, so Get-AUExeFacts gives unverified facts with the current file's evidence.
+    - None verifies and none, or two or more distinct paths, exist: $null.
+    Never throws.
+.PARAMETER KernelPaths
+    The candidate kernel paths.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER VolumeCache
+    The run's volume-to-drive map, shared across entries.
+.PARAMETER ReadBudget
+    The run's New-AUReadBudget result (Task 15 creates one per run and closes it in a finally
+    block), or $null for a budget for this call only.
+#>
+    param (
+        [string[]]$KernelPaths,
+        [pscustomobject]$ExeInfo,
+        [hashtable]$VolumeCache,
+        [pscustomobject]$ReadBudget
+    )
+
+    if ($null -eq $ExeInfo -or $ExeInfo.Kind -ne 'Win32') { return $null }
+    $Own = $null
+    if ($null -eq $ReadBudget) { $Own = New-AUReadBudget; $ReadBudget = $Own }
+    try
+    {
+        $Seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $Verified = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $Existing = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($Kernel in @($KernelPaths))
+        {
+            if ([string]::IsNullOrWhiteSpace($Kernel) -or -not $Seen.Add($Kernel.Trim())) { continue }
+            try
+            {
+                $Probe = Get-AUKernelProbe $Kernel $ExeInfo $VolumeCache $ReadBudget
+                if ($null -eq $Probe) { continue }
+                # Every verified candidate counts, so a kernel path that verifies on two drives keeps
+                # the entry ambiguous (D24); Select-AUVerifiedPath only caches the volume.
+                foreach ($Candidate in $Probe.Candidates)
+                {
+                    [void]$Existing.Add($Candidate.Path)
+                    if ($Candidate.Verified) { [void]$Verified.Add($Candidate.Path) }
+                }
+                [void](Select-AUVerifiedPath $Probe $Kernel $VolumeCache)
+            }
+            catch { Write-CMTraceLog -Message "App Usage: couldn't translate $($Kernel): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+        }
+        if ($Verified.Count -eq 1) { return [pscustomobject]@{ Path = @($Verified)[0]; Verified = $true } }
+        if ($Verified.Count -gt 1)
+        {
+            Write-CMTraceLog -Message "App Usage: $($Verified.Count) paths verify for $($ExeInfo.ExeName); its path stays unknown (D24)." -Component 'AppUsage'
+            return $null
+        }
+        if ($Existing.Count -eq 1) { return [pscustomobject]@{ Path = @($Existing)[0]; Verified = $false } }
+        if ($Existing.Count -gt 1) { Write-CMTraceLog -Message "App Usage: $($Existing.Count) paths exist for $($ExeInfo.ExeName) and none is this build; its path stays unknown." -Component 'AppUsage' }
+        return $null
+    }
+    finally { if ($null -ne $Own) { Close-AUReadBudget $Own } }
+}#endfunction
+
+function ConvertTo-AUPackageFamily
+{
+    <#
+.SYNOPSIS
+    Returns the package family name (Name_PublisherId) of a Package-kind ExeInfo, or $null.
+.DESCRIPTION
+    A package full name (Name_Version_Architecture_ResourceId_PublisherId) keeps its first and last
+    parts; a family name is kept as it is. An !AppId is dropped. Anything ConvertFrom-AUExeInfo
+    doesn't call Package gives $null.
+.PARAMETER ExeInfo
+    The SRUM ExeInfo string.
+#>
+    param (
+        [string]$ExeInfo
+    )
+
+    if ((ConvertFrom-AUExeInfo $ExeInfo).Kind -ne 'Package') { return $null }
+    $Value = $ExeInfo.Trim()
+    $Bang = $Value.IndexOf('!')
+    if ($Bang -ge 0) { $Value = $Value.Substring(0, $Bang) }
+    $Parts = $Value.Split('_')
+    if ($Parts.Count -eq 5) { return $Parts[0] + '_' + $Parts[4] }
+    if ($Parts.Count -eq 2) { return $Value }
+    return $null
+}#endfunction
+
+function Get-AUExeFacts
+{
+    <#
+.SYNOPSIS
+    Returns an executable's facts, in exactly Task 5's shape (F13), reading build facts only from a verified file (D24).
+.DESCRIPTION
+    Fields: ExeName, RunPath, LocationClass, FileDescription, FileProductName, FileCompanyName,
+    FileVersion, ProductVersion, FactsVerified, Subsystem, MsiProductCode, PackageFamily,
+    IsServiceBinary, UserSid, and PathEvidence.
+    Path-level facts come from the path: RunPath, LocationClass ($null with no path), and
+    IsServiceBinary (the service map). The file is read once with Read-AUFile (timed outside the
+    allowlisted system folders). Build facts (version info, Subsystem, and the Windows Installer owner) are
+    filled in only when the file's PE TimeDateStamp and CheckSum equal the ExeInfo's both before
+    and after the version info is read; FactsVerified says so. When the build is unverified and the
+    file at the path is a PE image, PathEvidence holds that current file's CompanyName and
+    ProductName: identity evidence only, never the build's facts (D30). A read that timed out or was
+    skipped for a spent budget gives no facts and no PathEvidence. A Package entry reads no file: it
+    gets its PackageFamily from the ExeInfo text, and no path. Never throws.
+.PARAMETER Path
+    The Find-AUExePath path (verified, or the one observed path of an updated build), or $null.
+.PARAMETER ExeInfo
+    The ConvertFrom-AUExeInfo result for the entry.
+.PARAMETER MsiFileMap
+    Lowercased full path to the ProductCode of the Windows Installer product that owns it.
+.PARAMETER ServiceBinaries
+    Lowercased path to service name (Get-AUServiceBinaries).
+.PARAMETER UserSid
+    The entry's user SID (from the ledger key).
+.PARAMETER ExeInfoText
+    The SRUM ExeInfo string, for a Package entry's PackageFamily.
+.PARAMETER ReadBudget
+    The run's New-AUReadBudget result (Task 15 creates one per run and closes it in a finally
+    block), or $null for a budget for this call only.
+#>
+    param (
+        [string]$Path,
+        [pscustomobject]$ExeInfo,
+        [hashtable]$MsiFileMap,
+        [hashtable]$ServiceBinaries,
+        [string]$UserSid,
+        [string]$ExeInfoText,
+        [pscustomobject]$ReadBudget
+    )
+
+    $Kind = $null
+    $ExeName = $null
+    if ($null -ne $ExeInfo) { $Kind = [string]$ExeInfo.Kind; $ExeName = $ExeInfo.ExeName }
+    $RunPath = $null
+    if ($Kind -ne 'Package' -and -not [string]::IsNullOrWhiteSpace($Path)) { $RunPath = $Path.Trim() }
+
+    $Facts = [pscustomobject][ordered]@{
+        ExeName         = $ExeName
+        RunPath         = $RunPath
+        LocationClass   = $null
+        FileDescription = $null
+        FileProductName = $null
+        FileCompanyName = $null
+        FileVersion     = $null
+        ProductVersion  = $null
+        FactsVerified   = $false
+        Subsystem       = $null
+        MsiProductCode  = $null
+        PackageFamily   = $null
+        IsServiceBinary = $false
+        UserSid         = $UserSid
+        PathEvidence    = $null
+    }
+    if ($Kind -eq 'Package')
+    {
+        try { $Facts.PackageFamily = ConvertTo-AUPackageFamily $ExeInfoText } catch { $Facts.PackageFamily = $null }
+        return $Facts
+    }
+    if (-not $RunPath) { return $Facts }
+
+    $Text = { param ($Value) if ($null -eq $Value) { return $null }; return ([string]$Value).Trim() }
+    $Key = $RunPath.ToLowerInvariant()
+    $Facts.LocationClass = Get-AULocationClass $RunPath
+    if ($null -ne $ServiceBinaries -and $ServiceBinaries.ContainsKey($Key)) { $Facts.IsServiceBinary = $true }
+
+    $Read = Read-AUFile $RunPath -WithVersion -ReadBudget $ReadBudget
+    if ($Read.Status -ne 'OK' -or $null -eq $Read.Before) { return $Facts }
+    if ($Read.Error) { Write-CMTraceLog -Message "App Usage: couldn't read the version info of $($RunPath): $($Read.Error)" -Component 'AppUsage' -Type 2 }
+    $Info = $Read.Info
+    if ($null -eq $Info) { return $Facts }
+
+    # The file could be replaced while it's read; the facts count only if the build is there before and after.
+    if ((Test-AUFingerprintMatch $Read.Before $ExeInfo) -and (Test-AUFingerprintMatch $Read.After $ExeInfo))
+    {
+        $Facts.FileDescription = & $Text $Info.FileDescription
+        $Facts.FileProductName = & $Text $Info.ProductName
+        $Facts.FileCompanyName = & $Text $Info.CompanyName
+        $Facts.FileVersion = & $Text $Info.FileVersion
+        $Facts.ProductVersion = & $Text $Info.ProductVersion
+        $Facts.Subsystem = $Read.Before.Subsystem
+        if ($null -ne $MsiFileMap -and $MsiFileMap.ContainsKey($Key)) { $Facts.MsiProductCode = [string]$MsiFileMap[$Key] }
+        $Facts.FactsVerified = $true
+        return $Facts
+    }
+
+    # Unverified: the current file at this path gives identity evidence only (D30).
+    $Facts.PathEvidence = [pscustomobject][ordered]@{ CompanyName = & $Text $Info.CompanyName; ProductName = & $Text $Info.ProductName }
+    return $Facts
+}#endfunction
+
+function Get-AUServiceRecords
+{
+    <#
+.SYNOPSIS
+    Returns every Win32 service's Name and PathName. A separate function so tests can mock the WMI read.
+.DESCRIPTION
+    The query gives up after AUServiceQueryTimeoutSeconds (30) and throws, so a stuck WMI service
+    can't hang the run; Get-AUServiceBinaries then logs it and returns an empty map.
+#>
+    return @(Get-CimInstance -ClassName Win32_Service -Property Name, PathName -OperationTimeoutSec $script:AUServiceQueryTimeoutSeconds -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; PathName = [string]$_.PathName } })
+}#endfunction
+
+function Get-AUServiceDll
+{
+    <#
+.SYNOPSIS
+    Returns a service's Parameters\ServiceDll value, expanded, or $null. A separate function so tests can mock the registry read.
+.PARAMETER ServiceName
+    The service name.
+#>
+    param (
+        [string]$ServiceName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ServiceName) -or $ServiceName.IndexOfAny([char[]]@('\', '/')) -ge 0) { return $null }
+    $Base = Open-AURegistryBase -Hive Machine
+    $Key = $null
+    try
+    {
+        $Key = $Base.OpenSubKey("$script:AUServicesKey\$ServiceName\Parameters")
+        if ($null -eq $Key) { return $null }
+        $Value = Get-AURegistryValue -Key $Key -Name 'ServiceDll' -ProfilePath ''
+        if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { return $null }
+        return $Value
+    }
+    finally
+    {
+        if ($null -ne $Key) { $Key.Close() }
+        $Base.Close()
+    }
+}#endfunction
+
+function ConvertTo-AUServiceFile
+{
+    <#
+.SYNOPSIS
+    Returns the file a service's PathName or ServiceDll names, as a drive-letter path, or $null.
+.DESCRIPTION
+    Machine environment variables are expanded; a quoted path is taken whole, an unquoted one up to
+    its .exe or .dll, so arguments are dropped (Get-AUCommandFile). A \??\ prefix is removed and
+    \SystemRoot\ becomes the Windows folder. Anything that isn't then a drive-letter path gives $null.
+.PARAMETER Command
+    The PathName or ServiceDll value.
+#>
+    param (
+        [string]$Command
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
+    $File = Get-AUCommandFile (Expand-AUEnvironmentText -Text $Command.Trim() -ProfilePath '')
+    if (-not $File) { return $null }
+    $File = $File.Trim()
+    if ($File.StartsWith('\??\')) { $File = $File.Substring(4) }
+    if ($File -match '^\\SystemRoot\\') { $File = [Environment]::GetEnvironmentVariable('SystemRoot') + $File.Substring(11) }
+    if ($File -notmatch '^[A-Za-z]:\\') { return $null }
+    return $File
+}#endfunction
+
+function Get-AUServiceBinaries
+{
+    <#
+.SYNOPSIS
+    Returns the files Windows services run: lowercased path to service name (F36).
+.DESCRIPTION
+    From each Win32_Service PathName, quoted or unquoted, with its arguments dropped. A service
+    hosted by svchost.exe maps through its Parameters\ServiceDll value instead, or is left out when
+    it has none. When two services run the same file, the first by name keeps it. Read once per run;
+    Task 15 passes the result to Get-AUExeFacts. An unreadable service list gives an empty map and is
+    logged. Never throws.
+#>
+    $Map = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+    try { $Services = @(Get-AUServiceRecords) }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't list the services; no executable counts as a service binary: $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        return $Map
+    }
+
+    $Order = @($Services | Where-Object { $null -ne $_ } | Sort-Object -Property @{ Expression = { [string]$_.Name } })
+    $Hosted = 0
+    foreach ($Service in $Order)
+    {
+        $Name = ([string]$Service.Name).Trim()
+        if (-not $Name) { continue }
+        $File = $null
+        try
+        {
+            $File = ConvertTo-AUServiceFile ([string]$Service.PathName)
+            if ($File -and [string]::Equals([IO.Path]::GetFileName($File), 'svchost.exe', [StringComparison]::OrdinalIgnoreCase))
+            {
+                $File = ConvertTo-AUServiceFile (Get-AUServiceDll $Name)
+                if ($File) { $Hosted++ }
+            }
+        }
+        catch { $File = $null }
+        if (-not $File) { continue }
+        $Key = $File.ToLowerInvariant()
+        if (-not $Map.ContainsKey($Key)) { $Map[$Key] = $Name }
+    }
+    Write-CMTraceLog -Message "App Usage: $($Map.Count) service binaries from $($Order.Count) services ($Hosted hosted by svchost.exe)." -Component 'AppUsage'
+    return $Map
+}#endfunction
+
 # All-profile discovery and the inventory list (Task 13). App Usage reads HKEY_USERS through .NET
 # registry keys and its own AU_<SID> mount names, never a PSDrive named HKU (F34): the D36 fallback,
 # Get-InstalledApplications, mounts and removes that drive.
