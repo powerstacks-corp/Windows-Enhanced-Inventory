@@ -721,7 +721,7 @@ Describe 'Invoke-AppUsage results' {
         $Result.Status | Should -BeExactly 'OK'
         @($Result.DeviceColumns.Keys) | Should -Be @('AppUsageEnabled_b', 'WatchingSince_t', 'AppUsageScriptVersion_s', 'MappingsVersion_s', 'CustomerMappingsHash_s',
             'UnmatchedExeCount_d', 'ProfilesFound_d', 'ProfilesRead_d', 'AppUsageCollectionStatus_s')
-        $Result.DeviceColumns['AppUsageScriptVersion_s'] | Should -BeExactly '20 - test'
+        $Result.DeviceColumns['AppUsageScriptVersion_s'] | Should -BeExactly '20'
         $Result.DeviceColumns['MappingsVersion_s'] | Should -BeExactly '2026.11.22.9'
         $Result.DeviceColumns['CustomerMappingsHash_s'] | Should -Match '^[0-9a-f]{64}$'
         $Result.DeviceColumns['WatchingSince_t'] | Should -BeExactly '2026-10-01T08:00:00.0000000Z'
@@ -730,6 +730,18 @@ Describe 'Invoke-AppUsage results' {
         $Result.LedgerPath | Should -BeExactly $script:LedgerPath
         $Result.OutboxPath | Should -Match 'AppUsage_TESTSERIAL_outbox$'
         foreach ($Stage in @('Snapshot', 'Discovery', 'LedgerRead', 'SrumRead', 'Merge', 'Facts', 'Aggregation', 'LedgerWrite', 'Total')) { $Result.Timings.Contains($Stage) | Should -BeTrue -Because $Stage }
+    }
+
+    It 'sends the leading number of the script version, <Expected>, for <Version> (plan Task 23)' -ForEach @(
+        @{ Version = '19 - August 10, 2026'; Expected = '19' }
+        @{ Version = '20 - test'; Expected = '20' }
+        @{ Version = ' 20'; Expected = '20' }
+        @{ Version = '120-beta'; Expected = '120' }
+        @{ Version = 'clm'; Expected = 'clm' }
+        @{ Version = ''; Expected = '' }
+    ) {
+        $Columns = New-AUDeviceColumns -Result (New-AUFailedResult -RunId $script:Run -LogAPIMode 'LogIngestionAPI' -ScriptVersion $Version) -LogAPIMode 'LogIngestionAPI' -ScriptVersion $Version
+        $Columns['AppUsageScriptVersion_s'] | Should -BeExactly $Expected
     }
 
     It 'names the device columns without suffixes for the classic API' {

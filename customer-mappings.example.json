@@ -28,7 +28,7 @@
       {
         "id": "c-ignore-kiosk-1",
         "type": "ignore",
-        "description": "Not an app: the kiosk shell that starts at sign-in.",
+        "description": "Not an app: the kiosk shell that starts at sign-in. An ignored exe never counts as use of an app, and is not one of its app's known exes, so an app whose only exe is ignored reads NotCovered, never NotUsed.",
         "when": { "exeName": "contosokiosk.exe" }
       },
       {

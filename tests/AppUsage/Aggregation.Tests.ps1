@@ -474,6 +474,279 @@ Describe 'Get-AUAppUsage known exe that ran unmatched (D30)' {
     }
 }
 
+Describe 'Get-AUAppUsage with the shipped and example rules (final review A)' {
+    BeforeAll {
+        $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+        $script:Shipped = Get-AUMappings -Embedded '' -BesideDir $RepoRoot -CustomerPath (Join-Path $TestDrive 'no-customer-mappings.json')
+        # The example customer file, loaded as the customer file through the real loader.
+        $script:WithExample = Get-AUMappings -Embedded '' -BesideDir $RepoRoot -CustomerPath (Join-Path $RepoRoot 'customer-mappings.example.json')
+        $script:Stable = New-TestApp 'Microsoft Visual Studio Code (User)' 'Microsoft Corporation' @{ Scope = $script:UserA; InstallLocation = 'C:\Users\a\AppData\Local\Programs\Microsoft VS Code\' }
+        $script:Insiders = New-TestApp 'Microsoft Visual Studio Code - Insiders (User)' 'Microsoft Corporation' @{ Scope = $script:UserA; InstallLocation = 'C:\Users\a\AppData\Local\Programs\Microsoft VS Code Insiders\' }
+
+        # An entry user A used today, matched and classified the way Invoke-AppUsage does it.
+        function New-TestRuleEntry([pscustomobject]$Facts, [object[]]$Apps, [pscustomobject]$Mappings = $script:Shipped)
+        {
+            $Identity = Resolve-AUIdentity -Facts $Facts -Mappings $Mappings -InstalledApps $Apps
+            $Target = Resolve-AUTarget -Identity $Identity -StoredTarget $null -Mappings $Mappings
+            $Classification = Get-AUClassification -Facts $Facts -Mappings $Mappings -MatchSection $Target.MatchSection
+            $Role = Get-AURole -Facts $Facts -Target $Target -Classification $Classification -InstalledApps $Apps
+            $Exe = [string]$Facts.ExeName
+            return New-TestUsedEntry $script:Today @{ ExeInfo = "!!$Exe!2026/11/01:00:00:00!1a2b!"; ExeName = $Exe; Facts = $Facts; FactsVerified = $Facts.FactsVerified; Target = $Target; Classification = $Classification; Role = $Role }
+        }
+
+        function New-TestCodeFacts([string]$Exe, [string]$Folder, [string]$Product)
+        {
+            $Path = "C:\Users\a\AppData\Local\Programs\$Folder\$Exe"
+            return New-TestFacts @{ ExeName = $Exe; RunPath = $Path; LocationClass = (Get-AULocationClass $Path); FileDescription = $Product; FileProductName = $Product; FileCompanyName = 'Microsoft Corporation'; FileVersion = '1.96.0'; ProductVersion = '1.96.0' }
+        }
+
+        function Get-TestRuleUsage([object[]]$Entries, [object[]]$Apps, [hashtable]$MsiFileMap = @{}, [pscustomobject]$Mappings = $script:Shipped)
+        {
+            $Known = Get-AUKnownExes $Apps $MsiFileMap $Mappings $Entries
+            return Invoke-TestAppUsage -Entries $Entries -Apps $Apps -Known $Known
+        }
+    }
+
+    It 'reports VS Code Insiders Used, never NotUsed, when it is the only VS Code and in daily use (Critical 1)' {
+        $apps = @($script:Insiders)
+        $insiders = New-TestRuleEntry (New-TestCodeFacts 'Code - Insiders.exe' 'Microsoft VS Code Insiders' 'Visual Studio Code - Insiders') $apps
+        $insiders.Target.MatchRuleId | Should -BeExactly 'ps-vscode-insiders-1'
+        (Get-TestRuleUsage @($insiders) $apps)[$script:Insiders.DisplayName].AppUsageStatus | Should -BeExactly 'Used'
+    }
+
+    It 'credits stable VS Code and Insiders each with their own use when both are installed' {
+        $apps = @($script:Stable, $script:Insiders)
+        $stable = New-TestRuleEntry (New-TestCodeFacts 'Code.exe' 'Microsoft VS Code' 'Visual Studio Code') $apps
+        $insiders = New-TestRuleEntry (New-TestCodeFacts 'Code - Insiders.exe' 'Microsoft VS Code Insiders' 'Visual Studio Code - Insiders') $apps
+        $stable.Target.ResolvedAppName | Should -BeExactly $script:Stable.DisplayName
+        $insiders.Target.ResolvedAppName | Should -BeExactly $script:Insiders.DisplayName
+        $onlyInsiders = Get-TestRuleUsage @($insiders) $apps
+        $onlyInsiders[$script:Insiders.DisplayName].AppUsageStatus | Should -BeExactly 'Used'
+        $onlyInsiders[$script:Stable.DisplayName].AppUsageStatus | Should -BeExactly 'NotUsed'
+        $onlyStable = Get-TestRuleUsage @($stable) $apps
+        $onlyStable[$script:Stable.DisplayName].AppUsageStatus | Should -BeExactly 'Used'
+        $onlyStable[$script:Insiders.DisplayName].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'is Ambiguous, never NotUsed, for Office 2016 (MSI) when an unverified Word build is matched to Microsoft 365 Apps, which is not installed (A2)' {
+        $code = '{90160000-0011-0000-1000-0000000FF1CE}'
+        $apps = @((New-TestApp 'Microsoft Office Professional Plus 2016' 'Microsoft Corporation' @{ ProductCode = $code; InstallLocation = 'C:\Program Files\Microsoft Office\' }))
+        $facts = New-TestFacts @{ ExeName = 'WINWORD.EXE'; RunPath = 'C:\Program Files\Microsoft Office\Office16\WINWORD.EXE'; FactsVerified = $false; FileCompanyName = $null; FileProductName = $null; FileDescription = $null; FileVersion = $null; ProductVersion = $null; PathEvidence = [pscustomobject]@{ CompanyName = 'Microsoft Corporation'; ProductName = 'Microsoft Office' } }
+        $word = New-TestRuleEntry $facts $apps
+        $word.Target.MatchRuleId | Should -BeExactly 'ps-m365apps-1'
+        $usage = Get-TestRuleUsage @($word) $apps @{ 'c:\program files\microsoft office\office16\winword.exe' = $code }
+        $usage['Microsoft Office Professional Plus 2016'].AppUsageStatus | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'is NotCovered, never NotUsed, for Office LTSC 2021 when Word is matched to Microsoft 365 Apps, which is not installed (A2)' {
+        $apps = @((New-TestApp 'Microsoft Office LTSC Professional Plus 2021 - en-us' 'Microsoft Corporation' @{ InstallLocation = 'C:\Program Files\Microsoft Office' }))
+        $facts = New-TestFacts @{ ExeName = 'WINWORD.EXE'; RunPath = 'C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE'; FileCompanyName = 'Microsoft Corporation'; FileProductName = 'Microsoft Office'; FileDescription = 'Microsoft Word'; FileVersion = '16.0.14332.20800'; ProductVersion = '16.0.14332.20800' }
+        $word = New-TestRuleEntry $facts $apps
+        $usage = Get-TestRuleUsage @($word) $apps
+        $usage['Microsoft Office LTSC Professional Plus 2021 - en-us'].AppUsageStatus | Should -BeExactly 'NotCovered'
+    }
+
+    It 'keeps Microsoft 365 Apps NotUsed when only OfficeClickToRun.exe ran as SYSTEM and sdxhelper.exe ran in the background from the Office folder (re-review)' {
+        $c2r = 'C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe'
+        $apps = @((New-TestApp 'Microsoft 365 Apps for enterprise - en-us' 'Microsoft Corporation' @{ InstallLocation = 'C:\Program Files\Microsoft Office'; DisplayIcon = $c2r; UninstallString = ('"' + $c2r + '" scenario=install scenariosubtype=ARP sourcetype=None productstoremove=O365ProPlusRetail.16_en-us_x-none culture=en-us version.16=16.0') }))
+        $service = New-TestEntry @{ UserSid = $script:SystemSid; UserType = 'System'; ExeInfo = '!!officeclicktorun.exe!2026/11/01:00:00:00!0c2r!'; ExeName = 'officeclicktorun.exe'; Role = 'Unmatched'; InstallStatus = 'Unmatched'; Target = (New-TestUnresolved); LastRanTime = $script:Today; Facts = (New-TestFacts @{ ExeName = 'officeclicktorun.exe'; RunPath = $c2r; FileCompanyName = 'Microsoft Corporation'; FileProductName = 'Microsoft Office'; FileDescription = 'Microsoft Office Click-to-Run (SxS)'; IsServiceBinary = $true }) }
+        $helper = New-TestEntry @{ ExeInfo = '!!sdxhelper.exe!2026/11/01:00:00:00!5d01!'; ExeName = 'sdxhelper.exe'; Role = 'Unmatched'; InstallStatus = 'Unmatched'; Target = (New-TestUnresolved); LastRanTime = $script:Today; LastInteractiveRunTime = $script:Today; Facts = (New-TestFacts @{ ExeName = 'sdxhelper.exe'; RunPath = 'C:\Program Files\Microsoft Office\root\Office16\sdxhelper.exe'; FileCompanyName = 'Microsoft Corporation'; FileProductName = 'Microsoft Office'; FileDescription = 'Microsoft Office SdxHelper' }) }
+        $usage = Get-TestRuleUsage @($service, $helper) $apps
+        $usage['Microsoft 365 Apps for enterprise - en-us'].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'still reports the review A sibling case Ambiguous: an Insiders build no rule matches, used from its install folder (re-review)' {
+        $apps = @($script:Stable, $script:Insiders)
+        $facts = New-TestCodeFacts 'Insiders Launcher.exe' 'Microsoft VS Code Insiders' 'Visual Studio Code - Insiders'
+        $facts.FactsVerified = $false; $facts.FileCompanyName = $null; $facts.FileProductName = $null; $facts.FileDescription = $null
+        $insiders = New-TestRuleEntry $facts $apps
+        $insiders.Target.MatchSection | Should -BeExactly 'None'
+        (Get-TestRuleUsage @($insiders) $apps)[$script:Insiders.DisplayName].AppUsageStatus | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'is NotCovered, never NotUsed, for an app whose only known exe the example file ignores, while that exe runs all day (A4)' {
+        $code = '{11111111-2222-3333-4444-555555555555}'
+        $apps = @((New-TestApp 'Contoso Kiosk' 'Contoso Ltd.' @{ ProductCode = $code; InstallLocation = 'C:\Program Files\Contoso\Kiosk\' }))
+        $facts = New-TestFacts @{ ExeName = 'contosokiosk.exe'; RunPath = 'C:\Program Files\Contoso\Kiosk\contosokiosk.exe'; FileCompanyName = 'Contoso Ltd.'; FileProductName = 'Contoso Kiosk'; FileDescription = 'Contoso Kiosk'; FileVersion = '3.1.0'; ProductVersion = '3.1.0'; MsiProductCode = $code }
+        $kiosk = New-TestRuleEntry $facts $apps $script:WithExample
+        $kiosk.Classification.IgnoreRuleId | Should -BeExactly 'c-ignore-kiosk-1'
+        $usage = Get-TestRuleUsage @($kiosk) $apps @{ 'c:\program files\contoso\kiosk\contosokiosk.exe' = $code } $script:WithExample
+        $usage['Contoso Kiosk'].AppUsageStatus | Should -BeExactly 'NotCovered'
+    }
+}
+
+Describe 'Get-AUAppUsage siblings under a target pattern that matches several apps (final review A, A1)' {
+    BeforeAll {
+        # The docs' example: one rule names alpha.exe with a Contoso* target, so both apps know alpha.exe.
+        $script:SiblingMappings = New-TestMappings @('{ "id": "ps-contoso-all", "type": "identity", "when": { "exeName": "alpha.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso*", "publisher": "Contoso*" } }')
+        $script:SiblingApps = @(
+            (New-TestApp 'Contoso Alpha' 'Contoso' @{ InstallLocation = 'C:\Program Files\Contoso\Alpha\' })
+            (New-TestApp 'Contoso Beta' 'Contoso' @{ InstallLocation = 'C:\Program Files\Contoso\Beta' })
+        )
+        $script:AlphaRun = New-TestUsedEntry $script:Today @{ Target = (New-TestTarget 'Contoso Alpha' @{ TargetPattern = 'Contoso*'; MatchRuleId = 'ps-resolve-path' }) }
+        function New-TestBetaRun([string]$RunPath = 'C:\Program Files\Contoso\Beta\bin\beta.exe', [hashtable]$Values = @{})
+        {
+            $Base = @{ ExeInfo = '!!beta.exe!2026/11/01:00:00:00!b1b1!'; ExeName = 'beta.exe'; Role = 'Unmatched'; InstallStatus = 'Unmatched'; Target = (New-TestUnresolved); Facts = (New-TestFacts @{ ExeName = 'beta.exe'; RunPath = $RunPath; FileProductName = 'Beta'; FileDescription = 'Beta' }) }
+            foreach ($Key in $Values.Keys) { $Base[$Key] = $Values[$Key] }
+            return New-TestUsedEntry $script:Today $Base
+        }
+        function Get-TestSiblingStatus([object[]]$Entries)
+        {
+            $Known = Get-AUKnownExes $script:SiblingApps @{} $script:SiblingMappings $Entries
+            return (Invoke-TestAppUsage -Entries $Entries -Apps $script:SiblingApps -Known $Known)['Contoso Beta'].AppUsageStatus
+        }
+    }
+
+    It 'is Ambiguous, never NotUsed, for the sibling when an unmatched exe ran from inside its install folder' {
+        Get-TestSiblingStatus @($script:AlphaRun, (New-TestBetaRun)) | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'compares the install folder ignoring case, and uses InstallLocation only, not the DisplayIcon or UninstallString folder (re-review)' {
+        Get-TestSiblingStatus @($script:AlphaRun, (New-TestBetaRun 'c:\PROGRAM FILES\contoso\beta\beta.exe')) | Should -BeExactly 'Ambiguous'
+        $script:SiblingApps[1].InstallLocation = $null
+        $script:SiblingApps[1].DisplayIcon = '"C:\Program Files\Contoso\Beta\beta.exe",0'
+        $script:SiblingApps[1].UninstallString = '"C:\Program Files\Contoso\Beta\uninstall.exe" /x'
+        try { Get-TestSiblingStatus @($script:AlphaRun, (New-TestBetaRun)) | Should -BeExactly 'NotUsed' }
+        finally { $script:SiblingApps[1].InstallLocation = 'C:\Program Files\Contoso\Beta'; $script:SiblingApps[1].DisplayIcon = $null; $script:SiblingApps[1].UninstallString = $null }
+    }
+
+    It 'counts only an unmatched exe with credited use: one that ran only in the background, or only as SYSTEM, leaves NotUsed (re-review)' {
+        $background = New-TestBetaRun -Values @{ LastFocusOrInputTime = $null; FocusTotal = [double]0 }
+        $system = New-TestBetaRun -Values @{ UserSid = $script:SystemSid; UserType = 'System' }
+        foreach ($Entry in @($background, $system))
+        {
+            Get-TestSiblingStatus @($script:AlphaRun, $Entry) | Should -BeExactly 'NotUsed' -Because $Entry.UserType
+        }
+    }
+
+    It 'never treats a broad root as an install folder: <Root> (re-review)' -ForEach @(
+        @{ Root = 'C:\Program Files\'; Run = 'C:\Program Files\SomeVendor\tool.exe' }
+        @{ Root = 'c:\program files'; Run = 'C:\Program Files\SomeVendor\tool.exe' }
+        @{ Root = 'C:\Program Files (x86)\'; Run = 'C:\Program Files (x86)\SomeVendor\tool.exe' }
+        @{ Root = 'C:\ProgramData'; Run = 'C:\ProgramData\SomeVendor\tool.exe' }
+        @{ Root = 'C:\Windows\'; Run = 'C:\Windows\System32\tool.exe' }
+        @{ Root = 'C:\Users'; Run = 'C:\Users\alice\Downloads\tool.exe' }
+        @{ Root = 'C:\Users\alice\'; Run = 'C:\Users\alice\Downloads\tool.exe' }
+        @{ Root = 'C:\Users\alice\AppData\Local\Programs\\'; Run = 'C:\Users\alice\AppData\Local\Programs\Other\tool.exe' }
+        @{ Root = 'D:\'; Run = 'D:\Tools\tool.exe' }
+    ) {
+        $code = '{55555555-5555-5555-5555-555555555555}'
+        $apps = @((New-TestApp 'Fabrikam Legacy Tool' 'Fabrikam' @{ ProductCode = $code; InstallLocation = $Root }))
+        $tool = New-TestBetaRun $Run -Values @{ ExeName = 'tool.exe'; ExeInfo = '!!tool.exe!2026/11/01:00:00:00!f1f1!' }
+        $known = Get-AUKnownExes $apps @{ 'c:\program files\fabrikam\legacy.exe' = $code } $null @($tool)
+        (Invoke-TestAppUsage -Entries @($tool) -Apps $apps -Known $known)['Fabrikam Legacy Tool'].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'stays NotUsed when the unmatched exe ran outside the folder, before WatchingSince, or is ignored' {
+        $old = (New-TestUtc '2026-09-01T00:00:00')
+        $outside = New-TestBetaRun 'C:\Program Files\Contoso\Betamax\beta.exe'
+        $early = New-TestBetaRun -Values @{ LastRanTime = $old; LastFocusOrInputTime = $old; LastInteractiveRunTime = $old }
+        $ignored = New-TestBetaRun -Values @{ Classification = (New-TestClassification 'ps-ignore-1') }
+        foreach ($Entry in @($outside, $early, $ignored))
+        {
+            Get-TestSiblingStatus @($script:AlphaRun, $Entry) | Should -BeExactly 'NotUsed' -Because $Entry.Facts.RunPath
+        }
+    }
+
+    It 'stays NotCovered, not Ambiguous, for an app with no known exe when an unmatched exe ran from its folder' {
+        $apps = @((New-TestApp 'Contoso Gamma' 'Contoso' @{ InstallLocation = 'C:\Program Files\Contoso\Gamma\' }))
+        $run = New-TestBetaRun 'C:\Program Files\Contoso\Gamma\gamma.exe'
+        (Invoke-TestAppUsage -Entries @($run) -Apps $apps -Known (New-TestKnown @{}))['Contoso Gamma'].AppUsageStatus | Should -BeExactly 'NotCovered'
+    }
+
+    It 'keeps a matched exe from another app out of the folder check' {
+        $other = New-TestUsedEntry $script:Today @{ ExeInfo = '!!tool.exe!2026/11/01:00:00:00!c1c1!'; ExeName = 'tool.exe'; Target = (New-TestTarget 'Contoso Alpha'); Facts = (New-TestFacts @{ ExeName = 'tool.exe'; RunPath = 'C:\Program Files\Contoso\Beta\tool.exe' }) }
+        Get-TestSiblingStatus @($script:AlphaRun, $other) | Should -BeExactly 'NotUsed'
+    }
+}
+
+Describe 'Get-AUAppUsage exes matched to a target that is not installed (final review A, A2)' {
+    BeforeAll {
+        $script:SuiteCode = '{33333333-3333-3333-3333-333333333333}'
+        $script:SuiteApps = @((New-TestApp 'Contoso Suite 2016' 'Contoso' @{ ProductCode = $script:SuiteCode }))
+        $script:SuiteMsi = @{ 'c:\program files\contoso\suite\writer.exe' = $script:SuiteCode }
+        function New-TestAbsentTargetRun([hashtable]$Values = @{})
+        {
+            $Target = New-TestTarget 'Contoso Cloud Suite' @{ TargetPattern = 'Contoso Cloud Suite*'; ResolvedAppName = $null }
+            $Base = @{ ExeInfo = '!!writer.exe!2026/11/01:00:00:00!d1d1!'; ExeName = 'writer.exe'; Target = $Target; InstallStatus = 'NotInstalled'; Facts = (New-TestFacts @{ ExeName = 'writer.exe'; RunPath = 'D:\Elsewhere\writer.exe' }) }
+            foreach ($Key in $Values.Keys) { $Base[$Key] = $Values[$Key] }
+            return New-TestUsedEntry $script:Today $Base
+        }
+        function Get-TestSuiteStatus([object[]]$Entries)
+        {
+            $Known = Get-AUKnownExes $script:SuiteApps $script:SuiteMsi $null $Entries
+            return (Invoke-TestAppUsage -Entries $Entries -Apps $script:SuiteApps -Known $Known)['Contoso Suite 2016'].AppUsageStatus
+        }
+    }
+
+    It 'is Ambiguous, never NotUsed, when an exe with one of the app''s known names ran matched to an app that is not installed' {
+        Get-TestSuiteStatus @((New-TestAbsentTargetRun)) | Should -BeExactly 'Ambiguous'
+    }
+
+    It 'is Ambiguous when that exe ran from inside the app''s install folder, whatever its name' {
+        $script:SuiteApps[0].InstallLocation = 'C:\Program Files\Contoso\Suite\'
+        try { Get-TestSuiteStatus @((New-TestAbsentTargetRun @{ ExeName = 'cloudhelper.exe'; ExeInfo = '!!cloudhelper.exe!2026/11/01:00:00:00!d2d2!'; Facts = (New-TestFacts @{ ExeName = 'cloudhelper.exe'; RunPath = 'C:\Program Files\Contoso\Suite\cloudhelper.exe' }) })) | Should -BeExactly 'Ambiguous' }
+        finally { $script:SuiteApps[0].InstallLocation = $null }
+    }
+
+    It 'stays NotUsed when that exe ran before WatchingSince, or when its target is installed' {
+        $old = (New-TestUtc '2026-09-01T00:00:00')
+        Get-TestSuiteStatus @((New-TestAbsentTargetRun @{ LastRanTime = $old; LastFocusOrInputTime = $old; LastInteractiveRunTime = $old })) | Should -BeExactly 'NotUsed'
+        $apps = @($script:SuiteApps[0], (New-TestApp 'Contoso Cloud Suite' 'Contoso'))
+        $run = New-TestAbsentTargetRun @{ Target = (New-TestTarget 'Contoso Cloud Suite' @{ TargetPattern = 'Contoso Cloud Suite*' }); InstallStatus = 'Installed' }
+        $known = Get-AUKnownExes $apps $script:SuiteMsi $null @($run)
+        $result = Invoke-TestAppUsage -Entries @($run) -Apps $apps -Known $known
+        $result['Contoso Suite 2016'].AppUsageStatus | Should -BeExactly 'NotUsed'
+        $result['Contoso Cloud Suite'].AppUsageStatus | Should -BeExactly 'Used'
+    }
+}
+
+Describe 'Get-AUKnownExes and ignored executables (final review A, A4)' {
+    BeforeAll {
+        $script:KioskCode = '{44444444-4444-4444-4444-444444444444}'
+        $script:KioskApps = @((New-TestApp 'Contoso Kiosk' 'Contoso' @{ ProductCode = $script:KioskCode }))
+        $script:KioskMsi = @{ 'c:\program files\contoso\kiosk\kiosk.exe' = $script:KioskCode; 'c:\program files\contoso\kiosk\kioskadmin.exe' = $script:KioskCode }
+        $script:KioskIgnore = New-TestClassification 'c-ignore-kiosk-1'
+        function New-TestKioskRun([string]$Exe = 'kiosk.exe', [hashtable]$Values = @{})
+        {
+            $Base = @{ ExeInfo = "!!$Exe!2026/11/01:00:00:00!e1e1!"; ExeName = $Exe; Target = (New-TestTarget 'Contoso Kiosk' @{ RuleType = 'ownership'; MatchRuleId = 'ps-own-msi'; InstalledStateDependent = $true }); Classification = $script:KioskIgnore; Facts = (New-TestFacts @{ ExeName = $Exe }) }
+            foreach ($Key in $Values.Keys) { $Base[$Key] = $Values[$Key] }
+            return New-TestUsedEntry $script:Today $Base
+        }
+    }
+
+    It 'leaves an ignored exe out of the app''s Windows Installer exes, so the app is NotCovered when it was the only one' {
+        $msi = @{ 'c:\program files\contoso\kiosk\kiosk.exe' = $script:KioskCode }
+        $run = New-TestKioskRun
+        $known = Get-AUKnownExes $script:KioskApps $msi $null @($run)
+        $known.ContainsKey('Contoso Kiosk') | Should -BeFalse
+        (Invoke-TestAppUsage -Entries @($run) -Apps $script:KioskApps -Known $known)['Contoso Kiosk'].AppUsageStatus | Should -BeExactly 'NotCovered'
+    }
+
+    It 'keeps the app''s other known exes, so it is NotUsed only on those' {
+        $run = New-TestKioskRun
+        $known = Get-AUKnownExes $script:KioskApps $script:KioskMsi $null @($run)
+        @($known['Contoso Kiosk']) | Should -Be @('kioskadmin.exe')
+        (Invoke-TestAppUsage -Entries @($run) -Apps $script:KioskApps -Known $known)['Contoso Kiosk'].AppUsageStatus | Should -BeExactly 'NotUsed'
+    }
+
+    It 'leaves an ignored exe out of the exes an identity rule names, a wildcard exeName included' {
+        $mappings = New-TestMappings @(
+            '{ "id": "ps-kiosk-1", "type": "identity", "when": { "exeName": "kiosk.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso Kiosk", "publisher": "Contoso*" } }'
+            '{ "id": "ps-kiosk-2", "type": "identity", "when": { "exeName": "kiosk*.exe", "publisher": "Contoso*" }, "target": { "displayName": "Contoso Kiosk", "publisher": "Contoso*" } }'
+        )
+        $run = New-TestKioskRun
+        (Get-AUKnownExes $script:KioskApps @{} $mappings @($run)).ContainsKey('Contoso Kiosk') | Should -BeFalse
+        (Get-AUKnownExes $script:KioskApps @{} $mappings @()).ContainsKey('Contoso Kiosk') | Should -BeTrue
+    }
+
+    It 'keeps an exe known when a build of it that is not ignored was matched to the app' {
+        $ignored = New-TestKioskRun
+        $plain = New-TestKioskRun -Values @{ ExeInfo = '!!kiosk.exe!2026/11/02:00:00:00!e2e2!'; Classification = (New-TestClassification) }
+        @((Get-AUKnownExes $script:KioskApps $script:KioskMsi $null @($ignored, $plain))['Contoso Kiosk'] | Sort-Object) | Should -Be @('kiosk.exe', 'kioskadmin.exe')
+    }
+}
+
 Describe 'Get-AUAppUsage coverage (D32, F24)' {
     It 'is blank, not NotUsed, when the per-user scope holding the app is <State>' -ForEach @(
         @{ State = 'Unread' }, @{ State = 'Deleted' }

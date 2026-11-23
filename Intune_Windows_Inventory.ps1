@@ -3197,6 +3197,34 @@ function Get-AUAppFolders
     return , $Folders.ToArray()
 }#endfunction
 
+function Get-AUOwnInstallFolder
+{
+    <#
+.SYNOPSIS
+    Returns an installed app's InstallLocation as a folder ending with \, or $null when it's blank,
+    not rooted, or a broad root.
+.DESCRIPTION
+    For Get-AUAppUsage's install-folder check, which must not take a shared folder for the app's
+    own: only InstallLocation counts (a DisplayIcon or UninstallString folder can be a shared
+    updater's, such as Click-to-Run's), and a broad root never does: a drive root, Program Files,
+    Program Files (x86), ProgramData, Windows, Users, a user profile root (Users\<name>), and a
+    user's AppData\Local\Programs, on any drive. Compared ignoring case, with trailing \ trimmed.
+.PARAMETER App
+    The installed-app entry.
+#>
+    param (
+        [pscustomobject]$App
+    )
+
+    $Folder = ([string]$App.InstallLocation).Trim().Trim('"').Replace('/', '\').TrimEnd('\')
+    if ($Folder -notmatch '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)\\[^\\]') { return $null }
+    if ($Folder -match $script:AUBroadInstallRoot) { return $null }
+    return $Folder + '\'
+}#endfunction
+
+# Folders that hold many apps, never one app's install folder (Get-AUOwnInstallFolder). -match ignores case.
+$script:AUBroadInstallRoot = '^[A-Za-z]:\\(Program Files|Program Files \(x86\)|ProgramData|Windows|Users(\\[^\\]+(\\AppData\\Local\\Programs)?)?)$'
+
 function Select-AUCandidate
 {
     <#
@@ -4641,7 +4669,8 @@ function Read-AULedger
     A missing file gives an empty ledger. A file that can't be read or parsed, or isn't a ledger of
     this schema, is moved aside (Move-AUUnreadableLedger) and never overwritten; the ledger starts
     empty, so it's rebuilt from SRUM, and Status holds LedgerReset. If the file can't be moved aside,
-    Writable is false and Write-AULedger leaves it alone. Dates come back as Utc dates. Never throws.
+    Writable is false and Write-AULedger leaves it alone. The log line names only the reason, the
+    exception type, and counts, never the file's text (D18). Dates come back as Utc dates. Never throws.
 .PARAMETER Path
     The ledger path, C:\Windows\AppUsage_<Serial>.json.
 #>
@@ -4651,26 +4680,45 @@ function Read-AULedger
 
     $Ledger = New-AULedger
     if (-not [IO.File]::Exists($Path)) { return $Ledger }
+    # The log line gives only the reason and counts: the exception text can quote the file, which holds
+    # other users' exe paths (D18).
+    $Reason = $null
+    $Characters = 0
+    $Number = 0
+    $Total = 0
     try
     {
+        $Reason = "the file couldn't be read"
         $Text = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+        $Characters = $Text.Length
+        $Reason = "it isn't valid JSON"
         $Data = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
+        $Reason = "it isn't a ledger"
         if ($null -eq $Data -or $Data -isnot [pscustomobject] -or $null -eq $Data.PSObject.Properties['Entries']) { throw 'The file is not a ledger.' }
-        if ($Data.SchemaVersion -ne $script:AULedgerSchemaVersion) { throw "Ledger schema version '$($Data.SchemaVersion)' isn't $($script:AULedgerSchemaVersion)." }
+        $Reason = "its schema version isn't $($script:AULedgerSchemaVersion)"
+        if ($Data.SchemaVersion -ne $script:AULedgerSchemaVersion) { throw 'The ledger schema version is different.' }
+        $Reason = "its WatchingSince date isn't valid"
         $Ledger.WatchingSince = ConvertFrom-AULedgerDate $Data.WatchingSince
-        foreach ($Record in @($Data.Entries))
+        $Records = @($Data.Entries)
+        $Total = $Records.Count
+        foreach ($Record in $Records)
         {
+            $Number++
             if ($null -eq $Record) { continue }
+            $Reason = "entry $Number of $Total isn't valid"
             $Entry = ConvertFrom-AULedgerRecord $Record
             $Key = "$($Entry.UserSid)|$($Entry.ExeInfo)"
-            if ($Ledger.Entries.ContainsKey($Key)) { throw "Ledger entry $Key appears twice." }
+            $Reason = "entry $Number of $Total repeats an earlier one"
+            if ($Ledger.Entries.ContainsKey($Key)) { throw 'A ledger entry appears twice.' }
             $Ledger.Entries[$Key] = $Entry
         }
         return $Ledger
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: the ledger $Path is unreadable, so it's rebuilt from SRUM: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
+        $Type = 'error'
+        try { $Type = $_.Exception.GetType().Name } catch { }
+        Write-CMTraceLog -Message "App Usage: the ledger $Path is unreadable ($Reason; $Type; $Characters characters), so it's rebuilt from SRUM." -Component 'AppUsage' -Type 3
         $Ledger = New-AULedger
         $Ledger.Status = [string[]]@('LedgerReset')
         if ($null -eq (Move-AUUnreadableLedger $Path)) { $Ledger.Writable = $false }
@@ -5330,8 +5378,10 @@ function Get-AUKnownExes
     components of the app's ProductCode; the exeName of each identity rule (customer and PowerStacks)
     whose target matches the app, as written in the rule, wildcards included; and the executables of
     entries matched to the app (Get-AUTargetAppNames). A Store or MSIX package entry is known by its
-    ExeInfo. Ignored entries don't count (F22), and an unresolved entry belongs to no app. An app with
-    no known executable is absent, so Get-AUAppUsage reports it NotCovered.
+    ExeInfo. Ignored entries don't count (F22): an exe an ignored entry names is left out of the first
+    two sources as well (a rule's wildcard exeName it matches too), unless an entry that isn't ignored
+    is matched to the app. An unresolved entry belongs to no app. An app with no known executable is
+    absent, so Get-AUAppUsage reports it NotCovered.
     Every value is a -like pattern: a rule's exeName as written (the validator checked it), and every
     other name escaped with ConvertTo-AUWildcardLiteral, because a file name may hold `, [, or ] and
     must match only itself.
@@ -5425,6 +5475,37 @@ function Get-AUKnownExes
         }
     }
 
+    # An exe an ignore rule matched isn't app use, so it isn't a known exe of any app from Windows
+    # Installer or a rule either (F22): an app whose only known exe is ignored is NotCovered, not NotUsed.
+    # A rule's wildcard exeName that an ignored exe matches goes too, which errs toward NotCovered.
+    $Ignored = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($Entry in @($Entries))
+    {
+        if ($null -eq $Entry -or $null -eq $Entry.Classification -or $Entry.Classification.Ignored -ne $true) { continue }
+        $Exe = Get-AUExeKey $Entry
+        if ($Exe) { [void]$Ignored.Add($Exe) }
+    }
+    if ($Ignored.Count -gt 0)
+    {
+        $IgnoredNames = [string[]]@($Ignored)
+        foreach ($Name in @($Known.Keys))
+        {
+            $Set = $Known[$Name]
+            foreach ($Pattern in @($Set))
+            {
+                # Every value is a -like pattern (escaped when literal); one that won't parse is compared exactly.
+                if ($Pattern.IndexOfAny($script:AUWildcardChars) -lt 0) { $Drop = $Ignored.Contains($Pattern) }
+                else
+                {
+                    try { $Drop = (@($IgnoredNames -like $Pattern).Count -gt 0) }
+                    catch { $Drop = $Ignored.Contains([Management.Automation.WildcardPattern]::Unescape($Pattern)) }
+                }
+                if ($Drop) { [void]$Set.Remove($Pattern) }
+            }
+            if ($Set.Count -eq 0) { $Known.Remove($Name) }
+        }
+    }
+
     # Executables seen and matched to the app.
     foreach ($Entry in @($Entries))
     {
@@ -5454,10 +5535,15 @@ function Get-AUAppUsage
     are left out (F22).
     AppUsageStatus, first that applies (D32): Used (a matched exe has credited use since
     WatchingSince), RanNotUsed (a matched exe ran since then), Ambiguous (an unresolved exe with this
-    app among its CandidateTargets ran since then, or an unmatched exe whose name is one of the app's
-    known or matched exes ran since then, a wildcard known exe compared with -like, D30), NotUsed (the
-    app has known exes, or matched exes, and none ran, matched or not), NotCovered (none known). An exe
-    matched to another app never makes this app Ambiguous. It's blank ($null) unless CollectionOk is true,
+    app among its CandidateTargets ran since then, or, for an app that would otherwise be NotUsed, an
+    unmatched exe ran since then whose name is one of the app's known or matched exes, a wildcard known
+    exe compared with -like (D30), or an unmatched exe with credited use since then whose RunPath is
+    inside the app's own InstallLocation (Get-AUOwnInstallFolder, never a broad root), as for a
+    sibling under a target pattern that matches several apps), NotUsed
+    (the app has known exes, or matched exes, and none ran, matched or not), NotCovered (none known).
+    An exe matched to a target that no installed app is counts as unmatched here, so a rule whose
+    target isn't installed never makes another app NotUsed. An exe matched to another installed app
+    never makes this app Ambiguous. It's blank ($null) unless CollectionOk is true,
     WatchingSince is known, and every scope holding the app in Apps (a blank Scope is Machine) is Read
     in ScopeRead, so missing coverage is never NotUsed. When CollectionOk is false, every field is
     blank.
@@ -5526,7 +5612,21 @@ function Get-AUAppUsage
 
     # Exe names (ExeName, or ExeInfo for a package) of unmatched entries that ran since WatchingSince.
     # An app whose known exe ran unmatched (an unverified build, say) is Ambiguous, never NotUsed (D30).
+    # An entry matched to a target that isn't installed counts as unmatched here.
     $UnmatchedRan = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    # Every folder above the RunPath of those entries that also have credited use since WatchingSince
+    # (Get-AUDerivedUse, the roll-up's own definition), ending with \, so an app whose own install
+    # folder (Get-AUOwnInstallFolder) holds one is Ambiguous, never NotUsed: a sibling under a target
+    # pattern knows the rule's exe, not its own unmatched one. Background, SYSTEM, and service runs
+    # don't count, so an updater or helper in the app's folder never hides a correct NotUsed.
+    $UnmatchedFolders = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $AddUnmatched = {
+        param ([string]$Exe, $Facts, [bool]$Used)
+        if ($Exe) { [void]$UnmatchedRan.Add($Exe) }
+        if (-not $Used -or $null -eq $Facts) { return }
+        $RunPath = ([string]$Facts.RunPath).Trim().Replace('/', '\')
+        for ($At = $RunPath.IndexOf('\'); $At -ge 0; $At = $RunPath.IndexOf('\', $At + 1)) { [void]$UnmatchedFolders.Add($RunPath.Substring(0, $At + 1)) }
+    }
 
     # Inline per-entry work: this loop runs once per ledger entry, thousands of times.
     foreach ($Entry in @($Entries))
@@ -5546,7 +5646,7 @@ function Get-AUAppUsage
             if (-not $RanSince) { continue }
             $Exe = ([string]$Entry.ExeName).Trim()
             if (-not $Exe) { $Exe = ([string]$Entry.ExeInfo).Trim() }
-            if ($Exe) { [void]$UnmatchedRan.Add($Exe) }
+            & $AddUnmatched $Exe $Entry.Facts $UsedSince
             if ($null -eq $Target) { continue }
             $Candidates = [Collections.Generic.List[string]]::new()
             foreach ($Candidate in @($Target.CandidateTargets)) { if (-not [string]::IsNullOrWhiteSpace([string]$Candidate)) { $Candidates.Add(([string]$Candidate).Trim()) } }
@@ -5562,7 +5662,11 @@ function Get-AUAppUsage
         $Focus = [double]0
         if (Test-AUInteractiveUserType ([string]$Entry.UserType)) { $Focus = [double]$Entry.FocusTotal }
         $UserSid = ([string]$Entry.UserSid).Trim()
-        foreach ($Name in @(Get-AUTargetAppNames $Target $Index))
+        $Names = @(Get-AUTargetAppNames $Target $Index)
+        # A target that isn't installed (a rule whose app is absent, or an uninstalled retained target):
+        # the exe may belong to an installed app that knows it, so it counts as unmatched (final review A2).
+        if ($Names.Count -eq 0 -and $RanSince) { & $AddUnmatched $Exe $Entry.Facts $UsedSince }
+        foreach ($Name in $Names)
         {
             $State = $States[$Name]
             if ($null -eq $State) { continue }
@@ -5582,10 +5686,13 @@ function Get-AUAppUsage
     $ReadState = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     if ($null -ne $ScopeRead) { foreach ($Key in $ScopeRead.Keys) { $ReadState[([string]$Key).Trim()] = [string]$ScopeRead[$Key] } }
     $Covered = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
+    $AppsByName = [Collections.Hashtable]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($App in $Index.Apps)
     {
         $Name = ([string]$App.DisplayName).Trim()
         if (-not $Name) { continue }
+        if (-not $AppsByName.ContainsKey($Name)) { $AppsByName[$Name] = [Collections.Generic.List[object]]::new() }
+        $AppsByName[$Name].Add($App)
         $Scope = ([string]$App.Scope).Trim()
         if (-not $Scope) { $Scope = 'Machine' }
         $IsRead = ($ReadState[$Scope] -ceq 'Read')
@@ -5627,6 +5734,15 @@ function Get-AUAppUsage
                                 catch { Write-CMTraceLog -Message "App Usage: known exe pattern '$Pattern' for $Trimmed isn't valid; compared exactly." -Component 'AppUsage' -Type 2 }
                             }
                             if ($Hit) { $Status = 'Ambiguous'; break }
+                        }
+                    }
+                    # An unmatched exe with credited use from inside the app's own install folder (final review A1).
+                    if ($Status -ceq 'NotUsed' -and $UnmatchedFolders.Count -gt 0 -and $null -ne $AppsByName[$Trimmed])
+                    {
+                        foreach ($App in $AppsByName[$Trimmed])
+                        {
+                            $Folder = Get-AUOwnInstallFolder $App
+                            if ($Folder -and $UnmatchedFolders.Contains($Folder)) { $Status = 'Ambiguous'; break }
                         }
                     }
                 }
@@ -6438,8 +6554,8 @@ function Clear-AUStaleRuns
     MaxAgeHours ago. Its marker's shadow copy is deleted only when the marker is trusted
     (Read-AUShadowMarker) and the shadow copy was made during the folder's lifetime
     (Get-AUShadowOrigin is Run); then the folder is removed (Remove-AUFolderTree). When the shadow
-    copy couldn't be checked (Unknown), the folder and its marker stay for the next run. Anything
-    else is left alone. Never throws.
+    copy couldn't be checked (Unknown) or couldn't be deleted, the folder and its marker stay for the
+    next run. Anything else is left alone. Never throws.
 .PARAMETER Root
     The protected work root.
 .PARAMETER Except
@@ -6482,7 +6598,14 @@ function Clear-AUStaleRuns
                         Write-CMTraceLog -Message "App Usage: couldn't check shadow copy $ShadowId, so the stale run folder $($Folder.FullName) and its marker stay for the next run." -Component 'AppUsage' -Type 2
                         continue
                     }
-                    if ($Origin -eq 'Run') { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+                    if ($Origin -eq 'Run')
+                    {
+                        if ((Remove-AUShadowCopy -ShadowId $ShadowId) -ne $true)
+                        {
+                            Write-CMTraceLog -Message "App Usage: couldn't remove shadow copy $ShadowId, so the stale run folder $($Folder.FullName) and its marker stay for the next run." -Component 'AppUsage' -Type 2
+                            continue
+                        }
+                    }
                     else { Write-CMTraceLog -Message "App Usage: left shadow copy $ShadowId alone; it isn't one that $($Folder.FullName) made." -Component 'AppUsage' -Type 2 }
                 }
                 Remove-AUFolderTree -Path $Folder.FullName
@@ -7121,7 +7244,9 @@ function Remove-AUSnapshot
     shadow copy itself. Each part is attempted whatever happens to the other, and every failure is
     logged. WorkDir is deleted only when it's a direct child of Root and not a link; otherwise it's
     logged and left alone. The folder delete (Remove-AUFolderTree) is retried briefly, because a hive
-    or database handle can take a moment to close.
+    or database handle can take a moment to close. When the shadow copy can't be removed, everything
+    in WorkDir but its marker is deleted, and the folder and marker stay, so a later run's stale
+    sweep (Clear-AUStaleRuns) removes the shadow copy; without the marker nothing would name it.
 .PARAMETER Snapshot
     The object from New-AUSnapshot, or $null.
 .PARAMETER Root
@@ -7142,7 +7267,8 @@ function Remove-AUSnapshot
     }
     catch { }
 
-    if ($ShadowId) { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+    $Released = $true
+    if ($ShadowId) { $Released = (Remove-AUShadowCopy -ShadowId $ShadowId) -eq $true }
 
     if ($WorkDir)
     {
@@ -7163,11 +7289,23 @@ function Remove-AUSnapshot
             Write-CMTraceLog -Message "App Usage: left $WorkDir alone, because it isn't a run folder directly inside $Root (or it's a link)." -Component 'AppUsage' -Type 3
             return
         }
+        if (-not $Released) { Write-CMTraceLog -Message "App Usage: kept $WorkDir and its marker, so a later run removes shadow copy $ShadowId." -Component 'AppUsage' -Type 2 }
         for ($Attempt = 1; $Attempt -le 3; $Attempt++)
         {
             try
             {
-                Remove-AUFolderTree -Path $Full
+                if ($Released) { Remove-AUFolderTree -Path $Full }
+                else
+                {
+                    # Everything but the marker: the copies go, the shadow copy's ID stays.
+                    foreach ($Item in (New-Object IO.DirectoryInfo $Full).GetFileSystemInfos())
+                    {
+                        if ($Item -is [IO.DirectoryInfo]) { Remove-AUFolderTree -Path $Item.FullName; continue }
+                        if ([string]::Equals($Item.Name, $script:AUShadowMarker, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($Item.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) { $Item.Attributes = [IO.FileAttributes]::Normal }
+                        $Item.Delete()
+                    }
+                }
                 break
             }
             catch
@@ -11385,8 +11523,9 @@ function New-AUDeviceColumns
     Returns the device columns for row 1, in the spec's order, named for the API mode (Get-AUColumnName).
 .DESCRIPTION
     AppUsageEnabled_b (true: metering was on), WatchingSince_t (Format-AUDate text, or $null),
-    AppUsageScriptVersion_s, MappingsVersion_s, CustomerMappingsHash_s, UnmatchedExeCount_d,
-    ProfilesFound_d, ProfilesRead_d, and AppUsageCollectionStatus_s. The run columns RunId_g,
+    AppUsageScriptVersion_s (the leading number of ScriptVersion), MappingsVersion_s,
+    CustomerMappingsHash_s, UnmatchedExeCount_d, ProfilesFound_d, ProfilesRead_d, and
+    AppUsageCollectionStatus_s. The run columns RunId_g,
     RowIndex_d, and RowCount_d are New-AURunRows's. Uses only what Constrained Language Mode allows.
 .PARAMETER Result
     The Invoke-AppUsage result, with Status set.
@@ -11406,7 +11545,11 @@ function New-AUDeviceColumns
     $Columns = [ordered]@{}
     $Columns[(Get-AUColumnName 'AppUsageEnabled' 'b' $LogAPIMode)] = $true
     $Columns[(Get-AUColumnName 'WatchingSince' 't' $LogAPIMode)] = $Watching
-    $Columns[(Get-AUColumnName 'AppUsageScriptVersion' 's' $LogAPIMode)] = $ScriptVersion
+    # The leading number of $ScriptVersion ('19 - August 10, 2026' gives 19), as the samples show; a
+    # version with no leading number is sent as it is, trimmed.
+    $Version = ([string]$ScriptVersion).Trim()
+    if ($Version -match '^(\d+)') { $Version = $Matches[1] }
+    $Columns[(Get-AUColumnName 'AppUsageScriptVersion' 's' $LogAPIMode)] = $Version
     $Columns[(Get-AUColumnName 'MappingsVersion' 's' $LogAPIMode)] = [string]$Result.MappingsVersion
     $Columns[(Get-AUColumnName 'CustomerMappingsHash' 's' $LogAPIMode)] = [string]$Result.CustomerMappingsHash
     $Columns[(Get-AUColumnName 'UnmatchedExeCount' 'd' $LogAPIMode)] = $Result.UnmatchedExeCount
@@ -11712,6 +11855,11 @@ function Send-AUInventoryRun
         [int]$LockTimeoutSeconds = $script:AULockTimeoutSeconds
     )
 
+    # The script's own preference (powershell.exe -File), whatever the caller's, as in Invoke-AppUsage
+    # and the sender: under Stop, a logger error after the rows were sent (the log is locked) would
+    # end this function, and the caller's own upload would send the row again. It holds for the outbox
+    # and row functions called from here too, so they run as they do under powershell.exe -File.
+    $ErrorActionPreference = 'Continue'
     if ($null -eq $Sender) { throw 'Send-AUInventoryRun needs -Sender.' }
     $State = [pscustomobject]@{
         Tokens     = New-Object 'System.Collections.Generic.List[string]'

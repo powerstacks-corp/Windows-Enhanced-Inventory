@@ -245,6 +245,20 @@ Describe 'Stale run cleanup (F28)' {
         Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:Id }
     }
 
+    It 'keeps a stale run folder and its marker for the next run when its shadow copy can''t be deleted (final review B1)' {
+        $Old = New-StaleRun $script:Root 'old-run' 25
+        Write-AUShadowMarker -Folder $Old -ShadowId $script:Id
+        Mock Remove-AUShadowCopy { $false }
+        $null = New-AUWorkDir -RunId 'current' -Root $script:Root
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:Id }
+        Test-Path -LiteralPath $Old | Should -BeTrue
+        Read-AUShadowMarker -Folder $Old | Should -BeExactly $script:Id
+
+        Mock Remove-AUShadowCopy { $true }
+        $null = New-AUWorkDir -RunId 'next' -Root $script:Root
+        Test-Path -LiteralPath $Old | Should -BeFalse
+    }
+
     It 'tells a shadow copy the run made from another one, and from one it couldn''t check' {
         $Since = [datetime]::UtcNow.AddHours(-3)
         Get-AUShadowOrigin -ShadowId $script:Id -SinceUtc $Since | Should -BeExactly 'Run'
@@ -670,9 +684,27 @@ Describe 'Remove-AUSnapshot' {
         Test-Path -LiteralPath $script:WorkDir | Should -BeFalse
     }
 
-    It 'never throws, and still removes the run folder, when the shadow copy cannot be removed' {
+    It 'never throws, and keeps only the marker, when the shadow copy cannot be removed, so a later run removes it (final review B1)' {
+        Write-AUShadowMarker -Folder $script:WorkDir -ShadowId $script:ShadowId
         Mock Get-CimInstance { throw 'WMI is broken' } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
         { Remove-AUSnapshot -Snapshot $script:Snapshot -Root $script:Root } | Should -Not -Throw
+        Test-Path -LiteralPath $script:WorkDir | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $script:WorkDir -Force | ForEach-Object { $_.Name }) | Should -Be @('shadow.id')
+        Read-AUShadowMarker -Folder $script:WorkDir | Should -BeExactly $script:ShadowId
+
+        # A later run's sweep finds the marker and removes the shadow copy and the folder.
+        [IO.Directory]::SetCreationTimeUtc($script:WorkDir, [datetime]::UtcNow.AddHours(-25))
+        Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; InstallDate = (Get-Date).AddHours(-2) } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Mock Remove-AUShadowCopy { $true }
+        Clear-AUStaleRuns -Root $script:Root -Except 'current' -MaxAgeHours 24
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:ShadowId }
+        Test-Path -LiteralPath $script:WorkDir | Should -BeFalse
+    }
+
+    It 'removes the whole run folder when the shadow copy is already gone' {
+        Write-AUShadowMarker -Folder $script:WorkDir -ShadowId $script:ShadowId
+        Mock Get-CimInstance { } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        Remove-AUSnapshot -Snapshot $script:Snapshot -Root $script:Root
         Test-Path -LiteralPath $script:WorkDir | Should -BeFalse
     }
 

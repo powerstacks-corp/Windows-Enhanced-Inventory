@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "powerStacks": {
-    "version": "2026.11.22.2",
+    "version": "2026.11.23.1",
     "identityRules": [
       { "id": "ps-own-msi", "type": "ownership", "source": "msi", "description": "A file that Windows Installer records as a component of an installed product maps to that product." },
       { "id": "ps-own-store", "type": "ownership", "source": "store", "description": "A Store package maps to the installed package." },
@@ -13,7 +13,8 @@
       { "id": "ps-m365apps-4", "type": "identity", "description": "Outlook (classic) in Microsoft 365 Apps (Click-to-Run).", "when": { "exeName": "OUTLOOK.EXE", "publisher": "Microsoft Corporation" }, "target": { "displayName": "Microsoft 365 Apps for *", "publisher": "Microsoft Corporation" } },
       { "id": "ps-m365apps-5", "type": "identity", "description": "OneNote in Microsoft 365 Apps (Click-to-Run).", "when": { "exeName": "ONENOTE.EXE", "publisher": "Microsoft Corporation" }, "target": { "displayName": "Microsoft 365 Apps for *", "publisher": "Microsoft Corporation" } },
       { "id": "ps-m365apps-6", "type": "identity", "description": "Access in Microsoft 365 Apps (Click-to-Run).", "when": { "exeName": "MSACCESS.EXE", "publisher": "Microsoft Corporation" }, "target": { "displayName": "Microsoft 365 Apps for *", "publisher": "Microsoft Corporation" } },
-      { "id": "ps-vscode-1", "type": "identity", "description": "Visual Studio Code, system or user install. Its ProductName, Visual Studio Code, does not match the Microsoft Visual Studio Code entry.", "when": { "exeName": "Code.exe", "publisher": "Microsoft Corporation" }, "target": { "displayName": "Microsoft Visual Studio Code*", "publisher": "Microsoft Corporation" } },
+      { "id": "ps-vscode-1", "type": "identity", "description": "Visual Studio Code, system or user install. Its ProductName, Visual Studio Code, does not match the Microsoft Visual Studio Code entry. The target also matches the Insiders entries, because one pattern cannot cover both stable entries without them; when both editions are installed, the install path step picks the edition, and ps-vscode-insiders-1 matches the Insiders executable.", "when": { "exeName": "Code.exe", "publisher": "Microsoft Corporation" }, "target": { "displayName": "Microsoft Visual Studio Code*", "publisher": "Microsoft Corporation" } },
+      { "id": "ps-vscode-insiders-1", "type": "identity", "description": "Visual Studio Code Insiders, system or user install. Its ProductName, Visual Studio Code - Insiders, does not match the Microsoft Visual Studio Code - Insiders entry.", "when": { "exeName": "Code - Insiders.exe", "publisher": "Microsoft Corporation" }, "target": { "displayName": "Microsoft Visual Studio Code - Insiders*", "publisher": "Microsoft Corporation" } },
       { "id": "ps-adobecc-1", "type": "identity", "description": "Adobe Creative Cloud desktop app. Its ProductName, Creative Cloud, does not match the Adobe Creative Cloud entry.", "when": { "exeName": "Creative Cloud.exe", "publisher": "Adobe*" }, "target": { "displayName": "Adobe Creative Cloud", "publisher": "Adobe*" } },
       { "id": "ps-adobecc-2", "type": "identity", "description": "Adobe Creative Cloud helper.", "when": { "exeName": "Creative Cloud Helper.exe", "publisher": "Adobe*" }, "target": { "displayName": "Adobe Creative Cloud", "publisher": "Adobe*" } },
       { "id": "ps-adobecc-3", "type": "identity", "description": "Adobe Creative Cloud UI helper.", "when": { "exeName": "Creative Cloud UI Helper.exe", "publisher": "Adobe*" }, "target": { "displayName": "Adobe Creative Cloud", "publisher": "Adobe*" } },

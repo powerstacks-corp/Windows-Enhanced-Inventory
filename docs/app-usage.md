@@ -27,7 +27,7 @@ These settings, at the top of the script, control App Usage:
 | `$MinFocusSecondsForUse` | `1` | How many seconds of focus or input count as use. |
 | `$AppUsageCustomerMappingsPath` | `C:\ProgramData\PowerStacks\AppUsage\customer-mappings.json` | Where the script looks for your mapping rules. |
 
-To turn App Usage off, set `$CollectAppMetering = $false`. The next run sends exactly the App Inventory row it sent before App Usage, and the usage history stays on the device. If you also roll back the data collection rule, change the script first and the rule only after devices stop sending App Usage rows. The updater's `-RollbackFrom` parameter puts back the rule it saved; see [Roll back](https://github.com/powerstacks-corp/EnhancedInventoryDeploy/blob/release/app-usage-v1/README.md#roll-back).
+To turn App Usage off, set `$CollectAppMetering = $false`. The next run sends the same data as version 19, minus the empty entries version 19 made from its own log lines: one App Inventory entry with a blank name and the `Win32` type, and several driver inventory entries with every field blank. The usage history stays on the device. If you also roll back the data collection rule, change the script first and the rule only after devices stop sending App Usage rows. The updater's `-RollbackFrom` parameter puts back the rule it saved; see [Roll back](https://github.com/powerstacks-corp/EnhancedInventoryDeploy/blob/release/app-usage-v1/README.md#roll-back).
 
 ### Deploy the Release Build
 
@@ -124,12 +124,12 @@ When App Usage is off, or fails on a run, these fields are blank. An executable 
 |---|---|
 | `Used` | Someone used one of the app's executables since the device's watching-since date, the earliest usage App Usage has for the device. |
 | `RanNotUsed` | One of the app's executables ran since then, but nobody used it: for example, it ran only in the background or only under SYSTEM. Not a reclamation candidate on its own. |
-| `Ambiguous` | Nothing is credited to the app, but an executable that might be the app's ran: one that could belong to it or to another app (see [When a Rule Matches Several Installed Apps](#when-a-rule-matches-several-installed-apps)), or an unmatched executable with the name of one of the app's known executables, for example a build the script couldn't verify. Not a reclamation candidate. |
+| `Ambiguous` | Nothing is credited to the app, but an executable that might be the app's ran: one that could belong to it or to another app (see [When a Rule Matches Several Installed Apps](#when-a-rule-matches-several-installed-apps)), an unmatched executable with the name of one of the app's known executables, for example a build the script couldn't verify, or an unmatched executable that someone used (not only a background or SYSTEM run) from inside the app's install folder, its `InstallLocation`. A shared folder such as `C:\Program Files` never counts as an app's install folder. An executable matched to an app that isn't installed counts as unmatched here. Not a reclamation candidate. |
 | `NotUsed` | App Usage knows the app's executables, and none of them ran since the watching-since date, whether matched to the app or not. The only value that marks a reclamation candidate. |
 | `NotCovered` | App Usage knows no executable for the app, so it can't measure its use. |
 | Blank | App Usage didn't run or failed on this run, the watching-since date isn't known yet, or the script couldn't read every place the app is installed (the device's apps, or a user's apps). Blank never means `NotUsed`. |
 
-App Usage knows an app's executables when Windows Installer lists them as part of the app, when an identity rule whose target matches the app names them in `when.exeName` (a pattern such as `contoso*.exe` covers every name it matches), or when it has seen one of them run and matched it to the app. An executable matched to a different app doesn't count as a run of this one.
+App Usage knows an app's executables when Windows Installer lists them as part of the app, when an identity rule whose target matches the app names them in `when.exeName` (a pattern such as `contoso*.exe` covers every name it matches), or when it has seen one of them run and matched it to the app. An executable that an ignore rule matches isn't one of the app's known executables, so an app whose only known executable is ignored is `NotCovered`. An executable matched to a different app doesn't count as a run of this one.
 
 ### Executable Usage
 
@@ -178,7 +178,7 @@ The installed apps (`InstalledApps1_s` to `InstalledApps10_s`) and the executabl
 
 To rebuild a list, take its pieces from every row of the run, ordered by `RowIndex_d` and then by column number, join them, and decode them as before. A run is complete when all `RowCount_d` rows with its `RunId_g` are present. Reports use each device's latest complete run and never show part of a run. Rows 2 and on aren't devices, so a query that takes each device's latest row has to take its latest complete run instead.
 
-Turning App Usage on requires the BI for Intune release that reads split runs. When App Usage is off, the script sends exactly the row it always sent, with no run columns.
+Turning App Usage on requires the BI for Intune release that reads split runs. When App Usage is off, the script sends the same App Inventory row as version 19, with no run columns, minus one empty entry: version 19 added an entry with a blank name and the `Win32` type, made from its own log lines. Version 20 also no longer sends the driver inventory entries with every field blank that version 19 made the same way.
 
 ### Rows That Fail to Send
 
@@ -204,7 +204,7 @@ Row 1 of every run with App Usage on carries these columns, next to the App Inve
 |---|---|
 | `AppUsageEnabled_b` | `true`: App Usage was on for this run. |
 | `WatchingSince_t` | The earliest usage App Usage has for the device, in UTC. Blank until the device has some. |
-| `AppUsageScriptVersion_s` | The script version. |
+| `AppUsageScriptVersion_s` | The leading number of the script version, for example `20`. |
 | `MappingsVersion_s` | The version of the PowerStacks mapping rules built into the script. Blank when App Usage skipped before it loaded them. |
 | `CustomerMappingsHash_s` | The SHA-256 of the customer mapping file the run used. Blank when there's no file or it's invalid. |
 | `UnmatchedExeCount_d` | How many executables no rule matched. Executables that ignore rules match aren't counted. |
@@ -296,6 +296,8 @@ The rule that wins sets the app's name pattern, and the installed apps that patt
 | Version | Version shares its first two parts with the executable's FileVersion or ProductVersion. Verified builds only. | `ps-resolve-version` |
 | Architecture | Entry is 32-bit, for an executable under `Program Files (x86)`, or 64-bit, for one under `Program Files`. | `ps-resolve-arch` |
 | Install scope | Per-user install belongs to the user who ran the executable from their own profile. | `ps-resolve-scope` |
+
+A target pattern also makes the rule's executable one of the known executables of every installed app the pattern matches. In the `Contoso*` example, Contoso Beta knows the rule's executable too, and when that executable runs and is matched to Contoso Alpha, it isn't a run of Contoso Beta. So when someone uses an unmatched executable from inside Contoso Beta's install folder, Contoso Beta is reported as `Ambiguous`, not `NotUsed`. An unmatched executable that runs only in the background or under SYSTEM, such as an updater, doesn't count. To measure each app, give each one its own rule with a target that matches only that app, for example `Contoso Alpha*` and `Contoso Beta*`.
 
 A check that has nothing to go on, or that would rule out every app, is skipped. When a check leaves one app, the executable is matched to it. If the candidates came from one of your rules, your rule's ID is reported, so if you delete the rule, the executable is matched again from the rules that remain. If they came from PowerStacks rules, the check's ID is reported as the rule ID.
 
@@ -400,7 +402,7 @@ When the script can't verify the build that ran, it uses the publisher and produ
 
 #### Ignore Rules
 
-An ignore rule has the same `when` conditions as a classification rule and no `role`. It marks an executable that isn't an app, such as a kiosk shell. The executable's usage is still recorded, but it doesn't make an app count as used, and it isn't counted as unmatched.
+An ignore rule has the same `when` conditions as a classification rule and no `role`. It marks an executable that isn't an app, such as a kiosk shell. The executable's usage is still recorded, but it doesn't make an app count as used, it isn't counted as unmatched, and it isn't one of the app's known executables. An app whose only known executable is ignored is reported as `NotCovered`, never `NotUsed`.
 
 The validator rejects any field it doesn't know, so a misspelled condition can't quietly make a rule match more than you meant.
 

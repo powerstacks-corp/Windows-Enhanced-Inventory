@@ -592,6 +592,16 @@ Describe 'The App Inventory row sender (fix round 1)' {
         $Run.Response | Should -Match '^204 : Upload payload size is [\d.]+Kb \(1 row\) $'
         @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter '*.json' -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty
     }
+
+    It 'sends the rows once when the caller''s error preference is Stop and logging the run''s result fails (final review B, 361)' {
+        # Fails only for Send-AUInventoryRun's own summary line, written after the rows were sent. Under
+        # Stop that error would end Send-AUInventoryRun, and the inline fallback would send the row again.
+        function Write-CMTraceLog { param ([Parameter(Position = 0)]$Message, [Parameter(ValueFromRemainingArguments = $true)]$Rest) if ([string]$Message -like 'App Usage: run * sent *') { Write-Error 'Write-CMTraceLog failed: the log is being used by another process.' } }
+        $Run = Invoke-TestMetered -Settings ($script:Retries + @{ ErrorActionPreference = 'Stop' }) -RealUpload -RealLogger
+        $script:Web.Calls.Count | Should -Be 1
+        $Run.Response | Should -Match '^204 : Upload payload size is [\d.]+Kb \(1 row\) $'
+        @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter '*.json' -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Exit code (D28)' {
