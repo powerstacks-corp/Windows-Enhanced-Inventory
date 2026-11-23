@@ -305,7 +305,7 @@ When two or more apps are left after every check, the executable is reported as 
 
 #### Microsoft 365 Apps in Two or More Languages
 
-When Microsoft 365 Apps is installed in two or more languages, each language has its own entry in **Installed apps**, for example `Microsoft 365 Apps for enterprise - en-us` and `Microsoft 365 Apps for enterprise - de-de`. The languages share one install folder and the same executables, so no check can tell them apart. Every language entry is reported as `Ambiguous`, never `Used` or `NotUsed`, and the Office executables are reported as unmatched with the language entries in `CandidateTargets`. This is a known limitation. If it affects your reports, contact PowerStacks support.
+When Microsoft 365 Apps is installed in two or more languages, each language has its own entry in **Installed apps**, for example `Microsoft 365 Apps for enterprise - en-us` and `Microsoft 365 Apps for enterprise - de-de`. The languages share one install folder and the same executables, so no check can tell them apart. When an Office executable runs, the script reports it as unmatched, with the language entries in `CandidateTargets`, and every language entry is reported as `Ambiguous`, never `Used`. If no Office executable ran, the entries are reported as `NotUsed`. This is a known limitation. If it affects your reports, contact PowerStacks support.
 
 ### Targets From Earlier Runs
 
