@@ -7936,30 +7936,17 @@ $script:AUOutboxMaxRuns = 5
 # Outbox files are <RunId>-<RowIndex>.json.
 $script:AUOutboxFilePattern = '^(?<RunId>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})-(?<RowIndex>[1-9][0-9]{0,8})\.json$'
 
-# The inventory's own upload path, the default sender for Send-AUOutbox and Send-AURunRows. It
-# makes the same call as the inline App Inventory upload, with the inventory's connection values,
-# so each row gets the inventory's existing retry (Invoke-LogSubmission). It returns $true only for
-# the success status the inventory's summary line checks (204, or 200 for the classic API).
-$script:AUInventorySender = {
-    param (
-        [byte[]]$Body,
-        [string]$LogAPIMode,
-        [string]$LogType
-    )
+# Outbox temp files older than this are leftovers of a run that stopped mid-write; Send-AUOutbox
+# deletes them.
+$script:AUOutboxTempMaxAgeHours = 24
 
-    if ($LogAPIMode -eq 'LogIngestionAPI')
-    {
-        $Response = Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body $Body -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $LogType
-        $Success = '^204 :'
-    }
-    else
-    {
-        $Response = Send-DataCollectorAPI -customerId $customerId -sharedKey $sharedKey -body $Body -logType $LogType
-        $Success = '^200 :'
-    }
-    Write-CMTraceLog -Message "App Usage: App Inventory row upload response: $Response" -Component 'AppUsage'
-    return ("$Response" -match $Success)
-}
+# The sender (F51): Send-AUOutbox and Send-AURunRows take it as a required scriptblock,
+# param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType), whose last output is $true only when
+# the row was accepted. The region never reads the inventory's connection settings, so Task 15 builds
+# it outside the region: it calls Send-LogIngestionAPI (or Send-DataCollectorAPI for the classic API)
+# with the inventory's connection variables, as the inline App Inventory upload does, so each row
+# keeps the inventory's existing retry (Invoke-LogSubmission), and returns whether the response is
+# the success status the summary line checks (204, or 200 for the classic API). Tests pass a mock.
 
 function Get-AUColumnName
 {
@@ -8479,6 +8466,47 @@ function Invoke-AUSend
     }
 }#endfunction
 
+function Remove-AUStaleOutboxTemp
+{
+    <#
+.SYNOPSIS
+    Deletes leftover *.tmp files in a trusted outbox that are older than MaxAgeHours. Returns how many were deleted. Never throws.
+.DESCRIPTION
+    A temp file is left only when a run stopped between creating it and swapping it in
+    (Save-AUOutboxRow). Only regular files owned by SYSTEM or Administrators are deleted; links,
+    folders, and files with another owner are left alone. The listing reads each entry's own
+    attributes and doesn't follow links. Call it only for an outbox Get-AUOutboxState trusts.
+.PARAMETER OutboxDir
+    The trusted outbox folder.
+.PARAMETER MaxAgeHours
+    How old a temp file must be, $script:AUOutboxTempMaxAgeHours by default.
+#>
+    param (
+        [string]$OutboxDir,
+        [double]$MaxAgeHours = $script:AUOutboxTempMaxAgeHours
+    )
+
+    $Deleted = 0
+    try
+    {
+        $Cutoff = [datetime]::UtcNow.AddHours(-$MaxAgeHours)
+        foreach ($Item in (New-Object IO.DirectoryInfo $OutboxDir).GetFileSystemInfos())
+        {
+            if (-not $Item.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if (($Item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Directory)) -ne 0) { continue }
+            if ($Item.LastWriteTimeUtc -ge $Cutoff) { continue }
+            $Trusted = $false
+            try { $Trusted = Test-AUTrustedOwner -Security ([IO.File]::GetAccessControl($Item.FullName, [Security.AccessControl.AccessControlSections]::Owner)) }
+            catch { $Trusted = $false }
+            if (-not $Trusted) { continue }
+            if (Remove-AUOutboxFile -Path $Item.FullName) { $Deleted++ }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't list the outbox $OutboxDir for leftover temp files: $($_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    if ($Deleted -gt 0) { Write-CMTraceLog -Message "App Usage: deleted $Deleted leftover temp file(s) older than $MaxAgeHours hours from the outbox $OutboxDir." -Component 'AppUsage' -Type 2 }
+    return $Deleted
+}#endfunction
+
 function Send-AUOutbox
 {
     <#
@@ -8493,9 +8521,12 @@ function Send-AUOutbox
     inventory's Invoke-LogSubmission), and a send that still fails spends one unit. Once the budget
     is 0, nothing more is sent this run and the rows stay for the next run. The caller sets it to 1
     per run, so an outage costs one retry cycle, not one per row.
-    An outbox that isn't trusted (Get-AUOutboxState) is never read, sent, or deleted from;
-    OutboxSkipped is then $true, as it is when the folder can't be listed. Returns Sent, Remaining,
-    PendingRows, and OutboxSkipped. Never throws.
+    In a trusted outbox, leftover temp files older than 24 hours are deleted first
+    (Remove-AUStaleOutboxTemp). An outbox that isn't trusted (Get-AUOutboxState) is never read,
+    sent, or deleted from; OutboxSkipped is then $true, as it is when the folder can't be listed.
+    Concurrent runs: Task 15 calls Send-AUOutbox, New-AURunRows, and Send-AURunRows under the
+    Global\PowerStacksAppUsage lock (Invoke-AUWithLock), so two runs never use the outbox at once.
+    Returns Sent, Remaining, PendingRows, and OutboxSkipped. Throws only when Sender is missing.
 .PARAMETER OutboxDir
     The outbox folder (Get-AUOutboxPath).
 .PARAMETER RetryBudget
@@ -8505,7 +8536,8 @@ function Send-AUOutbox
 .PARAMETER LogType
     The App Inventory log type.
 .PARAMETER Sender
-    The sender scriptblock; the inventory's upload ($script:AUInventorySender) by default.
+    Required. The sender scriptblock Task 15 builds from the inventory's upload (see the note above
+    Get-AUColumnName). There's no default, so the region never reads the connection settings.
 .PARAMETER MaxRowBytes
     The row-size limit.
 .PARAMETER MaxRuns
@@ -8516,11 +8548,12 @@ function Send-AUOutbox
         [ref]$RetryBudget,
         [string]$LogAPIMode,
         [string]$LogType = $(if ($LogAPIMode -eq 'LogIngestionAPI') { 'PowerStacksAppInventory_CL' } else { 'PowerStacksAppInventory' }),
-        [scriptblock]$Sender = $script:AUInventorySender,
+        [scriptblock]$Sender,
         [int]$MaxRowBytes = $script:AUMaxRowBytes,
         [int]$MaxRuns = $script:AUOutboxMaxRuns
     )
 
+    if ($null -eq $Sender) { throw 'Send-AUOutbox needs -Sender.' }
     $Result = [pscustomobject]@{ Sent = 0; Remaining = 0; PendingRows = $false; OutboxSkipped = $false }
     $State = Get-AUOutboxState -OutboxDir $OutboxDir
     if ($State -eq 'Absent') { return $Result }
@@ -8531,6 +8564,7 @@ function Send-AUOutbox
         return $Result
     }
 
+    [void](Remove-AUStaleOutboxTemp -OutboxDir $OutboxDir)
     try { $Files = Get-AUOutboxFiles -OutboxDir $OutboxDir }
     catch
     {
@@ -8586,8 +8620,10 @@ function Send-AURunRows
     supersedes them (D44). The outbox then keeps only the MaxRuns most recent runs. A missing
     outbox is created with the protected DACL (New-AUProtectedFolder); one that isn't trusted is
     never written or deleted from, and OutboxSkipped is $true. Returns Sent, Pending (rows not
-    sent), Saved (rows saved to the outbox), SentBytes, and OutboxSkipped. Throws only when a row
-    lacks the run columns (pass New-AURunRows' result as it is, not wrapped in @()).
+    sent), Saved (rows saved to the outbox), SentBytes, and OutboxSkipped. Throws only when Sender
+    is missing or a row lacks the run columns (pass New-AURunRows' result as it is, not wrapped in
+    @()). Concurrent runs: Task 15 calls it under the Global\PowerStacksAppUsage lock, with
+    Send-AUOutbox, so two runs never use the outbox at once.
 .PARAMETER Rows
     The rows, from New-AURunRows.
 .PARAMETER OutboxDir
@@ -8599,7 +8635,8 @@ function Send-AURunRows
 .PARAMETER LogType
     The App Inventory log type.
 .PARAMETER Sender
-    The sender scriptblock; the inventory's upload ($script:AUInventorySender) by default.
+    Required. The sender scriptblock Task 15 builds from the inventory's upload (see the note above
+    Get-AUColumnName). There's no default, so the region never reads the connection settings.
 .PARAMETER MaxRowBytes
     The row-size limit.
 .PARAMETER MaxRuns
@@ -8611,11 +8648,12 @@ function Send-AURunRows
         [ref]$RetryBudget,
         [string]$LogAPIMode,
         [string]$LogType = $(if ($LogAPIMode -eq 'LogIngestionAPI') { 'PowerStacksAppInventory_CL' } else { 'PowerStacksAppInventory' }),
-        [scriptblock]$Sender = $script:AUInventorySender,
+        [scriptblock]$Sender,
         [int]$MaxRowBytes = $script:AUMaxRowBytes,
         [int]$MaxRuns = $script:AUOutboxMaxRuns
     )
 
+    if ($null -eq $Sender) { throw 'Send-AURunRows needs -Sender.' }
     $RunIdColumn = Get-AUColumnName 'RunId' 'g' $LogAPIMode
     $IndexColumn = Get-AUColumnName 'RowIndex' 'd' $LogAPIMode
     $Result = [pscustomobject]@{ Sent = 0; Pending = 0; Saved = 0; SentBytes = 0; OutboxSkipped = $false }

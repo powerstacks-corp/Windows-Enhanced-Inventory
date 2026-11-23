@@ -729,38 +729,88 @@ Describe 'Send-AURunRows and Send-AUOutbox (D44, F50 to F53)' {
         $Budget = 1
         { Send-AURunRows -Rows @(, $Rows) -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender { $true } } | Should -Throw '*RunId_g*'
     }
-}
-
-Describe 'The default sender' {
-    BeforeAll {
-        function Send-LogIngestionAPI($tenantId, $clientId, $clientSecret, $body, $dceURI, $dcrImmutableId, $logType)
+    It 'needs a sender, and has no default that reads the connection settings' {
+        $Rows = New-AURunRows -MainColumns (New-TestMain) -LogAPIMode 'LogIngestionAPI'
+        $Budget = 1
+        { Send-AURunRows -Rows $Rows -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' } | Should -Throw '*-Sender*'
+        { Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' } | Should -Throw '*-Sender*'
+        foreach ($Name in 'Send-AUOutbox', 'Send-AURunRows')
         {
-            $script:SenderCall = @{ tenantId = $tenantId; body = $body; dceURI = $dceURI; dcrImmutableId = $dcrImmutableId; logType = $logType }
-            return $script:SenderResponse
+            $Parameter = (Get-Command $Name).Parameters['Sender']
+            $Parameter.ParameterType | Should -Be ([scriptblock])
+            (Get-Command $Name).ScriptBlock.Ast.Body.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Sender' } | ForEach-Object { $_.DefaultValue | Should -BeNullOrEmpty }
         }
-        function Send-DataCollectorAPI($customerId, $sharedKey, $body, $logType)
-        {
-            $script:SenderCall = @{ customerId = $customerId; body = $body; logType = $logType }
-            return $script:SenderResponse
-        }
-        $TenantId = 'tenant-1'; $ClientId = 'client-1'; $ClientSecret = 'secret'; $DceURI = 'https://dce'; $DcrImmutableId = 'dcr-1'
-        $customerId = 'workspace-1'; $sharedKey = 'key'
+        $Region = [regex]::Match([IO.File]::ReadAllText((Resolve-Path (Join-Path $PSScriptRoot '..\..\Intune_Windows_Inventory.ps1')).Path), '(?ms)^#region APPUSAGE\r?\n(.*?)^#endregion APPUSAGE').Groups[1].Value
+        $Region | Should -Not -Match '\$(TenantId|ClientId|ClientSecret|DceURI|DcrImmutableId|customerId|sharedKey)\b'
     }
 
-    It 'is the inventory upload, and succeeds only on its success status' {
-        $Body = [Text.Encoding]::UTF8.GetBytes('[{"a":1}]')
-        $script:SenderResponse = '204 : Upload payload size is 0.1Kb '
-        Invoke-AUSend -Sender $script:AUInventorySender -Body $Body -LogAPIMode 'LogIngestionAPI' -LogType 'PowerStacksAppInventory_CL' | Should -BeTrue
-        $script:SenderCall.logType | Should -BeExactly 'PowerStacksAppInventory_CL'
-        $script:SenderCall.tenantId | Should -BeExactly 'tenant-1'
-        $script:SenderCall.dcrImmutableId | Should -BeExactly 'dcr-1'
-        Test-TestBytesEqual $script:SenderCall.body $Body | Should -BeTrue
+    Context 'leftover temp files' {
+        BeforeEach {
+            # A trusted outbox with one saved row, as Save-AUOutboxRow leaves it.
+            $Failing = New-TestSender -AlwaysFail
+            $Budget = 1
+            [void](Send-AURunRows -Rows (New-AURunRows -MainColumns (New-TestMain) -LogAPIMode 'LogIngestionAPI' -RunId $script:RunA) -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Failing.Block)
+            Test-AUTrustedFolder -Path $script:Outbox | Should -BeTrue
 
-        $script:SenderResponse = 'DCR upload failed after retries : Upload payload size is 204.0Kb '
-        Invoke-AUSend -Sender $script:AUInventorySender -Body $Body -LogAPIMode 'LogIngestionAPI' -LogType 'PowerStacksAppInventory_CL' | Should -BeFalse
+            # A temp file created the way Save-AUOutboxRow creates one: protected DACL, owned by Administrators.
+            function New-TestTemp([string]$Name, [datetime]$WriteTimeUtc)
+            {
+                $Path = Join-Path $script:Outbox $Name
+                $Security = New-AUProtectedSecurity
+                $Security.SetOwner((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
+                $Stream = New-Object IO.FileStream($Path, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $Security)
+                $Stream.Dispose()
+                [IO.File]::SetLastWriteTimeUtc($Path, $WriteTimeUtc)
+                return $Path
+            }
+        }
 
-        $script:SenderResponse = '200 : Upload payload size is 0.1Kb '
-        Invoke-AUSend -Sender $script:AUInventorySender -Body $Body -LogAPIMode 'ClientSecret' -LogType 'PowerStacksAppInventory' | Should -BeTrue
-        $script:SenderCall.customerId | Should -BeExactly 'workspace-1'
+        It 'deletes trusted temp files older than 24 hours when the outbox is sent, and keeps newer ones' {
+            $Old = New-TestTemp "$($script:RunA)-2.json.tmp" ([datetime]::UtcNow.AddHours(-25))
+            $Fresh = New-TestTemp "$($script:RunA)-3.json.tmp" ([datetime]::UtcNow.AddHours(-23))
+            $Sender = New-TestSender
+            $Budget = 1
+            $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Sender.Block
+            Test-Path -LiteralPath $Old | Should -BeFalse
+            Test-Path -LiteralPath $Fresh | Should -BeTrue
+            $Flush.Sent | Should -Be 1
+            $Flush.Remaining | Should -Be 0
+        }
+
+        It 'counts what it deletes, and leaves other owners, folders, links, and saved rows alone' {
+            $Old = New-TestTemp 'a.json.tmp' ([datetime]::UtcNow.AddHours(-48))
+            $Foreign = New-TestTemp 'b.json.tmp' ([datetime]::UtcNow.AddHours(-48))
+            $Acl = [IO.File]::GetAccessControl($Foreign)
+            $Acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+            [IO.File]::SetAccessControl($Foreign, $Acl)
+            $Folder = Join-Path $script:Outbox 'c.json.tmp'
+            [void][IO.Directory]::CreateDirectory($Folder)
+            $Target = New-TestTemp 'target.dat' ([datetime]::UtcNow.AddHours(-48))
+            $Link = Join-Path $script:Outbox 'd.json.tmp'
+            $Out = & cmd.exe /c mklink "$Link" "$Target" 2>&1
+            $LinkMade = ($LASTEXITCODE -eq 0)
+
+            # MaxAgeHours 0 makes every entry old enough, the link and folder included.
+            Remove-AUStaleOutboxTemp -OutboxDir $script:Outbox -MaxAgeHours 0 | Should -Be 1
+            Test-Path -LiteralPath $Old | Should -BeFalse
+            Test-Path -LiteralPath $Foreign | Should -BeTrue
+            Test-Path -LiteralPath $Folder | Should -BeTrue
+            Test-Path -LiteralPath $Target | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $script:Outbox "$($script:RunA)-1.json") | Should -BeTrue
+            if ($LinkMade) { Test-Path -LiteralPath $Link | Should -BeTrue }
+            else { Set-ItResult -Skipped -Because "a file symbolic link needs elevation or Developer Mode: $Out" }
+        }
+
+        It 'never touches temp files in an untrusted outbox' {
+            $Untrusted = Join-Path $TestDrive ('untrusted-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $Untrusted | Out-Null
+            $Planted = Join-Path $Untrusted 'x.json.tmp'
+            [IO.File]::WriteAllText($Planted, 'x')
+            [IO.File]::SetLastWriteTimeUtc($Planted, [datetime]::UtcNow.AddDays(-3))
+            $Budget = 1
+            $Flush = Send-AUOutbox -OutboxDir $Untrusted -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender (New-TestSender).Block
+            $Flush.OutboxSkipped | Should -BeTrue
+            Test-Path -LiteralPath $Planted | Should -BeTrue
+        }
     }
 }
