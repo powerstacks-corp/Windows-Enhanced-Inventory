@@ -1028,6 +1028,25 @@ Describe 'Invoke-AppUsage recalculates every entry (D13, F16, F17, F22, F29)' {
         $Gamma[0].LastUsedTime | Should -BeExactly '2026-11-20T15:30:00.0000000Z'
     }
 
+    It 'doesn''t mark the Window Manager and Font Driver Host virtual accounts Deleted (Task 21)' {
+        $Dwm = 'S-1-5-90-0-1'
+        $Umfd = 'S-1-5-96-0-1'
+        Save-TestLedger @(
+            (New-TestEntry $Dwm 'dwm.exe' @{ Facts = (New-TestFacts 'dwm.exe'); LastRanTime = $script:Earlier })
+            (New-TestEntry $Umfd 'fontdrvhost.exe' @{ Facts = (New-TestFacts 'fontdrvhost.exe'); LastRanTime = $script:Earlier })
+            (New-TestEntry $script:Gone 'gamma.exe' @{ Facts = (New-TestFacts 'gamma.exe'); LastRanTime = $script:Earlier })
+        )
+        $script:ScopeSeen = $null
+        Mock Get-AUInstallStatus { if ($null -eq $script:ScopeSeen) { $script:ScopeSeen = $ScopeRead.Clone() }; 'Unmatched' }
+        $script:Logged = New-Object 'System.Collections.Generic.List[string]'
+        function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) $script:Logged.Add($Message) }
+        $null = Invoke-AppUsage -RunId $script:Run
+        $script:ScopeSeen[$script:Gone] | Should -BeExactly 'Deleted'
+        $script:ScopeSeen.ContainsKey($Dwm) | Should -BeFalse
+        $script:ScopeSeen.ContainsKey($Umfd) | Should -BeFalse
+        @($script:Logged | Where-Object { $_ -like 'App Usage: * ledger users are no longer in ProfileList (Deleted).' }) | Should -Be @('App Usage: 1 ledger users are no longer in ProfileList (Deleted).')
+    }
+
     It 'gives the deleted user''s per-user target NotInstalled on its own (F29)' {
         Save-TestLedger @((New-TestEntry $script:Gone 'gamma.exe' @{ Facts = (New-TestFacts 'gamma.exe'); LastRanTime = $script:Earlier }))
         $script:Entries = $null

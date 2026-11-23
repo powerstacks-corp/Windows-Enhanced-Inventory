@@ -10824,7 +10824,10 @@ function Add-AUDeletedScopes
     Marks each SID that's no longer in ProfileList Deleted in ScopeRead, and returns how many (F29).
 .DESCRIPTION
     A SID already in ScopeRead keeps its state. With no users (ProfileList couldn't be read),
-    nothing is marked, because a profile can't be known to be gone.
+    nothing is marked, because a profile can't be known to be gone. Only interactive SIDs
+    (Test-AUInteractiveUserType: CloudOnly, Domain, Local) are marked: SYSTEM, service, and virtual
+    accounts such as Window Manager (S-1-5-90-*) and Font Driver Host (S-1-5-96-*) never have a
+    profile, so their absence from ProfileList doesn't mean a deleted user (Task 21).
 .PARAMETER ScopeRead
     The discovery's ScopeRead.
 .PARAMETER Users
@@ -10846,6 +10849,7 @@ function Add-AUDeletedScopes
     {
         $Value = ([string]$Sid).Trim()
         if (-not $Value -or $Profiles.Contains($Value)) { continue }
+        if (-not (Test-AUInteractiveUserType (Get-AUUserType -Sid $Value -MachineDomainSid ''))) { continue }
         $Known = $false
         foreach ($Name in $ScopeRead.Keys) { if ([string]::Equals([string]$Name, $Value, [StringComparison]::OrdinalIgnoreCase)) { $Known = $true; break } }
         if ($Known) { continue }
@@ -10999,8 +11003,8 @@ function Invoke-AUCollection
        Merge-AUSrumRecords runs only when the read is OK with rows (F10), with UserTypes from the
        rows' own SIDs (case-insensitive), and with -NoArchive when the copy was repaired or the read
        is incomplete.
-    5. Ledger SIDs missing from ProfileList become Deleted in ScopeRead (F29), after the merge so a
-       deleted user's new rows count too.
+    5. Interactive ledger SIDs missing from ProfileList become Deleted in ScopeRead (F29), after the
+       merge so a deleted user's new rows count too. Service and virtual accounts never do.
     6. Every ledger entry is recalculated (Set-AUEntryResult; Package-kind entries only with
        IncludeStore), with one read budget and one service map for the run (F36).
     7. Invoke-AULedgerFold, then Get-AUKnownExes, Get-AUAppUsage, ConvertTo-AUExeUsage, and

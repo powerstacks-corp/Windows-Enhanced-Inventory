@@ -62,3 +62,42 @@ Describe 'Test-AUInteractiveUserType' {
         Test-AUInteractiveUserType 'Unknown' | Should -BeFalse
     }
 }
+
+Describe 'Add-AUDeletedScopes (F29, Task 21)' {
+    BeforeAll {
+        $script:Profiles = @([pscustomobject]@{ Sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001' })
+    }
+
+    It 'marks an interactive SID that isn''t in ProfileList Deleted: <Sid>' -ForEach @(
+        @{ Sid = 'S-1-12-1-9999-9999-9999-9999' }
+        @{ Sid = 'S-1-5-21-1111111111-2222222222-3333333333-1002' }
+        @{ Sid = 'S-1-5-21-4444444444-5555555555-6666666666-1001' }
+    ) {
+        $Scopes = @{ Machine = 'Read' }
+        Add-AUDeletedScopes -ScopeRead $Scopes -Users $script:Profiles -Sids @($Sid) | Should -Be 1
+        $Scopes[$Sid] | Should -BeExactly 'Deleted'
+    }
+
+    It 'leaves a service, virtual, or system account that never has a profile alone: <Sid>' -ForEach @(
+        @{ Sid = 'S-1-5-90-0-1' }
+        @{ Sid = 'S-1-5-96-0-1' }
+        @{ Sid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' }
+        @{ Sid = 'S-1-5-82-3006700770-424185619-1745488364-794895919-4004696415' }
+        @{ Sid = 'S-1-5-83-1-1111111111-2222222222-3333333333-4444444444' }
+        @{ Sid = 'S-1-5-18' }
+        @{ Sid = 'S-1-5-19' }
+        @{ Sid = 'S-1-5-20' }
+        @{ Sid = 'S-1-5-32-544' }
+    ) {
+        $Scopes = @{ Machine = 'Read' }
+        Add-AUDeletedScopes -ScopeRead $Scopes -Users $script:Profiles -Sids @($Sid) | Should -Be 0
+        $Scopes.ContainsKey($Sid) | Should -BeFalse
+    }
+
+    It 'counts only the interactive SIDs it marks' {
+        $Scopes = @{ Machine = 'Read' }
+        $Sids = @('S-1-5-90-0-1', 'S-1-5-90-0-2', 'S-1-5-96-0-1', 'S-1-12-1-9999-9999-9999-9999', 'S-1-5-21-1111111111-2222222222-3333333333-1001')
+        Add-AUDeletedScopes -ScopeRead $Scopes -Users $script:Profiles -Sids $Sids | Should -Be 1
+        @($Scopes.Keys | Where-Object { $Scopes[$_] -eq 'Deleted' }) | Should -Be @('S-1-12-1-9999-9999-9999-9999')
+    }
+}
