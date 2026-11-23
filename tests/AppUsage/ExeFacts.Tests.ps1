@@ -3,7 +3,12 @@ BeforeAll {
     # A silent logger with the real one's parameters, so tests can check what was logged with a ParameterFilter.
     function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) }
 
-    $script:TestSid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+    # The entry's user is the account running the tests, which owns the files the tests create, so
+    # those files pass the owner check outside the protected roots (I2).
+    $script:TestSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    # Another user, who doesn't own the test files.
+    $script:OtherSid = 'S-1-5-21-1111111111-2222222222-3333333333-1002'
+    $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     $script:Epoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
     $script:OldBuild = New-Object DateTime 2025, 3, 4, 5, 6, 7, ([DateTimeKind]::Utc)
     $script:NewBuild = New-Object DateTime 2026, 10, 11, 12, 13, 14, ([DateTimeKind]::Utc)
@@ -698,7 +703,7 @@ Describe 'Get-AUExeFacts' {
         $script:VersionInfo = Get-TestVersionInfo $script:Notepad
         Mock Read-AUFile {
             [pscustomobject]@{ Status = 'OK'; Before = [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' }; Info = $script:VersionInfo
-                After = [pscustomobject]@{ LinkTimeUtc = $script:NewBuild; CheckSum = [uint32]0x20; Subsystem = 'GUI' }; Error = $null; Owner = $null }
+                After = [pscustomobject]@{ LinkTimeUtc = $script:NewBuild; CheckSum = [uint32]0x20; Subsystem = 'GUI' }; Error = $null; Owner = $script:TestSid }
         }
         $facts = Get-AUExeFacts $script:Path $info @{} @{} $script:TestSid
         $facts.FactsVerified | Should -BeFalse
@@ -746,12 +751,168 @@ Describe 'Get-AUExeFacts' {
         New-TestPe $script:Path $script:OldBuild 0x10
         Mock Read-AUFile {
             [pscustomobject]@{ Status = 'OK'; Before = [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' }; Info = $null
-                After = [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' }; Error = 'boom'; Owner = $null }
+                After = [pscustomobject]@{ LinkTimeUtc = $script:OldBuild; CheckSum = [uint32]0x10; Subsystem = 'GUI' }; Error = 'boom'; Owner = $script:TestSid }
         }
         $facts = Get-AUExeFacts $script:Path (New-TestExeInfo 'app.exe' $script:OldBuild 0x10) @{} @{} $script:TestSid
         $facts.FactsVerified | Should -BeFalse
         $facts.RunPath | Should -BeExactly $script:Path
         Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match 'boom' -and $Type -eq 2 }
+    }
+}
+
+Describe 'The owner check outside the protected roots (I2)' {
+    BeforeDiscovery {
+        $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    BeforeAll {
+        function Set-TestOwner([string]$Path, [string]$Sid)
+        {
+            $Security = [IO.File]::GetAccessControl($Path, [Security.AccessControl.AccessControlSections]::Owner)
+            $Security.SetOwner((New-Object Security.Principal.SecurityIdentifier $Sid))
+            [IO.File]::SetAccessControl($Path, $Security)
+        }
+        function Copy-TestFile([string]$From, [string]$To)
+        {
+            [void](New-Item -ItemType Directory -Force -Path (Split-Path $To))
+            Copy-Item -LiteralPath $From -Destination $To -Force
+        }
+    }
+    BeforeEach {
+        # A second fixed drive's \Program Files, which any user can create (TestDrive stands in for D:).
+        $script:Planted = Join-Path (Get-AULongPath $TestDrive) "D-$([guid]::NewGuid().ToString('N'))\Program Files\Contoso\app.exe"
+        Copy-TestFile $script:Notepad $script:Planted
+        Set-TestOwner $script:Planted $script:TestSid
+        $script:PlantedInfo = Get-TestExeInfoOf $script:Planted 'app.exe'
+        Mock Write-CMTraceLog { }
+    }
+
+    It 'finds the protected roots and the user-writable folders inside them from the machine' {
+        $roots = Get-AUProtectedRoots
+        $pf = [Environment]::GetFolderPath('ProgramFiles').TrimEnd('\')
+        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
+        foreach ($folder in @($win, $pf, [Environment]::GetFolderPath('ProgramFilesX86').TrimEnd('\'), "$pf\WindowsApps"))
+        {
+            @($roots.Allowed | Where-Object { [string]::Equals($_, $folder, [StringComparison]::OrdinalIgnoreCase) }).Count | Should -Be 1 -Because $folder
+        }
+        @($roots.Allowed).Count | Should -Be 4
+        foreach ($folder in @("$win\Temp", "$win\Tasks", "$win\Tracing", "$win\System32\Tasks", "$win\System32\spool\drivers\color", "$win\SysWOW64\Tasks", "$win\System32\com\dmp"))
+        {
+            @($roots.Excluded | Where-Object { [string]::Equals($_, $folder, [StringComparison]::OrdinalIgnoreCase) }).Count | Should -Be 1 -Because $folder
+        }
+        @($roots.Allowed + $roots.Excluded) | ForEach-Object { $_ | Should -Not -Match '%|\\$' }
+        (New-AUReadBudget).ProtectedRoots.Allowed.Count | Should -Be 4
+    }
+
+    It 'treats only the protected roots as protected, without their user-writable folders' {
+        $pf = [Environment]::GetFolderPath('ProgramFiles').TrimEnd('\')
+        $pf86 = [Environment]::GetFolderPath('ProgramFilesX86').TrimEnd('\')
+        $win = [Environment]::GetFolderPath('Windows').TrimEnd('\')
+        $other = if ($win.StartsWith('C:', [StringComparison]::OrdinalIgnoreCase)) { 'D:' } else { 'C:' }
+        $roots = Get-AUProtectedRoots
+        foreach ($protected in @("$win\System32\notepad.exe", "$win\explorer.exe", "$win\IMECache\x\setup.exe", "$pf\Contoso\app.exe", "$pf86\Contoso\app.exe",
+                "$pf\WindowsApps\Contoso.App_1.0.0.0_x64__abc\app.exe", "$win\SysWOW64\where.exe", "$($pf.ToUpperInvariant())\CONTOSO\APP.EXE",
+                ($pf.Replace('\', '/') + '/Contoso/app.exe'), "\\?\$win\System32\notepad.exe", "$win\System32\drivers\..\notepad.exe"))
+        {
+            Test-AUProtectedPath $protected $roots | Should -BeTrue -Because $protected
+        }
+        foreach ($open in @("$win\Temp\setup.exe", "$win\Tasks\x.exe", "$win\Tracing\x.exe", "$win\System32\Tasks\evil.exe", "$win\System32\spool\drivers\color\x.exe",
+                "$win\SysWOW64\Tasks\x.exe", 'C:\Users\alice\AppData\Local\Contoso\app.exe', 'C:\ProgramData\Contoso\agent.exe', "$other\Program Files\Contoso\app.exe",
+                "$other\Windows\System32\x.exe", "$pf\..\Users\alice\x.exe", "${pf}X\app.exe", "${win}Evil\x.exe", 'Contoso\app.exe', '', $null))
+        {
+            Test-AUProtectedPath $open $roots | Should -BeFalse -Because "$open"
+        }
+        # Without roots, it reads them itself.
+        Test-AUProtectedPath "$win\System32\notepad.exe" | Should -BeTrue
+        Test-AUProtectedPath "$win\Temp\x.exe" | Should -BeFalse
+    }
+
+    It 'lets an excluded folder win over the protected root that holds it' {
+        $roots = [pscustomobject]@{ Allowed = @('D:\Apps'); Excluded = @('D:\Apps\Drop') }
+        Test-AUProtectedPath 'D:\Apps\tool.exe' $roots | Should -BeTrue
+        Test-AUProtectedPath 'D:\Apps\Drop\tool.exe' $roots | Should -BeFalse
+        Test-AUProtectedPath 'D:\AppsX\tool.exe' $roots | Should -BeFalse
+    }
+
+    It 'trusts only SYSTEM, Administrators, TrustedInstaller, and the entry''s own user as owners' {
+        foreach ($sid in @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'))
+        {
+            Test-AUTrustedFileOwner -Owner $sid -UserSid $script:OtherSid | Should -BeTrue -Because $sid
+        }
+        Test-AUTrustedFileOwner -Owner $script:OtherSid -UserSid $script:OtherSid | Should -BeTrue
+        Test-AUTrustedFileOwner -Owner $script:OtherSid.ToLowerInvariant() -UserSid $script:OtherSid | Should -BeTrue
+        Test-AUTrustedFileOwner -Owner $script:TestSid -UserSid $script:OtherSid | Should -BeFalse
+        Test-AUTrustedFileOwner -Owner 'S-1-5-32-545' -UserSid $script:OtherSid | Should -BeFalse
+        Test-AUTrustedFileOwner -Owner 'S-1-1-0' -UserSid '' | Should -BeFalse
+        Test-AUTrustedFileOwner -Owner $null -UserSid $script:OtherSid | Should -BeFalse
+        Test-AUTrustedFileOwner -Owner '' -UserSid '' | Should -BeFalse
+    }
+
+    It 'reads a file''s owner, and fails closed for a link, a folder, a missing file, or a relative path' {
+        Get-AUFileOwner $script:Planted | Should -BeExactly $script:TestSid
+        $target = Join-Path $TestDrive "target-$([guid]::NewGuid().ToString('N'))"
+        Copy-TestFile $script:Notepad (Join-Path $target 'app.exe')
+        $link = Join-Path $TestDrive "link-$([guid]::NewGuid().ToString('N'))"
+        $null = cmd.exe /c mklink /J "$link" "$target"
+        Test-Path -LiteralPath (Join-Path $link 'app.exe') | Should -BeTrue
+        Get-AUFileOwner (Join-Path $link 'app.exe') | Should -BeNullOrEmpty
+        Get-AUFileOwner (Split-Path $script:Planted) | Should -BeNullOrEmpty
+        Get-AUFileOwner (Join-Path $TestDrive 'missing.exe') | Should -BeNullOrEmpty
+        Get-AUFileOwner 'Contoso\app.exe' | Should -BeNullOrEmpty
+        Get-AUFileOwner $null | Should -BeNullOrEmpty
+        Read-AUFileFacts $script:Planted -WithOwner | Select-Object -ExpandProperty Owner | Should -BeExactly $script:TestSid
+        Read-AUFileFacts $script:Planted | Select-Object -ExpandProperty Owner | Should -BeNullOrEmpty
+    }
+
+    It 'gives another user''s entry no facts and no evidence from a file that user doesn''t own, and counts it without logging the path' {
+        $budget = New-AUReadBudget
+        try
+        {
+            $facts = Get-AUExeFacts $script:Planted $script:PlantedInfo @{ $script:Planted.ToLowerInvariant() = '{AAAAAAAA-0000-0000-0000-000000000001}' } @{} $script:OtherSid -ReadBudget $budget
+            $facts.FactsVerified | Should -BeFalse
+            $facts.PathEvidence | Should -BeNullOrEmpty
+            $facts.FileCompanyName | Should -BeNullOrEmpty
+            $facts.FileProductName | Should -BeNullOrEmpty
+            $facts.Subsystem | Should -BeNullOrEmpty
+            $facts.MsiProductCode | Should -BeNullOrEmpty
+            $facts.RunPath | Should -BeExactly $script:Planted
+            $budget.UntrustedOwner | Should -Be 1
+
+            # An updated build (no fingerprint match) gives no PathEvidence either.
+            $unverified = Get-AUExeFacts $script:Planted (New-TestExeInfo 'app.exe' $script:OldBuild 0x10) @{} @{} $script:OtherSid -ReadBudget $budget
+            $unverified.PathEvidence | Should -BeNullOrEmpty
+            $budget.UntrustedOwner | Should -Be 2
+            Should -Invoke Write-CMTraceLog -Times 0 -ParameterFilter { $Message -like "*$($script:Planted)*" -or $Message -like '*Program Files\Contoso*' }
+        }
+        finally { Close-AUReadBudget $budget }
+    }
+
+    It 'gives the owner''s own entry its verified facts' {
+        $facts = Get-AUExeFacts $script:Planted $script:PlantedInfo @{} @{} $script:TestSid
+        $facts.FactsVerified | Should -BeTrue
+        $facts.FileProductName | Should -Not -BeNullOrEmpty
+    }
+
+    It 'gives any user''s entry verified facts from a file Administrators own' -Skip:(-not $script:IsAdmin) {
+        Set-TestOwner $script:Planted 'S-1-5-32-544'
+        (Get-AUExeFacts $script:Planted $script:PlantedInfo @{} @{} $script:OtherSid).FactsVerified | Should -BeTrue
+    }
+
+    It 'checks no owner inside the protected roots' {
+        Mock Test-AUProtectedPath { $true }
+        (Get-AUExeFacts $script:Planted $script:PlantedInfo @{} @{} $script:OtherSid).FactsVerified | Should -BeTrue
+    }
+
+    It 'fails closed under a link: even the owner''s own entry gets no facts' {
+        $link = Join-Path $TestDrive "link-$([guid]::NewGuid().ToString('N'))"
+        $null = cmd.exe /c mklink /J "$link" (Split-Path $script:Planted)
+        $facts = Get-AUExeFacts (Join-Path $link 'app.exe') $script:PlantedInfo @{} @{} $script:TestSid
+        $facts.FactsVerified | Should -BeFalse
+        $facts.PathEvidence | Should -BeNullOrEmpty
+    }
+
+    It 'logs a line without the path when there is no run budget to count it in' {
+        $null = Get-AUExeFacts $script:Planted $script:PlantedInfo @{} @{} $script:OtherSid
+        Should -Invoke Write-CMTraceLog -Times 1 -Exactly -ParameterFilter { $Message -like '*owner*' -and $Message -notlike "*$($script:Planted)*" }
     }
 }
 

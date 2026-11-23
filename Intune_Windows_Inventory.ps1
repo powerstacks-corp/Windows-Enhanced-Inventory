@@ -7200,32 +7200,215 @@ function Get-AUVersionInfo
     return [Diagnostics.FileVersionInfo]::GetVersionInfo((ConvertTo-AUIoPath $Path))
 }#endfunction
 
+# Folders under the protected roots that standard users can write to on stock Windows: under
+# %SystemRoot% itself, and under System32 and SysWOW64. A file there gets the owner check.
+$script:AUUserWritableWindowsFolders = @('Temp', 'Tasks', 'Tracing', 'Registration\CRMLog', 'debug\WIA')
+$script:AUUserWritableSystemFolders = @('Tasks', 'Tasks_Migrated', 'spool\drivers\color', 'spool\PRINTERS', 'spool\SERVERS', 'Microsoft\Crypto\RSA\MachineKeys', 'com\dmp', 'FxsTmp')
+# The owners whose files outside the protected roots give verified facts, besides the entry's own
+# user: SYSTEM, Administrators, and TrustedInstaller.
+$script:AUTrustedFileOwnerSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+
+function Get-AUProtectedRoots
+{
+    <#
+.SYNOPSIS
+    Returns the folders standard users can't write to (Allowed) and the user-writable folders inside them (Excluded).
+.DESCRIPTION
+    Allowed: %SystemRoot%, %ProgramFiles%, %ProgramFiles(x86)%, and %ProgramFiles%\WindowsApps.
+    Excluded: the folders in AUUserWritableWindowsFolders under %SystemRoot%, such as
+    C:\Windows\Temp, and those in AUUserWritableSystemFolders under System32 and SysWOW64, such as
+    System32\Tasks. The locations come from the machine's registry (ProgramFilesDir,
+    ProgramFilesDir (x86), and SystemRoot), never from user variables, with the known-folder API as
+    the fallback. No trailing backslash. A location that can't be found is left out, so its files
+    get the owner check. Never throws.
+#>
+    $Read = {
+        param ([string]$KeyPath, [string]$Name)
+        $Base = $null
+        $Key = $null
+        try
+        {
+            $Base = Open-AURegistryBase -Hive Machine
+            $Key = $Base.OpenSubKey($KeyPath)
+            if ($null -eq $Key) { return $null }
+            return [string]$Key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        catch { return $null }
+        finally
+        {
+            if ($null -ne $Key) { $Key.Close() }
+            if ($null -ne $Base) { $Base.Close() }
+        }
+    }
+    $Clean = {
+        param ([string]$Folder, [string]$Fallback)
+        if ([string]::IsNullOrWhiteSpace($Folder) -or $Folder.IndexOf('%') -ge 0) { $Folder = $Fallback }
+        if ([string]::IsNullOrWhiteSpace($Folder)) { return $null }
+        $Folder = $Folder.Trim().TrimEnd('\')
+        if ($Folder -notmatch '^[A-Za-z]:\\[^\\]') { return $null }
+        return $Folder
+    }
+
+    $Allowed = New-Object 'System.Collections.Generic.List[string]'
+    $Excluded = New-Object 'System.Collections.Generic.List[string]'
+    try
+    {
+        $ProgramFiles = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows\CurrentVersion' 'ProgramFilesDir') ([Environment]::GetFolderPath('ProgramFiles'))
+        $ProgramFilesX86 = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows\CurrentVersion' 'ProgramFilesDir (x86)') ([Environment]::GetFolderPath('ProgramFilesX86'))
+        $SystemRoot = & $Clean (& $Read 'SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'SystemRoot') ([Environment]::GetFolderPath('Windows'))
+        if ($ProgramFiles) { $Allowed.Add($ProgramFiles); $Allowed.Add($ProgramFiles + '\WindowsApps') }
+        if ($ProgramFilesX86) { $Allowed.Add($ProgramFilesX86) }
+        if ($SystemRoot)
+        {
+            $Allowed.Add($SystemRoot)
+            foreach ($Folder in $script:AUUserWritableWindowsFolders) { $Excluded.Add($SystemRoot + '\' + $Folder) }
+            foreach ($System in @('System32', 'SysWOW64'))
+            {
+                foreach ($Folder in $script:AUUserWritableSystemFolders) { $Excluded.Add($SystemRoot + '\' + $System + '\' + $Folder) }
+            }
+        }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't find the system folders; every file gets the owner check: $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
+    return [pscustomobject]@{ Allowed = $Allowed.ToArray(); Excluded = $Excluded.ToArray() }
+}#endfunction
+
+function Test-AUProtectedPath
+{
+    <#
+.SYNOPSIS
+    Tests whether a file is inside a protected root that standard users can't write to (Get-AUProtectedRoots).
+.DESCRIPTION
+    The path is normalized with GetFullPath (forward slashes, a \\?\ prefix, . and .. segments, and
+    existing 8.3 short names resolved) and compared ignoring case with each folder plus a trailing
+    backslash: Excluded first, then Allowed. Anything else (a user profile, C:\Windows\Temp,
+    System32\Tasks, ProgramData, another drive's \Program Files) is a place another user could
+    have created the file, so Get-AUExeFacts checks its owner. A path that doesn't normalize is false.
+.PARAMETER Path
+    The drive-letter path.
+.PARAMETER Roots
+    The Get-AUProtectedRoots result (a read budget's ProtectedRoots), or $null to read it now.
+#>
+    param (
+        [string]$Path,
+        [pscustomobject]$Roots
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $Full = $Path.Trim().Replace('/', '\')
+    if ($Full.StartsWith('\\?\')) { $Full = $Full.Substring(4) }
+    if ($Full -notmatch '^[A-Za-z]:\\') { return $false }
+    try { $Full = [IO.Path]::GetFullPath($Full) }
+    catch { return $false }
+    if ($null -eq $Roots) { $Roots = Get-AUProtectedRoots }
+    foreach ($Folder in @($Roots.Excluded)) { if ($Folder -and $Full.StartsWith($Folder + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false } }
+    foreach ($Folder in @($Roots.Allowed)) { if ($Folder -and $Full.StartsWith($Folder + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}#endfunction
+
+function Test-AUTrustedFileOwner
+{
+    <#
+.SYNOPSIS
+    Tests whether a file's owner is one whose file may give an entry verified facts: SYSTEM, Administrators, TrustedInstaller, or the entry's own user.
+.PARAMETER Owner
+    The owner's SID (Get-AUFileOwner), or $null when it couldn't be read.
+.PARAMETER UserSid
+    The entry's user SID.
+#>
+    param (
+        [string]$Owner,
+        [string]$UserSid
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Owner)) { return $false }
+    $Owner = $Owner.Trim()
+    if ($script:AUTrustedFileOwnerSids -contains $Owner) { return $true }
+    return (-not [string]::IsNullOrWhiteSpace($UserSid) -and [string]::Equals($Owner, $UserSid.Trim(), [StringComparison]::OrdinalIgnoreCase))
+}#endfunction
+
+function Get-AUFileOwner
+{
+    <#
+.SYNOPSIS
+    Returns a file's owner SID, or $null when the file, or any folder above it, is a link (a reparse point), or the owner can't be read.
+.DESCRIPTION
+    In-box .NET can't read a file's owner from a handle that doesn't follow links, and
+    GetAccessControl opens the path and follows one. So the attributes of the file and of every
+    folder above it are read right before and right after the owner, and the result is $null when
+    any of them is a link, the file is a folder, or the two reads differ. Fails closed: any error
+    gives $null. Reading the owner asks only for READ_CONTROL. Read-AUFile runs this in its timed
+    runspace. Never throws.
+.PARAMETER Path
+    The drive-letter path.
+#>
+    param (
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -notmatch '^[A-Za-z]:\\[^\\]') { return $null }
+    try
+    {
+        # The file, then each folder above it, without the drive root.
+        $Chain = New-Object 'System.Collections.Generic.List[string]'
+        $Current = $Path.TrimEnd('\')
+        while ($Current.Length -gt 2)
+        {
+            $Chain.Add((ConvertTo-AUIoPath $Current))
+            $Current = $Current.Substring(0, $Current.LastIndexOf('\'))
+        }
+        $Before = New-Object 'System.Collections.Generic.List[int]'
+        foreach ($Item in $Chain) { $Before.Add([int][IO.File]::GetAttributes($Item)) }
+        foreach ($Value in $Before) { if (($Value -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { return $null } }
+        if (($Before[0] -band [int][IO.FileAttributes]::Directory) -ne 0) { return $null }
+        $Owner = [IO.File]::GetAccessControl($Chain[0], [Security.AccessControl.AccessControlSections]::Owner).GetOwner([Security.Principal.SecurityIdentifier])
+        for ($i = 0; $i -lt $Chain.Count; $i++)
+        {
+            if ([int][IO.File]::GetAttributes($Chain[$i]) -ne $Before[$i]) { return $null }
+        }
+        if ($null -eq $Owner) { return $null }
+        return [string]$Owner.Value
+    }
+    catch { return $null }
+}#endfunction
+
 function Read-AUFileFacts
 {
     <#
 .SYNOPSIS
-    Reads a file's PE fingerprint and, optionally, its version info and its fingerprint again: Status, Before, Info, After, Error.
+    Reads a file's PE fingerprint and, optionally, its version info and fingerprint again, and its owner: Status, Before, Info, After, Error, Owner.
 .DESCRIPTION
     The version info is read only when the file is a PE image, and the fingerprint is read again
     after it, so a file replaced mid-read shows a different After. Error holds a version-read
-    failure's message. Status is OK. Read-AUFile runs this in its timed runspace. Never throws.
+    failure's message. With WithOwner, the owner (Get-AUFileOwner) is read before and after the
+    rest, and Owner is set only when both reads give the same SID, so a file swapped during the
+    read has no owner. Status is OK. Read-AUFile runs this in its timed runspace. Never throws.
 .PARAMETER Path
     The drive-letter path.
 .PARAMETER WithVersion
     Also read the version info and the fingerprint after it.
+.PARAMETER WithOwner
+    Also read the owner.
 #>
     param (
         [string]$Path,
-        [switch]$WithVersion
+        [switch]$WithVersion,
+        [switch]$WithOwner
     )
 
-    $Result = [pscustomobject]@{ Status = 'OK'; Before = $null; Info = $null; After = $null; Error = $null }
+    $Result = [pscustomobject]@{ Status = 'OK'; Before = $null; Info = $null; After = $null; Error = $null; Owner = $null }
+    $OwnerBefore = $null
+    if ($WithOwner) { $OwnerBefore = Get-AUFileOwner $Path }
     $Result.Before = Get-AUPeFingerprint $Path
     if ($WithVersion -and $null -ne $Result.Before)
     {
         try { $Result.Info = Get-AUVersionInfo $Path }
         catch { $Result.Error = $_.Exception.Message }
         $Result.After = Get-AUPeFingerprint $Path
+    }
+    if ($WithOwner -and $OwnerBefore)
+    {
+        $OwnerAfter = Get-AUFileOwner $Path
+        if ([string]::Equals($OwnerBefore, $OwnerAfter, [StringComparison]::OrdinalIgnoreCase)) { $Result.Owner = $OwnerBefore }
     }
     return $Result
 }#endfunction
@@ -7243,12 +7426,12 @@ function Get-AUFileReadScript
     [void]$Builder.AppendLine("`$script:AUFileShare = [IO.FileShare]$([int]$script:AUFileShare)")
     [void]$Builder.AppendLine("`$script:AUPeHeaderBytes = $script:AUPeHeaderBytes")
     [void]$Builder.AppendLine("`$script:AUUnixEpoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)")
-    foreach ($Name in @('ConvertTo-AUIoPath', 'Get-AUPeFingerprint', 'Get-AUVersionInfo', 'Read-AUFileFacts'))
+    foreach ($Name in @('ConvertTo-AUIoPath', 'Get-AUPeFingerprint', 'Get-AUVersionInfo', 'Get-AUFileOwner', 'Read-AUFileFacts'))
     {
         $Body = (Get-Command -Name $Name -CommandType Function).ScriptBlock.ToString()
         [void]$Builder.AppendLine("function $Name {").AppendLine($Body).AppendLine('}')
     }
-    [void]$Builder.AppendLine('Read-AUFileFacts -Path $args[0] -WithVersion:$args[1]')
+    [void]$Builder.AppendLine('Read-AUFileFacts -Path $args[0] -WithVersion:$args[1] -WithOwner:$args[2]')
     return $Builder.ToString()
 }#endfunction
 
@@ -7261,7 +7444,9 @@ function New-AUReadBudget
     Task 15 creates one read budget per run, passes it to Find-AUExePath and Get-AUExeFacts, and
     closes it with Close-AUReadBudget in a finally block. RemainingMs falls by the time every read
     takes; once it's spent, the remaining files are skipped (unverified, no facts). Reads,
-    TimedOut, and Skipped count what happened. The runspace is created on the first read.
+    TimedOut, and Skipped count what happened, and UntrustedOwner the files outside the protected
+    roots that gave no facts because of their owner (Get-AUExeFacts). ProtectedRoots is read once
+    (Get-AUProtectedRoots). The runspace is created on the first read.
 .PARAMETER TotalSeconds
     The run's total for timed reads.
 .PARAMETER FileTimeoutSeconds
@@ -7273,13 +7458,15 @@ function New-AUReadBudget
     )
 
     return [pscustomobject]@{
-        TimeoutMs   = [int][Math]::Max(1, [Math]::Round($FileTimeoutSeconds * 1000))
-        RemainingMs = [double]([Math]::Max(0, $TotalSeconds * 1000))
-        Runspace    = $null
-        ScriptText  = $null
-        Reads       = 0
-        TimedOut    = 0
-        Skipped     = 0
+        TimeoutMs      = [int][Math]::Max(1, [Math]::Round($FileTimeoutSeconds * 1000))
+        RemainingMs    = [double]([Math]::Max(0, $TotalSeconds * 1000))
+        Runspace       = $null
+        ScriptText     = $null
+        Reads          = 0
+        TimedOut       = 0
+        Skipped        = 0
+        UntrustedOwner = 0
+        ProtectedRoots = (Get-AUProtectedRoots)
     }
 }#endfunction
 
@@ -7319,6 +7506,8 @@ function Read-AUFile
     The drive-letter path.
 .PARAMETER WithVersion
     Also read the version info and the fingerprint after it.
+.PARAMETER WithOwner
+    Also read the file's owner (Read-AUFileFacts).
 .PARAMETER ReadBudget
     The run's New-AUReadBudget result (Task 15 creates one per run and closes it in a finally
     block). With none, a budget for this one read is made and closed.
@@ -7326,12 +7515,13 @@ function Read-AUFile
     param (
         [string]$Path,
         [switch]$WithVersion,
+        [switch]$WithOwner,
         [pscustomobject]$ReadBudget
     )
 
     $Own = $null
     if ($null -eq $ReadBudget) { $Own = New-AUReadBudget; $ReadBudget = $Own }
-    $Result = [pscustomobject]@{ Status = 'Failed'; Before = $null; Info = $null; After = $null; Error = $null }
+    $Result = [pscustomobject]@{ Status = 'Failed'; Before = $null; Info = $null; After = $null; Error = $null; Owner = $null }
     $Shell = $null
     $Started = $false
     $Finished = $false
@@ -7356,7 +7546,7 @@ function Read-AUFile
         }
         $Shell = [PowerShell]::Create()
         $Shell.Runspace = $ReadBudget.Runspace
-        [void]$Shell.AddScript($ReadBudget.ScriptText).AddArgument($Path).AddArgument([bool]$WithVersion)
+        [void]$Shell.AddScript($ReadBudget.ScriptText).AddArgument($Path).AddArgument([bool]$WithVersion).AddArgument([bool]$WithOwner)
         $Async = $Shell.BeginInvoke()
         $Started = $true
         if ($Async.AsyncWaitHandle.WaitOne($Wait))
@@ -7643,13 +7833,20 @@ function Get-AUExeFacts
     FileVersion, ProductVersion, FactsVerified, Subsystem, MsiProductCode, PackageFamily,
     IsServiceBinary, UserSid, and PathEvidence.
     Path-level facts come from the path: RunPath, LocationClass ($null with no path), and
-    IsServiceBinary (the service map). The file is read once with Read-AUFile (a timed read). Build facts (version info, Subsystem, and the Windows Installer owner) are
-    filled in only when the file's PE TimeDateStamp and CheckSum equal the ExeInfo's both before
-    and after the version info is read; FactsVerified says so. When the build is unverified and the
-    file at the path is a PE image, PathEvidence holds that current file's CompanyName and
-    ProductName: identity evidence only, never the build's facts (D30). A read that timed out or was
-    skipped for a spent budget gives no facts and no PathEvidence. A Package entry reads no file: it
-    gets its PackageFamily from the ExeInfo text, and no path. Never throws.
+    IsServiceBinary (the service map). The file is read once with Read-AUFile (a timed read).
+    Build facts (version info, Subsystem, and the Windows Installer owner) are filled in only when
+    the file's PE TimeDateStamp and CheckSum equal the ExeInfo's both before and after the version
+    info is read; FactsVerified says so. When the build is unverified and the file at the path is a
+    PE image, PathEvidence holds that current file's CompanyName and ProductName: identity evidence
+    only, never the build's facts (D30). A read that timed out or was skipped for a spent budget
+    gives no facts and no PathEvidence.
+    A file outside the protected roots (Test-AUProtectedPath) could have been created by another
+    user, for example under a second drive's \Program Files, so its owner is read too: unless it's
+    SYSTEM, Administrators, TrustedInstaller, or the entry's own user (Test-AUTrustedFileOwner), or
+    when it can't be read or the path holds a link, the file gives no facts and no PathEvidence.
+    Such a file is counted in the budget's UntrustedOwner, never logged by path.
+    A Package entry reads no file: it gets its PackageFamily from the ExeInfo text, and no path.
+    Never throws.
 .PARAMETER Path
     The Find-AUExePath path (verified, or the one observed path of an updated build), or $null.
 .PARAMETER ExeInfo
@@ -7711,8 +7908,18 @@ function Get-AUExeFacts
     $Facts.LocationClass = Get-AULocationClass $RunPath
     if ($null -ne $ServiceBinaries -and $ServiceBinaries.ContainsKey($Key)) { $Facts.IsServiceBinary = $true }
 
-    $Read = Read-AUFile $RunPath -WithVersion -ReadBudget $ReadBudget
+    $Roots = $null
+    if ($null -ne $ReadBudget) { $Roots = $ReadBudget.ProtectedRoots }
+    $CheckOwner = -not (Test-AUProtectedPath $RunPath $Roots)
+    $Read = Read-AUFile $RunPath -WithVersion -WithOwner:$CheckOwner -ReadBudget $ReadBudget
     if ($Read.Status -ne 'OK' -or $null -eq $Read.Before) { return $Facts }
+    if ($CheckOwner -and -not (Test-AUTrustedFileOwner -Owner $Read.Owner -UserSid $UserSid))
+    {
+        # Another user could have planted it: no facts and no evidence (I2).
+        if ($null -ne $ReadBudget) { $ReadBudget.UntrustedOwner++ }
+        else { Write-CMTraceLog -Message "App Usage: an executable file outside the protected folders has an owner that isn't trusted for its entry, so it's treated as unverified." -Component 'AppUsage' -Type 2 }
+        return $Facts
+    }
     if ($Read.Error) { Write-CMTraceLog -Message "App Usage: couldn't read the version info of $($RunPath): $($Read.Error)" -Component 'AppUsage' -Type 2 }
     $Info = $Read.Info
     if ($null -eq $Info) { return $Facts }
@@ -10325,7 +10532,7 @@ function Invoke-AUCollection
             Set-AUEntryResult -Entry $Entry -Context $Context
             $Entries.Add($Entry)
         }
-        Write-CMTraceLog -Message "App Usage: recalculated $($Entries.Count) of $($Keys.Count) ledger entries; $($ReadBudget.Reads) timed file reads, $($ReadBudget.TimedOut) timed out, $($ReadBudget.Skipped) skipped." -Component 'AppUsage'
+        Write-CMTraceLog -Message "App Usage: recalculated $($Entries.Count) of $($Keys.Count) ledger entries; $($ReadBudget.Reads) timed file reads, $($ReadBudget.TimedOut) timed out, $($ReadBudget.Skipped) skipped, $($ReadBudget.UntrustedOwner) with an untrusted owner." -Component 'AppUsage'
         & $EndStage 'Facts'
 
         # 7. Fold aged-out builds, then the output, from the folded ledger.

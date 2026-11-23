@@ -108,8 +108,8 @@ App Usage also sends one entry for each executable build it has seen and each ap
 | `RunPath` | The path the build ran from, when the script found it and confirmed it's the same build. |
 | `LocationClass` | The kind of folder it ran from: `Windows`, `ProgramFiles`, `UserProfile`, `Temp`, `Download`, `ManagementCache`, or `Other`. |
 | `FileDescription`, `FileProductName`, `FileCompanyName`, `FileVersion`, `ProductVersion` | The build's file details. Only when the script verified the build (`FactsVerified` is `true`); blank otherwise. |
-| `FactsVerified` | `true` when the file on disk is the build that ran. |
-| `EvidenceCompanyName`, `EvidenceProductName`, `EvidenceSource` | For a build the script couldn't verify: the company and product names of the file now at the same path, with `EvidenceSource` set to `CurrentFileAtPath`. They can match the executable to an app, but they aren't the build's own details. Blank for a verified build. |
+| `FactsVerified` | `true` when the file on disk is the build that ran. A file outside the Windows and Program Files folders counts only when SYSTEM, Administrators, TrustedInstaller, or the user who ran it owns the file, so one user can't plant a file that gives another user's executable its details. |
+| `EvidenceCompanyName`, `EvidenceProductName`, `EvidenceSource` | For a build the script couldn't verify: the company and product names of the file now at the same path, with `EvidenceSource` set to `CurrentFileAtPath`. They can match the executable to an app, but they aren't the build's own details. Blank for a verified build, and blank when the file is outside the Windows and Program Files folders and its owner isn't one of those listed for `FactsVerified`. |
 | `Subsystem` | Whether it's a console (command-line) or graphical program, when the script could tell. |
 | `Role` | The kind of executable it is. See [Role](#role). |
 | `ClassificationRuleId` | The ID of the ignore rule that matched it, or else of the classification rule that set its role. Blank when neither did. |

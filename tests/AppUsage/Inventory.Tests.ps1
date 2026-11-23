@@ -132,7 +132,7 @@ BeforeAll {
         Mock Get-AUInstalledApps { $script:Discovery }
         Mock Read-AUSrum { $script:Srum }
         Mock Get-AUServiceBinaries { @{} }
-        Mock New-AUReadBudget { [pscustomobject]@{ Id = 'run-budget'; TimeoutMs = 5000; RemainingMs = 120000; Runspace = $null; ScriptText = $null; Reads = 0; TimedOut = 0; Skipped = 0 } }
+        Mock New-AUReadBudget { [pscustomobject]@{ Id = 'run-budget'; TimeoutMs = 5000; RemainingMs = 120000; Runspace = $null; ScriptText = $null; Reads = 0; TimedOut = 0; Skipped = 0; UntrustedOwner = 0 } }
         Mock Close-AUReadBudget { }
         Mock Find-AUExePath { $null }
     }

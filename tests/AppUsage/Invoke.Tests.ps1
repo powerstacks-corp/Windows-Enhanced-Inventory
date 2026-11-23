@@ -212,7 +212,7 @@ BeforeAll {
         Mock Get-AUInstalledApps { $script:Discovery }
         Mock Read-AUSrum { $script:Srum }
         Mock Get-AUServiceBinaries { @{} }
-        Mock New-AUReadBudget { [pscustomobject]@{ Id = 'run-budget'; TimeoutMs = 5000; RemainingMs = 120000; Runspace = $null; ScriptText = $null; Reads = 0; TimedOut = 0; Skipped = 0 } }
+        Mock New-AUReadBudget { [pscustomobject]@{ Id = 'run-budget'; TimeoutMs = 5000; RemainingMs = 120000; Runspace = $null; ScriptText = $null; Reads = 0; TimedOut = 0; Skipped = 0; UntrustedOwner = 0 } }
         Mock Close-AUReadBudget { }
         Mock Find-AUExePath { $null }
     }
@@ -646,6 +646,14 @@ Describe 'Invoke-AppUsage results' {
         {
             @($script:Logged | Where-Object { $_ -like "App Usage: stage $Stage took * ms." }).Count | Should -Be 1 -Because $Stage
         }
+    }
+
+    It 'logs how many files had an untrusted owner, as a count (I2)' {
+        $script:Logged = New-Object 'System.Collections.Generic.List[string]'
+        function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) $script:Logged.Add($Message) }
+        Mock New-AUReadBudget { [pscustomobject]@{ Id = 'run-budget'; TimeoutMs = 5000; RemainingMs = 120000; Runspace = $null; ScriptText = $null; Reads = 3; TimedOut = 0; Skipped = 0; UntrustedOwner = 2 } }
+        $null = Invoke-AppUsage -RunId $script:Run
+        @($script:Logged | Where-Object { $_ -like 'App Usage: recalculated * 3 timed file reads, 0 timed out, 0 skipped, 2 with an untrusted owner.' }).Count | Should -Be 1
     }
 }
 
