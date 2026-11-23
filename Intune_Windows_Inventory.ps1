@@ -4641,7 +4641,8 @@ function Read-AULedger
     A missing file gives an empty ledger. A file that can't be read or parsed, or isn't a ledger of
     this schema, is moved aside (Move-AUUnreadableLedger) and never overwritten; the ledger starts
     empty, so it's rebuilt from SRUM, and Status holds LedgerReset. If the file can't be moved aside,
-    Writable is false and Write-AULedger leaves it alone. Dates come back as Utc dates. Never throws.
+    Writable is false and Write-AULedger leaves it alone. The log line names only the reason, the
+    exception type, and counts, never the file's text (D18). Dates come back as Utc dates. Never throws.
 .PARAMETER Path
     The ledger path, C:\Windows\AppUsage_<Serial>.json.
 #>
@@ -4651,26 +4652,45 @@ function Read-AULedger
 
     $Ledger = New-AULedger
     if (-not [IO.File]::Exists($Path)) { return $Ledger }
+    # The log line gives only the reason and counts: the exception text can quote the file, which holds
+    # other users' exe paths (D18).
+    $Reason = $null
+    $Characters = 0
+    $Number = 0
+    $Total = 0
     try
     {
+        $Reason = "the file couldn't be read"
         $Text = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+        $Characters = $Text.Length
+        $Reason = "it isn't valid JSON"
         $Data = ConvertFrom-Json -InputObject $Text -ErrorAction Stop
+        $Reason = "it isn't a ledger"
         if ($null -eq $Data -or $Data -isnot [pscustomobject] -or $null -eq $Data.PSObject.Properties['Entries']) { throw 'The file is not a ledger.' }
-        if ($Data.SchemaVersion -ne $script:AULedgerSchemaVersion) { throw "Ledger schema version '$($Data.SchemaVersion)' isn't $($script:AULedgerSchemaVersion)." }
+        $Reason = "its schema version isn't $($script:AULedgerSchemaVersion)"
+        if ($Data.SchemaVersion -ne $script:AULedgerSchemaVersion) { throw 'The ledger schema version is different.' }
+        $Reason = "its WatchingSince date isn't valid"
         $Ledger.WatchingSince = ConvertFrom-AULedgerDate $Data.WatchingSince
-        foreach ($Record in @($Data.Entries))
+        $Records = @($Data.Entries)
+        $Total = $Records.Count
+        foreach ($Record in $Records)
         {
+            $Number++
             if ($null -eq $Record) { continue }
+            $Reason = "entry $Number of $Total isn't valid"
             $Entry = ConvertFrom-AULedgerRecord $Record
             $Key = "$($Entry.UserSid)|$($Entry.ExeInfo)"
-            if ($Ledger.Entries.ContainsKey($Key)) { throw "Ledger entry $Key appears twice." }
+            $Reason = "entry $Number of $Total repeats an earlier one"
+            if ($Ledger.Entries.ContainsKey($Key)) { throw 'A ledger entry appears twice.' }
             $Ledger.Entries[$Key] = $Entry
         }
         return $Ledger
     }
     catch
     {
-        Write-CMTraceLog -Message "App Usage: the ledger $Path is unreadable, so it's rebuilt from SRUM: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
+        $Type = 'error'
+        try { $Type = $_.Exception.GetType().Name } catch { }
+        Write-CMTraceLog -Message "App Usage: the ledger $Path is unreadable ($Reason; $Type; $Characters characters), so it's rebuilt from SRUM." -Component 'AppUsage' -Type 3
         $Ledger = New-AULedger
         $Ledger.Status = [string[]]@('LedgerReset')
         if ($null -eq (Move-AUUnreadableLedger $Path)) { $Ledger.Writable = $false }

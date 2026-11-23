@@ -688,6 +688,33 @@ Describe 'Ledger file access (D18)' {
         (Read-AULedger -Path $script:Path).Entries.Count | Should -Be 1
     }
 
+    It 'logs only the reason and counts for an unreadable ledger, never its text: <Case>' -ForEach @(
+        @{ Case = 'invalid JSON'; Reason = "it isn't valid JSON"; Text = '{"SchemaVersion":1,"WatchingSince":null,"Entries":[{"UserSid":"S-1-5-21-1-2-3-1001","ExeInfo":"\Device\HarddiskVolume3\Users\alice\AppData\Local\Secret\secret.exe","Counted":' }
+        @{ Case = 'a repeated entry'; Reason = 'entry 2 of 2 repeats an earlier one'; Text = 'DUPLICATE' }
+        @{ Case = 'a malformed entry'; Reason = "entry 1 of 1 isn't valid"; Text = 'BADDATE' }
+    ) {
+        function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) }
+        $script:Logged = [Collections.Generic.List[string]]::new()
+        Mock Write-CMTraceLog { $script:Logged.Add([string]$Message) }
+        $Exe = '\Device\HarddiskVolume3\Users\alice\AppData\Local\Secret\secret.exe'
+        if ($Text -eq 'DUPLICATE' -or $Text -eq 'BADDATE')
+        {
+            $L = New-EmptyLedger
+            Invoke-Merge $L @(New-Row $script:Local $Exe 1 0 10)
+            Write-AULedger -Ledger $L -Path $script:Path
+            $Data = [IO.File]::ReadAllText($script:Path) | ConvertFrom-Json
+            if ($Text -eq 'DUPLICATE') { $Data.Entries = @($Data.Entries[0], $Data.Entries[0]) }
+            else { $Data.Entries[0].FirstSeen = 'C:\Users\alice\AppData\Local\Secret\secret.exe' }
+            $Text = $Data | ConvertTo-Json -Depth 8 -Compress
+        }
+        [IO.File]::WriteAllText($script:Path, $Text)
+        @((Read-AULedger -Path $script:Path).Status) | Should -Contain 'LedgerReset'
+        $Line = @($script:Logged | Where-Object { $_ -like '*is unreadable*' })
+        $Line.Count | Should -Be 1
+        $Line[0] | Should -BeLike ("*($Reason; *characters)*")
+        foreach ($Private in @('secret', 'alice', 'S-1-5-21')) { $Line[0] | Should -Not -BeLike "*$Private*" -Because $Private }
+    }
+
     It 'protects the moved-aside copy of an unreadable ledger' {
         [IO.File]::WriteAllText($script:Path, 'not json')
         $null = Read-AULedger -Path $script:Path
