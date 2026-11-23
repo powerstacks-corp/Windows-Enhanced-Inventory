@@ -272,11 +272,14 @@ Describe 'Find-AUExePath' {
         Mock Get-AUFixedDrives { @($script:Root) }
     }
 
-    It 'chooses the System32 or SysWOW64 candidate whose fingerprint matches (F37)' {
+    It 'chooses the System32 or SysWOW64 candidate whose fingerprint matches, Verified $true (F37)' {
         New-TestPe $script:Sys32 $script:NewBuild 0x64
         New-TestPe $script:Wow64 $script:OldBuild 0x32
-        Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{} | Should -BeExactly $script:Wow64
-        Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:NewBuild 0x64) @{} | Should -BeExactly $script:Sys32
+        $found = Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{}
+        $found.Path | Should -BeExactly $script:Wow64
+        $found.Verified | Should -BeTrue
+        @($found.PSObject.Properties.Name) | Should -Be @('Path', 'Verified')
+        (Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:NewBuild 0x64) @{}).Path | Should -BeExactly $script:Sys32
     }
 
     It 'returns $null when both candidates match (D24)' {
@@ -284,12 +287,46 @@ Describe 'Find-AUExePath' {
         New-TestPe $script:Sys32 $script:OldBuild 0x32
         New-TestPe $script:Wow64 $script:OldBuild 0x32
         Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{} | Should -BeNullOrEmpty
-        Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match '2 paths' }
+        Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match '2 paths verify' }
+    }
+
+    It 'returns the one existing path with Verified $false when none verifies (updated in place)' {
+        New-TestPe $script:Sys32 $script:NewBuild 0x64
+        $cache = @{}
+        $found = Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) $cache
+        $found.Path | Should -BeExactly $script:Sys32
+        $found.Verified | Should -BeFalse
+        # Only a verified path caches the volume.
+        $cache.Count | Should -Be 0
+    }
+
+    It 'returns $null when two distinct paths exist and none verifies' {
+        Mock Write-CMTraceLog { }
+        New-TestPe $script:Sys32 $script:NewBuild 0x64
+        New-TestPe $script:Wow64 $script:NewBuild 0x65
+        Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{} | Should -BeNullOrEmpty
+        Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match '2 paths exist' }
+    }
+
+    It 'prefers the one verified path over another existing path that does not verify' {
+        New-TestPe $script:Sys32 $script:NewBuild 0x64
+        New-TestPe $script:Wow64 $script:OldBuild 0x32
+        $found = Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{}
+        $found.Path | Should -BeExactly $script:Wow64
+        $found.Verified | Should -BeTrue
+    }
+
+    It 'returns $null when one kernel path exists under two drives and neither verifies' {
+        $other = Join-Path (Get-AULongPath $TestDrive) 'Vol2'
+        Mock Get-AUFixedDrives { @($script:Root, (Join-Path (Get-AULongPath $TestDrive) 'Vol2')) }
+        New-TestPe $script:Sys32 $script:NewBuild 0x64
+        New-TestPe (Join-Path $other 'Windows\System32\tool.exe') $script:NewBuild 0x64
+        Find-AUExePath @($script:Kernels[0]) (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{} | Should -BeNullOrEmpty
     }
 
     It 'counts a kernel path given twice once' {
         New-TestPe $script:Sys32 $script:OldBuild 0x32
-        Find-AUExePath @($script:Kernels[0], $script:Kernels[0].ToUpperInvariant()) (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{} | Should -BeExactly $script:Sys32
+        (Find-AUExePath @($script:Kernels[0], $script:Kernels[0].ToUpperInvariant()) (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{}).Path | Should -BeExactly $script:Sys32
     }
 
     It 'returns $null for no candidates, blank candidates, or a Package entry' {
@@ -298,13 +335,53 @@ Describe 'Find-AUExePath' {
         Find-AUExePath $script:Kernels (ConvertFrom-AUExeInfo 'Contoso.Notes_8wekyb3d8bbwe!App') @{} | Should -BeNullOrEmpty
     }
 
+    It 'end to end, updated in place: the older build at its only path gives RunPath, unverified facts, and current-file evidence (D30)' -Skip:(-not (Test-Path (Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\ngen.exe'))) {
+        $path = Join-Path $script:Root 'Program Files\Contoso\app.exe'
+        [void](New-Item -ItemType Directory -Force -Path (Split-Path $path))
+        Copy-Item $script:Notepad $path -Force
+        $old = Get-AUPeFingerprint $path
+        $text = '!!app.exe!{0}!{1}!' -f $old.LinkTimeUtc.ToString('yyyy/MM/dd:HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $old.CheckSum.ToString('x')
+        $info = ConvertFrom-AUExeInfo $text
+        # The app is updated in place: a different build now sits at the only path SRUM recorded.
+        Copy-Item $script:Ngen $path -Force
+        $current = Get-TestVersionInfo $path
+
+        $found = Find-AUExePath @('\Device\HarddiskVolume3\Program Files\Contoso\app.exe') $info @{}
+        $found.Path | Should -BeExactly $path
+        $found.Verified | Should -BeFalse
+
+        $facts = Get-AUExeFacts $found.Path $info @{} @{} $script:TestSid -ExeInfoText $text
+        $facts.RunPath | Should -BeExactly $path
+        $facts.FactsVerified | Should -BeFalse
+        $facts.FileVersion | Should -BeNullOrEmpty
+        $facts.ProductVersion | Should -BeNullOrEmpty
+        $facts.FileCompanyName | Should -BeNullOrEmpty
+        $facts.FileProductName | Should -BeNullOrEmpty
+        $facts.Subsystem | Should -BeNullOrEmpty
+        $facts.PathEvidence.CompanyName | Should -BeExactly $current.CompanyName.Trim()
+        $facts.PathEvidence.ProductName | Should -BeExactly $current.ProductName.Trim()
+
+        # The per-executable output labels it as current-file evidence (sample 11).
+        $entry = New-AULedgerEntry $script:TestSid $text
+        $entry.Facts = $facts
+        $entry | Add-Member -NotePropertyMembers @{ Target = [pscustomobject]@{ MatchSection = 'None'; CandidateTargets = $null }; Classification = $null; Role = 'Unmatched'; UserType = 'Local'; InstallStatus = 'Unmatched' }
+        $usage = @(ConvertTo-AUExeUsage @($entry))
+        $usage.Count | Should -Be 1
+        $usage[0].RunPath | Should -BeExactly $path
+        $usage[0].FactsVerified | Should -BeFalse
+        $usage[0].FileVersion | Should -BeNullOrEmpty
+        $usage[0].EvidenceSource | Should -BeExactly 'CurrentFileAtPath'
+        $usage[0].EvidenceCompanyName | Should -BeExactly $current.CompanyName.Trim()
+        $usage[0].EvidenceProductName | Should -BeExactly $current.ProductName.Trim()
+    }
+
     Context 'With nothing on disk' {
         It 'gives $null, facts with only the exe name, and matching falls back to name and publisher' {
             $info = New-TestExeInfo 'tool.exe' $script:OldBuild 0x32
-            $path = Find-AUExePath $script:Kernels $info @{}
-            $path | Should -BeNullOrEmpty
+            $found = Find-AUExePath $script:Kernels $info @{}
+            $found | Should -BeNullOrEmpty
 
-            $facts = Get-AUExeFacts $path $info @{} @{} $script:TestSid
+            $facts = Get-AUExeFacts $null $info @{} @{} $script:TestSid
             $facts.ExeName | Should -BeExactly 'tool.exe'
             $facts.RunPath | Should -BeNullOrEmpty
             $facts.LocationClass | Should -BeNullOrEmpty
@@ -321,6 +398,119 @@ Describe 'Find-AUExePath' {
             $narrowed.Step | Should -BeExactly 'publisher'
             $narrowed.Candidates[0].DisplayName | Should -BeExactly 'Contoso Tool'
         }
+    }
+}
+
+Describe 'Timed reads outside Windows and Program Files' {
+    BeforeAll {
+        $script:SlowScript = 'Start-Sleep -Seconds 30'
+    }
+    BeforeEach {
+        $script:Path = Join-Path (Get-AULongPath $TestDrive) 'Users\alice\AppData\Local\Contoso\app.exe'
+        New-TestPe $script:Path $script:OldBuild 0x10
+        $script:Info = New-TestExeInfo 'app.exe' $script:OldBuild 0x10
+        Mock Write-CMTraceLog { }
+    }
+
+    It 'reads directly only under Windows and Program Files' {
+        foreach ($direct in @('C:\Windows\System32\notepad.exe', 'C:\Program Files\Contoso\app.exe', 'C:\Program Files (x86)\Contoso\app.exe', 'E:\Program Files\Contoso\app.exe'))
+        {
+            Test-AUDirectRead $direct | Should -BeTrue
+        }
+        foreach ($timed in @('C:\Users\alice\AppData\Local\Contoso\app.exe', 'C:\Users\alice\Downloads\setup.exe', 'C:\Windows\Temp\setup.exe', 'C:\Windows\IMECache\x\setup.exe',
+                'C:\ProgramData\Contoso\agent.exe', 'E:\probe\ProbeOnE.exe', 'C:\Tools\tool.exe'))
+        {
+            Test-AUDirectRead $timed | Should -BeFalse
+        }
+    }
+
+    It 'defaults to a 5-second timeout per file and a 120-second total' {
+        $budget = New-AUReadBudget
+        $budget.TimeoutMs | Should -Be 5000
+        $budget.RemainingMs | Should -Be 120000
+    }
+
+    It 'reads a user-writable file in a runspace, reuses the runspace, and verifies the build' {
+        Test-AUDirectRead $script:Path | Should -BeFalse
+        $budget = New-AUReadBudget
+        try
+        {
+            $facts = Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget
+            $facts.FactsVerified | Should -BeTrue
+            $facts.Subsystem | Should -BeExactly 'GUI'
+            $runspace = $budget.Runspace
+            $runspace | Should -Not -BeNullOrEmpty
+            (Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget).FactsVerified | Should -BeTrue
+            [object]::ReferenceEquals($budget.Runspace, $runspace) | Should -BeTrue
+            $budget.Reads | Should -Be 2
+            $budget.RemainingMs | Should -BeLessThan 120000
+        }
+        finally { Close-AUReadBudget $budget }
+        $budget.Runspace | Should -BeNullOrEmpty
+    }
+
+    It 'gives up on a slow read after the per-file timeout: unverified, no evidence, logged, runspace let go' {
+        Mock Get-AUFileReadScript { $script:SlowScript }
+        $budget = New-AUReadBudget -FileTimeoutSeconds 0.5
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $facts = Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget
+        $timer.Stop()
+        $timer.ElapsedMilliseconds | Should -BeLessThan 3000
+        $facts.FactsVerified | Should -BeFalse
+        $facts.PathEvidence | Should -BeNullOrEmpty
+        $facts.RunPath | Should -BeExactly $script:Path
+        $budget.TimedOut | Should -Be 1
+        $budget.Runspace | Should -BeNullOrEmpty
+        Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match 'took longer than 500 ms' -and $Type -eq 2 }
+
+        # Closing doesn't wait on the stuck read either.
+        $timer.Restart()
+        Close-AUReadBudget $budget
+        $timer.ElapsedMilliseconds | Should -BeLessThan 500
+    }
+
+    It 'stops reading user-writable files once the run budget is spent, without waiting' {
+        Mock Get-AUFileReadScript { $script:SlowScript }
+        $budget = New-AUReadBudget -TotalSeconds 1 -FileTimeoutSeconds 0.4
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $results = @(for ($i = 0; $i -lt 6; $i++) { Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget })
+        $timer.Stop()
+        # At most the budget plus the runspace start-ups; never six timeouts.
+        $timer.ElapsedMilliseconds | Should -BeLessThan 4000
+        $budget.RemainingMs | Should -BeLessOrEqual 0
+        $budget.Skipped | Should -BeGreaterThan 0
+        ($budget.TimedOut + $budget.Skipped) | Should -Be 6
+        $results | ForEach-Object { $_.FactsVerified | Should -BeFalse; $_.PathEvidence | Should -BeNullOrEmpty }
+        Should -Invoke Write-CMTraceLog -Times 1 -Exactly -ParameterFilter { $Message -match 'budget is spent' }
+
+        # Once spent, a read returns at once.
+        $timer.Restart()
+        (Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget).FactsVerified | Should -BeFalse
+        $timer.ElapsedMilliseconds | Should -BeLessThan 300
+        Close-AUReadBudget $budget
+    }
+
+    It 'leaves a kernel path untranslated when its fingerprint read times out, and keeps it as the observed path' {
+        Mock Get-AUFileReadScript { $script:SlowScript }
+        Mock Get-AUFixedDrives { @((Get-AULongPath $TestDrive)) }
+        $budget = New-AUReadBudget -FileTimeoutSeconds 0.4
+        $kernel = '\Device\HarddiskVolume3\Users\alice\AppData\Local\Contoso\app.exe'
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        Resolve-AUKernelPath $kernel $script:Info @{} $budget | Should -BeNullOrEmpty
+        $found = Find-AUExePath @($kernel) $script:Info @{} $budget
+        $timer.ElapsedMilliseconds | Should -BeLessThan 4000
+        $found.Path | Should -BeExactly $script:Path
+        $found.Verified | Should -BeFalse
+        $budget.TimedOut | Should -Be 2
+        Close-AUReadBudget $budget
+    }
+
+    It 'reads Windows and Program Files paths directly even when the budget is spent' {
+        Mock Test-AUDirectRead { $true }
+        $budget = New-AUReadBudget -TotalSeconds 0
+        (Get-AUExeFacts $script:Path $script:Info @{} @{} $script:TestSid -ReadBudget $budget).FactsVerified | Should -BeTrue
+        $budget.Skipped | Should -Be 0
+        $budget.Runspace | Should -BeNullOrEmpty
     }
 }
 
@@ -420,6 +610,8 @@ Describe 'Get-AUExeFacts' {
     }
 
     It 'is unverified when the file changes while its version info is read' {
+        # The direct read, so the mocked file reads below apply.
+        Mock Test-AUDirectRead { $true }
         New-TestPe $script:Path $script:OldBuild 0x10
         $info = New-TestExeInfo 'app.exe' $script:OldBuild 0x10
         $script:Reads = 0
@@ -460,6 +652,8 @@ Describe 'Get-AUExeFacts' {
     }
 
     It 'never throws: a failing version read leaves the build unverified and is logged' {
+        # The direct read, so the mocked file reads below apply.
+        Mock Test-AUDirectRead { $true }
         Mock Write-CMTraceLog { }
         New-TestPe $script:Path $script:OldBuild 0x10
         Mock Get-AUVersionInfo { throw 'boom' }

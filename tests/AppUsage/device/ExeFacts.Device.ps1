@@ -12,9 +12,9 @@
         under every fixed drive, the way Task 0.4 counted it (translated, ambiguous, not found)
       - Verify: of the translated paths whose exe has a Win32 fingerprint in the timeline, how many
         Resolve-AUKernelPath verifies, and the volume-to-drive map it cached
-      - Entries: Find-AUExePath for every user and Win32 build in the timeline (found, none, no
-        candidate), and Get-AUExeFacts for the found ones (verified, subsystem, Installer owner,
-        service binary)
+      - Entries: Find-AUExePath for every user and Win32 build in the timeline (verified, updated in
+        place, none, no candidate), and Get-AUExeFacts for the found ones (verified, PathEvidence,
+        subsystem, Installer owner, service binary), with one read budget for the run
       - SecondVolume: E:\probe\ProbeOnE.exe through its SRUM rows (if any) and through a kernel
         path built from its own fingerprint
       - Services: Get-AUServiceBinaries counts, and facts for a few service executables
@@ -96,6 +96,7 @@ try
     $Kernels = @($Resource | ForEach-Object { [string]$_.KernelPath } | Where-Object { $_ -match '^\\Device\\HarddiskVolume\d+\\.+\.exe$' } | Sort-Object -Unique)
     $Probe = [ordered]@{ Paths = $Kernels.Count; Translated = 0; Ambiguous = 0; NotFound = 0 }
     $Verify = [ordered]@{ WithFingerprint = 0; Verified = 0; Mismatch = 0 }
+    $Budget = New-AUReadBudget
     $Cache = @{}
     $NotFound = New-Object System.Collections.Generic.List[string]
     $Mismatch = New-Object System.Collections.Generic.List[string]
@@ -110,7 +111,7 @@ try
         if (-not $InfoByExe.ContainsKey($Exe)) { continue }
         $Verify.WithFingerprint++
         $Path = $null
-        foreach ($Info in $InfoByExe[$Exe].Values) { $Path = Resolve-AUKernelPath $Kernel $Info $Cache; if ($Path) { break } }
+        foreach ($Info in $InfoByExe[$Exe].Values) { $Path = Resolve-AUKernelPath $Kernel $Info $Cache $Budget; if ($Path) { break } }
         if ($Path) { $Verify.Verified++ } else { $Verify.Mismatch++; if ($Mismatch.Count -lt 4) { $Mismatch.Add((Get-Short $Kernel 70)) } }
     }
     $Out.Probe = $Probe
@@ -126,19 +127,29 @@ try
     $Msi = New-Object Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
     $Base = Open-AURegistryBase -Hive Machine
     try { [void](Read-AUMsiFileMap -Base $Base -Into $Msi) } finally { $Base.Close() }
-    $EntryStats = [ordered]@{ Entries = $Entries.Count; Found = 0; None = 0; NoCandidate = 0; MultiCandidateFound = 0; Verified = 0; GUI = 0; Console = 0; OtherSubsystem = 0; MsiOwned = 0; ServiceBinary = 0; WithCompany = 0 }
+    $EntryStats = [ordered]@{ Entries = $Entries.Count; Found = 0; UpdatedInPlace = 0; WithPathEvidence = 0; None = 0; NoCandidate = 0; MultiCandidateFound = 0; Verified = 0; GUI = 0; Console = 0; OtherSubsystem = 0; MsiOwned = 0; ServiceBinary = 0; WithCompany = 0 }
     $Samples = New-Object System.Collections.Generic.List[string]
     $ServiceFound = New-Object System.Collections.Generic.List[string]
+    $InPlace = New-Object System.Collections.Generic.List[string]
     $EntryCache = @{}
     foreach ($Entry in $Entries.Values)
     {
         $Candidates = $ByUserExe["$($Entry.UserSid)|$($Entry.Info.ExeName)"]
         if ($null -eq $Candidates) { $EntryStats.NoCandidate++; continue }
-        $Path = Find-AUExePath $Candidates.ToArray() $Entry.Info $EntryCache
-        if (-not $Path) { $EntryStats.None++; continue }
+        $Found = Find-AUExePath $Candidates.ToArray() $Entry.Info $EntryCache $Budget
+        if (-not $Found) { $EntryStats.None++; continue }
+        $Path = $Found.Path
+        if (-not $Found.Verified)
+        {
+            $EntryStats.UpdatedInPlace++
+            $Facts = Get-AUExeFacts $Path $Entry.Info $Msi $Services $Entry.UserSid -ExeInfoText $Entry.Text -ReadBudget $Budget
+            if ($Facts.PathEvidence) { $EntryStats.WithPathEvidence++ }
+            if ($InPlace.Count -lt 3) { $InPlace.Add(('{0} | verified={1} | evidence={2} / {3}' -f (Get-Short $Path 60), $Facts.FactsVerified, $Facts.PathEvidence.CompanyName, $Facts.PathEvidence.ProductName)) }
+            continue
+        }
         $EntryStats.Found++
         if (@($Candidates | Sort-Object -Unique).Count -gt 1) { $EntryStats.MultiCandidateFound++ }
-        $Facts = Get-AUExeFacts $Path $Entry.Info $Msi $Services $Entry.UserSid -ExeInfoText $Entry.Text
+        $Facts = Get-AUExeFacts $Path $Entry.Info $Msi $Services $Entry.UserSid -ExeInfoText $Entry.Text -ReadBudget $Budget
         if ($Facts.FactsVerified) { $EntryStats.Verified++ }
         switch ($Facts.Subsystem) { 'GUI' { $EntryStats.GUI++ } 'Console' { $EntryStats.Console++ } 'Other' { $EntryStats.OtherSubsystem++ } }
         if ($Facts.MsiProductCode) { $EntryStats.MsiOwned++ }
@@ -148,6 +159,7 @@ try
     }
     $Out.Entries = $EntryStats
     $Out.FactSamples = $Samples.ToArray()
+    $Out.UpdatedInPlaceSamples = $InPlace.ToArray()
     $Out.ServiceBinariesInSrum = $ServiceFound.ToArray()
 
     # The second volume.
@@ -157,7 +169,7 @@ try
     $Second.SrumKernelPaths = @($SrumRows | ForEach-Object { $_.KernelPath } | Sort-Object -Unique)
     if ($InfoByExe.ContainsKey('probeone.exe') -and $SrumRows.Count)
     {
-        $Second.SrumResolved = @(foreach ($Info in $InfoByExe['probeone.exe'].Values) { Find-AUExePath ([string[]]@($SrumRows | ForEach-Object { $_.KernelPath })) $Info $Cache }) | Where-Object { $_ } | Select-Object -First 1
+        $Second.SrumResolved = @(foreach ($Info in $InfoByExe['probeone.exe'].Values) { Find-AUExePath ([string[]]@($SrumRows | ForEach-Object { $_.KernelPath })) $Info $Cache $Budget }) | Where-Object { $_ } | ForEach-Object { '{0} (verified {1})' -f $_.Path, $_.Verified } | Select-Object -First 1
     }
     if ($Second.FileExists)
     {
@@ -167,7 +179,7 @@ try
         $Second.OwnFingerprintResolved = Resolve-AUKernelPath '\Device\HarddiskVolume99\probe\ProbeOnE.exe' $OwnInfo $FreshCache
         $Second.FreshCache = @($FreshCache.Keys | ForEach-Object { "$_=$($FreshCache[$_])" }) -join ','
         $Second.WrongBuildResolved = Resolve-AUKernelPath '\Device\HarddiskVolume98\probe\ProbeOnE.exe' (ConvertFrom-AUExeInfo '!!probeone.exe!2001/01/01:00:00:00!1!') @{}
-        $ProbeFacts = Get-AUExeFacts $ProbeFile $OwnInfo $Msi $Services 'S-1-5-18'
+        $ProbeFacts = Get-AUExeFacts $ProbeFile $OwnInfo $Msi $Services 'S-1-5-18' -ReadBudget $Budget
         $Second.Facts = '{0} | {1} | {2}' -f $ProbeFacts.FactsVerified, $ProbeFacts.Subsystem, $ProbeFacts.LocationClass
     }
     $Out.SecondVolume = $Second
@@ -183,7 +195,7 @@ try
         if ($null -eq $Fp) { continue }
         $Name = [IO.Path]::GetFileName($Exe)
         $Info = ConvertFrom-AUExeInfo ('!!{0}!{1}!{2}!' -f $Name, $Fp.LinkTimeUtc.ToString('yyyy/MM/dd:HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $Fp.CheckSum.ToString('x'))
-        $F = Get-AUExeFacts $Exe $Info $Msi $Services 'S-1-5-18'
+        $F = Get-AUExeFacts $Exe $Info $Msi $Services 'S-1-5-18' -ReadBudget $Budget
         $ServiceSamples.Add(('{0} ({1}) svc={2} ver={3} {4}' -f (Get-Short $Exe 55), $Services[$Exe], $F.IsServiceBinary, $F.FactsVerified, $F.Subsystem))
     }
     $Out.Services = [ordered]@{
@@ -193,6 +205,8 @@ try
         Samples    = $ServiceSamples.ToArray()
     }
     $Out.MsiFiles = $Msi.Count
+    $Out.ReadBudget = [ordered]@{ TimedReads = $Budget.Reads; TimedOut = $Budget.TimedOut; Skipped = $Budget.Skipped; SpentMs = [long](120000 - $Budget.RemainingMs) }
+    Close-AUReadBudget $Budget
     $Out.AnalysisMs = $Timer.ElapsedMilliseconds
 }
 catch { $Out.AnalysisError = "$($_.Exception.Message) at $($_.InvocationInfo.ScriptLineNumber)" }
