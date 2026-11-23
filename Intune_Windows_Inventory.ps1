@@ -6523,8 +6523,8 @@ function Clear-AUStaleRuns
     MaxAgeHours ago. Its marker's shadow copy is deleted only when the marker is trusted
     (Read-AUShadowMarker) and the shadow copy was made during the folder's lifetime
     (Get-AUShadowOrigin is Run); then the folder is removed (Remove-AUFolderTree). When the shadow
-    copy couldn't be checked (Unknown), the folder and its marker stay for the next run. Anything
-    else is left alone. Never throws.
+    copy couldn't be checked (Unknown) or couldn't be deleted, the folder and its marker stay for the
+    next run. Anything else is left alone. Never throws.
 .PARAMETER Root
     The protected work root.
 .PARAMETER Except
@@ -6567,7 +6567,14 @@ function Clear-AUStaleRuns
                         Write-CMTraceLog -Message "App Usage: couldn't check shadow copy $ShadowId, so the stale run folder $($Folder.FullName) and its marker stay for the next run." -Component 'AppUsage' -Type 2
                         continue
                     }
-                    if ($Origin -eq 'Run') { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+                    if ($Origin -eq 'Run')
+                    {
+                        if ((Remove-AUShadowCopy -ShadowId $ShadowId) -ne $true)
+                        {
+                            Write-CMTraceLog -Message "App Usage: couldn't remove shadow copy $ShadowId, so the stale run folder $($Folder.FullName) and its marker stay for the next run." -Component 'AppUsage' -Type 2
+                            continue
+                        }
+                    }
                     else { Write-CMTraceLog -Message "App Usage: left shadow copy $ShadowId alone; it isn't one that $($Folder.FullName) made." -Component 'AppUsage' -Type 2 }
                 }
                 Remove-AUFolderTree -Path $Folder.FullName
@@ -7206,7 +7213,9 @@ function Remove-AUSnapshot
     shadow copy itself. Each part is attempted whatever happens to the other, and every failure is
     logged. WorkDir is deleted only when it's a direct child of Root and not a link; otherwise it's
     logged and left alone. The folder delete (Remove-AUFolderTree) is retried briefly, because a hive
-    or database handle can take a moment to close.
+    or database handle can take a moment to close. When the shadow copy can't be removed, everything
+    in WorkDir but its marker is deleted, and the folder and marker stay, so a later run's stale
+    sweep (Clear-AUStaleRuns) removes the shadow copy; without the marker nothing would name it.
 .PARAMETER Snapshot
     The object from New-AUSnapshot, or $null.
 .PARAMETER Root
@@ -7227,7 +7236,8 @@ function Remove-AUSnapshot
     }
     catch { }
 
-    if ($ShadowId) { [void](Remove-AUShadowCopy -ShadowId $ShadowId) }
+    $Released = $true
+    if ($ShadowId) { $Released = (Remove-AUShadowCopy -ShadowId $ShadowId) -eq $true }
 
     if ($WorkDir)
     {
@@ -7248,11 +7258,23 @@ function Remove-AUSnapshot
             Write-CMTraceLog -Message "App Usage: left $WorkDir alone, because it isn't a run folder directly inside $Root (or it's a link)." -Component 'AppUsage' -Type 3
             return
         }
+        if (-not $Released) { Write-CMTraceLog -Message "App Usage: kept $WorkDir and its marker, so a later run removes shadow copy $ShadowId." -Component 'AppUsage' -Type 2 }
         for ($Attempt = 1; $Attempt -le 3; $Attempt++)
         {
             try
             {
-                Remove-AUFolderTree -Path $Full
+                if ($Released) { Remove-AUFolderTree -Path $Full }
+                else
+                {
+                    # Everything but the marker: the copies go, the shadow copy's ID stays.
+                    foreach ($Item in (New-Object IO.DirectoryInfo $Full).GetFileSystemInfos())
+                    {
+                        if ($Item -is [IO.DirectoryInfo]) { Remove-AUFolderTree -Path $Item.FullName; continue }
+                        if ([string]::Equals($Item.Name, $script:AUShadowMarker, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($Item.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) { $Item.Attributes = [IO.FileAttributes]::Normal }
+                        $Item.Delete()
+                    }
+                }
                 break
             }
             catch
