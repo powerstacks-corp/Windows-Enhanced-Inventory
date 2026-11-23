@@ -336,6 +336,68 @@ Describe 'New-AUSnapshot' {
         Mock Remove-AUShadowCopy { $script:CopiesAtRelease = $script:Copied.Count; $true }
         # Plenty of free space, unless a test says otherwise.
         Mock Get-AUFreeSpace { [long]100GB }
+        # No shadow copies before the request, unless a test says otherwise.
+        Mock Get-AUShadowList { @() }
+    }
+
+    It 'deletes the shadow copy a failed or timed-out request made: new since the list taken before it, and made after the run started (item 11)' {
+        function Write-CMTraceLog { param ([string]$Message, [string]$Component, [int]$Type) }
+        Mock Write-CMTraceLog { }
+        $script:Old = '{0000AAAA-0000-0000-0000-000000000001}'
+        $script:New = '{0000BBBB-0000-0000-0000-000000000002}'
+        $script:Lists = 0
+        Mock Get-AUShadowList {
+            $script:Lists++
+            [pscustomobject]@{ ID = $script:Old; InstallDateUtc = [datetime]::UtcNow.AddHours(-2) }
+            if ($script:Lists -gt 1) { [pscustomobject]@{ ID = $script:New; InstallDateUtc = [datetime]::UtcNow } }
+        }
+        Mock Invoke-CimMethod { throw 'The WS-Management service cannot complete the operation within the time specified in OperationTimeout.' }
+        $S = New-AUSnapshot -WorkDir $script:WorkDir
+        $S.Status | Should -BeExactly 'ShadowCopyFailed'
+        $S.ShadowId | Should -BeNullOrEmpty
+        Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:New }
+        Should -Invoke Remove-AUShadowCopy -Times 0 -ParameterFilter { $ShadowId -eq $script:Old }
+        Test-Path -LiteralPath (Join-Path $script:WorkDir 'shadow.id') | Should -BeFalse
+        Should -Invoke Write-CMTraceLog -Times 1 -Exactly -ParameterFilter { $Message -like '*removed 1 of 1 new shadow copies*' }
+        Should -Invoke Write-CMTraceLog -Times 0 -ParameterFilter { $Message -like "*$($script:Old)*" }
+        Should -Invoke Copy-AUShadowFile -Times 0
+    }
+
+    It 'deletes nothing after a failed request when the only shadow copies are ones that existed before, or were made before the run started' {
+        $script:Old = '{0000AAAA-0000-0000-0000-000000000001}'
+        $script:Earlier = '{0000CCCC-0000-0000-0000-000000000003}'
+        $script:Lists = 0
+        Mock Get-AUShadowList {
+            $script:Lists++
+            [pscustomobject]@{ ID = $script:Old; InstallDateUtc = [datetime]::UtcNow.AddHours(-2) }
+            # A backup tool's shadow copy, not in the first list, but made before this run started.
+            if ($script:Lists -gt 1) { [pscustomobject]@{ ID = $script:Earlier; InstallDateUtc = [datetime]::UtcNow.AddHours(-1) } }
+        }
+        Mock Invoke-CimMethod { throw 'timed out' }
+        $S = New-AUSnapshot -WorkDir $script:WorkDir
+        $S.Status | Should -BeExactly 'ShadowCopyFailed'
+        Should -Invoke Get-AUShadowList -Times 2 -Exactly
+        Should -Invoke Remove-AUShadowCopy -Times 0
+    }
+
+    It 'keeps the marker for the next run when the new shadow copy can''t be deleted' {
+        $script:New = '{0000BBBB-0000-0000-0000-000000000002}'
+        $script:Lists = 0
+        Mock Get-AUShadowList { $script:Lists++; if ($script:Lists -gt 1) { [pscustomobject]@{ ID = $script:New; InstallDateUtc = [datetime]::UtcNow } } }
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 2; ShadowID = $null } }
+        Mock Remove-AUShadowCopy { $false }
+        $S = New-AUSnapshot -WorkDir $script:WorkDir
+        $S.Status | Should -BeExactly 'ShadowCopyFailed'
+        $S.ShadowId | Should -BeExactly $script:New
+        [IO.File]::ReadAllText((Join-Path $script:WorkDir 'shadow.id')) | Should -BeExactly $script:New
+    }
+
+    It 'takes no shadow copy when the existing ones can''t be listed first' {
+        Mock Get-AUShadowList { throw 'WMI failed' }
+        Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
+        $S = New-AUSnapshot -WorkDir $script:WorkDir
+        $S.Status | Should -BeExactly 'ShadowCopyFailed'
+        Should -Invoke Invoke-CimMethod -Times 0
     }
 
     It 'gives ShadowCopyFailed, a null SrumDbPath, and no copies when the shadow copy fails' {
@@ -385,6 +447,8 @@ Describe 'New-AUSnapshot' {
         $script:Copied | Should -Contain "$Link\Windows\System32\sru\*"
         $script:Copied | Should -Contain "$Link\Users\signedout\NTUSER.DAT"
         Test-Path -LiteralPath $Link | Should -BeFalse
+        # The shadow copies are listed once, before the request, and nothing else is cleaned up.
+        Should -Invoke Get-AUShadowList -Times 1 -Exactly
         # The shadow copy is released once, after every copy, and its marker goes with it.
         Should -Invoke Remove-AUShadowCopy -Times 1 -Exactly -ParameterFilter { $ShadowId -eq $script:ShadowId }
         $script:CopiesAtRelease | Should -Be $script:Copied.Count
@@ -474,6 +538,33 @@ Describe 'New-AUSnapshot' {
     }
 }
 
+Describe 'Get-AUShadowList (item 11)' {
+    It 'lists only the client-accessible shadow copies of the system drive, with UTC install times, in 30 seconds or less' {
+        $script:Made = Get-Date
+        Mock Get-CimInstance { [pscustomobject]@{ DeviceID = '\\?\Volume{1111}\'; DriveLetter = $env:SystemDrive } } -ParameterFilter { $ClassName -eq 'Win32_Volume' }
+        Mock Get-CimInstance {
+            [pscustomobject]@{ ID = '{A}'; VolumeName = '\\?\Volume{1111}\'; ClientAccessible = $true; InstallDate = $script:Made }
+            [pscustomobject]@{ ID = '{B}'; VolumeName = '\\?\Volume{2222}\'; ClientAccessible = $true; InstallDate = $script:Made }
+            [pscustomobject]@{ ID = '{C}'; VolumeName = '\\?\Volume{1111}\'; ClientAccessible = $false; InstallDate = $script:Made }
+        } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        $List = @(Get-AUShadowList)
+        $List.Count | Should -Be 1
+        $List[0].ID | Should -BeExactly '{A}'
+        $List[0].InstallDateUtc | Should -Be $script:Made.ToUniversalTime()
+        $List[0].InstallDateUtc.Kind | Should -Be ([DateTimeKind]::Utc)
+        Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_Volume' -and $OperationTimeoutSec -eq 30 }
+        Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' -and $OperationTimeoutSec -eq 30 }
+    }
+
+    It 'throws when the system drive''s volume or the shadow copies can''t be read' {
+        Mock Get-CimInstance { } -ParameterFilter { $ClassName -eq 'Win32_Volume' }
+        { Get-AUShadowList } | Should -Throw
+        Mock Get-CimInstance { [pscustomobject]@{ DeviceID = '\\?\Volume{1111}\' } } -ParameterFilter { $ClassName -eq 'Win32_Volume' }
+        Mock Get-CimInstance { throw 'WMI failed' } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
+        { Get-AUShadowList } | Should -Throw
+    }
+}
+
 Describe 'Get-AUCopyBytes and Get-AUFreeSpace (I4)' {
     It 'adds up the SRUM folder''s files and each hive folder''s NTUSER.DAT, .LOG1, and .LOG2' {
         $Sru = Join-Path $TestDrive "sru-$([guid]::NewGuid().ToString('N'))"
@@ -526,6 +617,7 @@ Describe 'WMI time limits (review minor 2)' {
 
         $WorkDir = New-TestWorkDir
         Mock Get-AUProfileList { }
+        Mock Get-AUShadowList { @() }
         Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0; ShadowID = $script:ShadowId } }
         Mock Get-CimInstance { [pscustomobject]@{ ID = $script:ShadowId; DeviceObject = $null } } -ParameterFilter { $ClassName -eq 'Win32_ShadowCopy' }
         Mock Remove-AUShadowCopy { $true }

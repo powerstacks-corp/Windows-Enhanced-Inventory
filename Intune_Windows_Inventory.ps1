@@ -6509,6 +6509,85 @@ function Get-AUFreeSpace
     catch { return $null }
 }#endfunction
 
+function Get-AUShadowList
+{
+    <#
+.SYNOPSIS
+    Returns the client-accessible shadow copies of the system drive, the kind New-AUSnapshot makes: ID and InstallDateUtc.
+.DESCRIPTION
+    The system drive's volume comes from Win32_Volume, and only Win32_ShadowCopy entries of that
+    volume with ClientAccessible set are listed. InstallDateUtc is $null when the install time
+    can't be read. Throws when the volume or the shadow copies can't be read, so a caller never
+    mistakes a failed read for an empty list.
+#>
+    $Volume = @(Get-CimInstance -ClassName Win32_Volume -Filter "DriveLetter='$($env:SystemDrive)'" -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop) | Select-Object -First 1
+    if ($null -eq $Volume -or -not $Volume.DeviceID) { throw "the volume of $($env:SystemDrive) wasn't found." }
+    $List = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($Shadow in @(Get-CimInstance -ClassName Win32_ShadowCopy -OperationTimeoutSec $script:AUCimTimeoutSeconds -ErrorAction Stop))
+    {
+        if ($null -eq $Shadow -or $Shadow.ClientAccessible -ne $true) { continue }
+        if (-not [string]::Equals([string]$Shadow.VolumeName, [string]$Volume.DeviceID, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $Installed = $null
+        if ($Shadow.InstallDate -is [datetime]) { $Installed = $Shadow.InstallDate.ToUniversalTime() }
+        $List.Add([pscustomobject]@{ ID = [string]$Shadow.ID; InstallDateUtc = $Installed })
+    }
+    return $List.ToArray()
+}#endfunction
+
+function Remove-AUUnrecordedShadow
+{
+    <#
+.SYNOPSIS
+    After a shadow copy request failed or timed out, deletes the shadow copies it may still have made. Returns the ID of one it couldn't delete, or $null.
+.DESCRIPTION
+    VSS can finish a shadow copy after the request has timed out on the script's side, and nothing
+    would record it. A shadow copy counts as this run's only when it's in the list now
+    (Get-AUShadowList) but wasn't in the list taken right before the request, and was made at or
+    after the run started, so another tool's shadow copies, made earlier, are never touched. Each
+    one's ID goes into the run folder's marker before it's deleted, so a run killed meanwhile leaves
+    it for the next run's sweep; the marker is removed once all are deleted, and holds the one that
+    wasn't otherwise. The log gives counts, never other shadow copies' IDs. Never throws.
+.PARAMETER KnownIds
+    The shadow copy IDs listed right before the request.
+.PARAMETER SinceUtc
+    When the run started.
+.PARAMETER WorkDir
+    The run folder.
+#>
+    param (
+        [string[]]$KnownIds,
+        [datetime]$SinceUtc,
+        [string]$WorkDir
+    )
+
+    try { $Now = @(Get-AUShadowList) }
+    catch
+    {
+        Write-CMTraceLog -Message "App Usage: couldn't list the shadow copies after the request failed, so one it may have made can't be found: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
+        return $null
+    }
+    $New = @($Now | Where-Object { $null -ne $_ -and $KnownIds -notcontains $_.ID -and $null -ne $_.InstallDateUtc -and $_.InstallDateUtc -ge $SinceUtc })
+    if ($New.Count -eq 0) { return $null }
+    $Marker = [IO.Path]::Combine($WorkDir, $script:AUShadowMarker)
+    $Removed = 0
+    $Kept = $null
+    foreach ($Shadow in $New)
+    {
+        try { Write-AUShadowMarker -Folder $WorkDir -ShadowId $Shadow.ID }
+        catch { Write-CMTraceLog -Message "App Usage: couldn't write the shadow marker in $WorkDir`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+        if (Remove-AUShadowCopy -ShadowId $Shadow.ID) { $Removed++ }
+        elseif ($null -eq $Kept) { $Kept = $Shadow.ID }
+    }
+    try
+    {
+        if ($null -ne $Kept) { Write-AUShadowMarker -Folder $WorkDir -ShadowId $Kept }
+        elseif ([IO.File]::Exists($Marker)) { [IO.File]::Delete($Marker) }
+    }
+    catch { Write-CMTraceLog -Message "App Usage: couldn't update the shadow marker in $WorkDir`: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3 }
+    Write-CMTraceLog -Message "App Usage: the shadow copy request failed; removed $Removed of $($New.Count) new shadow copies it made." -Component 'AppUsage' -Type 2
+    return $Kept
+}#endfunction
+
 function New-AUSnapshot
 {
     <#
@@ -6527,7 +6606,10 @@ function New-AUSnapshot
     The shadow copy is released before this function returns, and ShadowId is then $null. While the
     shadow copy exists, its ID is in <WorkDir>\shadow.id, so a run killed mid-snapshot leaves it for
     the next run's New-AUWorkDir to delete. When the release fails, ShadowId and the marker stay,
-    and Remove-AUSnapshot tries again.
+    and Remove-AUSnapshot tries again. The shadow copies already there are listed before the
+    request (Get-AUShadowList; no list, no request); when the request fails or times out, the ones
+    it may still have made are deleted (Remove-AUUnrecordedShadow), and one that can't be is kept in
+    ShadowId and the marker.
     Before anything is copied, the free space on the work folder's drive (Get-AUFreeSpace) must be
     at least 2 GB and at least three times the size of the copies (Get-AUCopyBytes), which leaves
     room for a repaired SRUM copy. Otherwise nothing is copied and Status is LowDiskSpace; free
@@ -6560,8 +6642,22 @@ function New-AUSnapshot
 
         try
         {
-            $Created = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = "$($env:SystemDrive)\"; Context = 'ClientAccessible' } -OperationTimeoutSec $script:AUShadowCreateTimeoutSeconds -ErrorAction Stop
-            if ($Created.ReturnValue -ne 0 -or -not $Created.ShadowID) { throw "Win32_ShadowCopy.Create returned $($Created.ReturnValue)." }
+            # The shadow copies there already, and the run's start (to the second, the precision of
+            # InstallDate), so a request that fails or times out while VSS still makes the shadow
+            # copy can find and delete it (item 11). No list, no request.
+            $RunStartUtc = [datetime]::UtcNow
+            $RunStartUtc = $RunStartUtc.AddTicks( - ($RunStartUtc.Ticks % [TimeSpan]::TicksPerSecond))
+            $KnownIds = @(Get-AUShadowList | ForEach-Object { [string]$_.ID })
+            try
+            {
+                $Created = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = "$($env:SystemDrive)\"; Context = 'ClientAccessible' } -OperationTimeoutSec $script:AUShadowCreateTimeoutSeconds -ErrorAction Stop
+                if ($Created.ReturnValue -ne 0 -or -not $Created.ShadowID) { throw "Win32_ShadowCopy.Create returned $($Created.ReturnValue)." }
+            }
+            catch
+            {
+                $Snapshot.ShadowId = Remove-AUUnrecordedShadow -KnownIds $KnownIds -SinceUtc $RunStartUtc -WorkDir $WorkDir
+                throw
+            }
             $Snapshot.ShadowId = [string]$Created.ShadowID
             # A run killed from here on leaves this marker, so a later run deletes the shadow copy.
             try { Write-AUShadowMarker -Folder $WorkDir -ShadowId $Snapshot.ShadowId }
