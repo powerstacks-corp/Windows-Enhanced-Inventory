@@ -514,3 +514,19 @@ PowerStacksAppInventory_CL
 ### Updating to a New PowerStacks Release
 
 There's nothing to do for your rules. A new release replaces only the PowerStacks rules built into the script; your file stays where it is, and your rules keep winning.
+
+### What a Release Contains
+
+Each release publishes three files. You deploy the script; keep the other two with it.
+
+| File | What it is |
+|---|---|
+| `Intune_Windows_Inventory.ps1` | The script you deploy, with the PowerStacks rules built in. |
+| `Test-AppUsageMappings.ps1` | The validator for your rules file. Keep it in the same folder as the script. |
+| `customer-mappings.example.json` | An example rules file. Copy it, name the copy `customer-mappings.json`, and replace the examples with your rules. |
+
+A release never contains a file named `customer-mappings.json`, so it can't replace yours.
+
+The PowerStacks rules are the Base64 value between the `# BEGIN APPUSAGE MAPPINGS` and `# END APPUSAGE MAPPINGS` lines of the script. Don't edit that block by hand. The script checks the rules on every run; if they don't load or don't validate, App Usage skips the run and reports `MappingsUnavailable:Invalid`. To change how executables match, use your own file.
+
+The published script has fewer comments than the source: the comments inside its functions are removed to keep it under the Intune size limit for remediation scripts. The settings at the top keep all their guidance.
