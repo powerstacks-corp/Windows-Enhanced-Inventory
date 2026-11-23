@@ -9928,7 +9928,8 @@ function Send-AUOutbox
     Runs before this run's rows are built, so arrival order keeps run order, and row 1's
     AppUsageCollectionStatus_s reflects the flush: PendingRows is $true when rows still wait
     afterward. The outbox first keeps only the MaxRuns most recent runs. A saved row that isn't
-    valid (Read-AUOutboxRow) is deleted unsent.
+    valid (Read-AUOutboxRow) is deleted unsent, and one that can't be read is kept; either way the
+    drain stops there for this run, so a newer run's rows are never sent before an older run's.
     Each saved row gets one attempt with no backoff (Invoke-AUSend -SingleAttempt), so the drain
     takes at most one call per saved row. The first failure that may work later stops the drain:
     that row and the rest stay for the next run, and the run's RetryBudget (F51), which this run's
@@ -9998,14 +9999,15 @@ function Send-AUOutbox
         try { $Body = Read-AUOutboxRow -File $File -LogAPIMode $LogAPIMode -MaxRowBytes $MaxRowBytes }
         catch
         {
-            Write-CMTraceLog -Message "App Usage: couldn't read $($File.Path) from the outbox, so it waits: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
-            continue
+            # Run order: the rows after it wait too.
+            Write-CMTraceLog -Message "App Usage: couldn't read $($File.Path) from the outbox, so it and the rows after it wait: $(Get-AUSafeLogText $_.Exception.Message)" -Component 'AppUsage' -Type 3
+            break
         }
         if ($null -eq $Body)
         {
-            Write-CMTraceLog -Message "App Usage: $($File.Path) in the outbox isn't a valid saved row, so it's deleted unsent." -Component 'AppUsage' -Type 3
+            Write-CMTraceLog -Message "App Usage: $($File.Path) in the outbox isn't a valid saved row, so it's deleted unsent, and the rows after it wait for the next run." -Component 'AppUsage' -Type 3
             if (Remove-AUOutboxFile -Path $File.Path) { $Remaining-- }
-            continue
+            break
         }
         $Send = Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType -SingleAttempt
         if ($Send.Ok)

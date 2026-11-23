@@ -727,6 +727,9 @@ Describe 'Send-AURunRows and Send-AUOutbox (D44, F50 to F53)' {
             $Sender = New-TestSender
             $Budget = 1
             $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'ClientSecret' -Sender $Sender.Block
+            # The drain stops after each invalid row, so the second goes on the next run.
+            @(Get-TestOutboxNames $script:Outbox).Count | Should -Be 1
+            $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'ClientSecret' -Sender $Sender.Block
             $Sender.State.Calls | Should -Be 0
             Get-TestOutboxNames $script:Outbox | Should -BeNullOrEmpty
         }
@@ -932,6 +935,35 @@ Describe 'The sender contract: Ok and Permanent (Task 17 follow-ups)' {
         $Flush.Remaining | Should -Be 2
         $Flush.PendingRows | Should -BeTrue
         Test-Path -LiteralPath $Files.First | Should -BeTrue
+    }
+
+    It 'deletes an invalid saved row unsent, then stops the drain, so a newer run never goes before an older one' {
+        $Files = Save-TestTwoRuns
+        [IO.File]::WriteAllText($Files.First, '[{"RunId_g":"truncated')
+        [IO.File]::SetLastWriteTimeUtc($Files.First, [datetime]::UtcNow.AddMinutes(-10))
+        $Contract = New-TestContractSender @()
+        $Budget = 1
+        $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Contract.State.Calls | Should -Be 0
+        Test-Path -LiteralPath $Files.First | Should -BeFalse
+        Test-Path -LiteralPath $Files.Second | Should -BeTrue
+        $Flush.Remaining | Should -Be 1
+        $Flush.PendingRows | Should -BeTrue
+        $Budget | Should -Be 1
+    }
+
+    It 'stops the drain at a saved row it can''t read, keeping it and the rest' {
+        $Files = Save-TestTwoRuns
+        $script:LockedRow = $Files.First
+        Mock Read-AUOutboxRow { throw 'the file is locked' } -ParameterFilter { $File.Path -eq $script:LockedRow }
+        $Contract = New-TestContractSender @()
+        $Budget = 1
+        $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
+        $Contract.State.Calls | Should -Be 0
+        Test-Path -LiteralPath $Files.First | Should -BeTrue
+        Test-Path -LiteralPath $Files.Second | Should -BeTrue
+        $Flush.Remaining | Should -Be 2
+        $Flush.PendingRows | Should -BeTrue
     }
 
     It 'saves this run''s permanently rejected row, so the next run tries it once more' {
