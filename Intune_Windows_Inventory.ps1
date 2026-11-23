@@ -6936,6 +6936,7 @@ $script:AUUnixEpoch = New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::
 # header through Subsystem (70). CheckSum and Subsystem sit at the same offsets in PE32 and PE32+.
 $script:AUPeHeaderBytes = 94
 $script:AUServicesKey = 'SYSTEM\CurrentControlSet\Services'
+$script:AUServiceQueryTimeoutSeconds = 30
 
 function Get-AUFixedDrives
 {
@@ -7361,6 +7362,7 @@ function Read-AUFile
     if ($null -eq $ReadBudget) { $Own = New-AUReadBudget; $ReadBudget = $Own }
     $Result = [pscustomobject]@{ Status = 'Failed'; Before = $null; Info = $null; After = $null; Error = $null }
     $Shell = $null
+    $Started = $false
     $Finished = $false
     $Timer = [Diagnostics.Stopwatch]::StartNew()
     try
@@ -7385,6 +7387,7 @@ function Read-AUFile
         $Shell.Runspace = $ReadBudget.Runspace
         [void]$Shell.AddScript($ReadBudget.ScriptText).AddArgument($Path).AddArgument([bool]$WithVersion)
         $Async = $Shell.BeginInvoke()
+        $Started = $true
         if ($Async.AsyncWaitHandle.WaitOne($Wait))
         {
             $Finished = $true
@@ -7393,6 +7396,9 @@ function Read-AUFile
             return $Result
         }
 
+        # Let the stuck read go without waiting on it: its thread stays blocked until the lock is
+        # released or the process exits. Each timeout costs the budget at least min(5 s, what's left),
+        # so a run abandons at most about 24 runspaces (120 s / 5 s), plus one for a last short wait.
         $ReadBudget.TimedOut++
         Write-CMTraceLog -Message "App Usage: reading $Path took longer than $Wait ms; it's treated as unverified." -Component 'AppUsage' -Type 2
         try { [void]$Shell.BeginStop($null, $null) } catch { }
@@ -7405,12 +7411,17 @@ function Read-AUFile
     catch
     {
         Write-CMTraceLog -Message "App Usage: couldn't read $($Path): $($_.Exception.Message)" -Component 'AppUsage' -Type 2
+        # A runspace that failed isn't used again; the next read gets a new one. CloseAsync doesn't wait.
+        $Broken = $ReadBudget.Runspace
+        $ReadBudget.Runspace = $null
+        if ($null -ne $Broken) { try { $Broken.CloseAsync() } catch { } }
         return $Result
     }
     finally
     {
         if ($Result.Status -ne 'Skipped') { $ReadBudget.RemainingMs -= $Timer.Elapsed.TotalMilliseconds }
-        if ($Finished -and $null -ne $Shell) { $Shell.Dispose() }
+        # Disposing a shell that never started, or whose read finished, doesn't wait; a timed-out one would.
+        if ($null -ne $Shell -and ($Finished -or -not $Started)) { try { $Shell.Dispose() } catch { } }
         if ($null -ne $Own) { Close-AUReadBudget $Own }
     }
 }#endfunction
@@ -7421,12 +7432,13 @@ function Get-AUKernelProbe
 .SYNOPSIS
     Probes one kernel path under the fixed drives: the existing candidate files, each with whether its fingerprint verifies.
 .DESCRIPTION
-    Returns Volume (lowercase), Cached (the volume's drive was cached), and Candidates (Root, Path,
-    Verified) for every drive where the file exists and is named the ExeInfo exe name, with 8.3
-    names expanded. A cached volume tries only its drive; a drive cached for another volume isn't
-    tried. Returns $null for a refused path: not \Device\HarddiskVolumeN\, an empty, . or ..
-    segment, a stream name, wildcards, or invalid characters; or a Package, Other, or
-    fingerprint-less entry. The fingerprints are read with Read-AUFile.
+    Returns Volume (lowercase), CachedRoot, and Candidates (Root, Path, Verified) for every drive
+    where the file exists and is named the ExeInfo exe name, with 8.3 names expanded. A cached
+    volume's drive (CachedRoot, else $null) is tried first; when no file there verifies, every
+    fixed drive is probed, so a wrong cache entry never hides a file. Returns $null for a refused
+    path: not \Device\HarddiskVolumeN\, an empty, . or .. segment, a stream name, wildcards, or
+    invalid characters; or a Package, Other, or fingerprint-less entry. The fingerprints are read
+    with Read-AUFile.
 .PARAMETER KernelPath
     The Resource row's KernelPath.
 .PARAMETER ExeInfo
@@ -7457,28 +7469,31 @@ function Get-AUKernelProbe
 
     $Cached = $null
     if ($null -ne $VolumeCache) { $Cached = [string]$VolumeCache[$Volume] }
-    if ($Cached) { $Roots = @($Cached) }
-    else
-    {
-        $Claimed = @()
-        if ($null -ne $VolumeCache) { $Claimed = @($VolumeCache.Values) }
-        $Roots = @(Get-AUFixedDrives | Where-Object { $_ -and $Claimed -notcontains $_ })
-    }
+    if (-not $Cached) { $Cached = $null }
 
     $Candidates = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($Root in $Roots)
-    {
-        $Candidate = ([string]$Root).TrimEnd('\') + '\' + $Rest
+    $Probe = {
+        param ([string]$Root)
+        $Candidate = $Root.TrimEnd('\') + '\' + $Rest
         # An attribute query, not an open, so it can't be held up by a lock on the file.
-        if (-not [IO.File]::Exists((ConvertTo-AUIoPath $Candidate))) { continue }
+        if (-not [IO.File]::Exists((ConvertTo-AUIoPath $Candidate))) { return }
         $Path = Get-AULongPath $Candidate
         $Leaf = $Path.Substring($Path.LastIndexOf('\') + 1)
-        if ($ExeInfo.ExeName -and -not [string]::Equals($Leaf, [string]$ExeInfo.ExeName, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($ExeInfo.ExeName -and -not [string]::Equals($Leaf, [string]$ExeInfo.ExeName, [StringComparison]::OrdinalIgnoreCase)) { return }
         $Read = Read-AUFile $Path -ReadBudget $ReadBudget
         $Verified = ($Read.Status -eq 'OK' -and (Test-AUFingerprintMatch $Read.Before $ExeInfo))
         $Candidates.Add([pscustomobject]@{ Root = [string]$Root; Path = $Path; Verified = $Verified })
     }
-    return [pscustomobject]@{ Volume = $Volume; Cached = [bool]$Cached; Candidates = $Candidates.ToArray() }
+    if ($Cached) { & $Probe $Cached }
+    if (-not $Cached -or -not @($Candidates | Where-Object { $_.Verified }).Count)
+    {
+        foreach ($Root in @(Get-AUFixedDrives))
+        {
+            if (-not $Root -or ($Cached -and [string]::Equals([string]$Root, $Cached, [StringComparison]::OrdinalIgnoreCase))) { continue }
+            & $Probe ([string]$Root)
+        }
+    }
+    return [pscustomobject]@{ Volume = $Volume; CachedRoot = $Cached; Candidates = $Candidates.ToArray() }
 }#endfunction
 
 function Select-AUVerifiedPath
@@ -7486,6 +7501,9 @@ function Select-AUVerifiedPath
     <#
 .SYNOPSIS
     Returns a probe's one verified path, caching its volume's drive, or $null when none or two or more verify.
+.DESCRIPTION
+    Only a single, unambiguous verified hit sets the cache, and it replaces a cached drive that
+    turned out wrong.
 .PARAMETER Probe
     The Get-AUKernelProbe result.
 .PARAMETER KernelPath
@@ -7507,7 +7525,7 @@ function Select-AUVerifiedPath
         Write-CMTraceLog -Message "App Usage: $KernelPath verifies under $($Verified.Count) drives; the path stays untranslated." -Component 'AppUsage'
         return $null
     }
-    if ($null -ne $VolumeCache -and -not $Probe.Cached) { $VolumeCache[$Probe.Volume] = $Verified[0].Root }
+    if ($null -ne $VolumeCache -and -not [string]::Equals([string]$Probe.CachedRoot, $Verified[0].Root, [StringComparison]::OrdinalIgnoreCase)) { $VolumeCache[$Probe.Volume] = $Verified[0].Root }
     return $Verified[0].Path
 }#endfunction
 
@@ -7521,8 +7539,8 @@ function Resolve-AUKernelPath
     candidate counts only when its PE TimeDateStamp and CheckSum equal the ExeInfo fingerprint and
     its file name is the ExeInfo exe name (D24). Exactly one verified candidate is returned, with
     any 8.3 short names expanded; none, or two or more (ambiguous), gives $null. A verified path
-    caches the volume's drive: a cached volume tries only that drive, and a drive cached for another
-    volume isn't tried. A Package or Other entry, or a Win32 entry without a fingerprint, is never
+    caches the volume's drive: a cached volume tries that drive first, and every drive when nothing
+    there verifies. A Package or Other entry, or a Win32 entry without a fingerprint, is never
     probed. Never throws.
 .PARAMETER KernelPath
     The Resource row's KernelPath.
@@ -7594,9 +7612,14 @@ function Find-AUExePath
             {
                 $Probe = Get-AUKernelProbe $Kernel $ExeInfo $VolumeCache $ReadBudget
                 if ($null -eq $Probe) { continue }
-                foreach ($Candidate in $Probe.Candidates) { [void]$Existing.Add($Candidate.Path) }
-                $Path = Select-AUVerifiedPath $Probe $Kernel $VolumeCache
-                if ($Path) { [void]$Verified.Add($Path) }
+                # Every verified candidate counts, so a kernel path that verifies on two drives keeps
+                # the entry ambiguous (D24); Select-AUVerifiedPath only caches the volume.
+                foreach ($Candidate in $Probe.Candidates)
+                {
+                    [void]$Existing.Add($Candidate.Path)
+                    if ($Candidate.Verified) { [void]$Verified.Add($Candidate.Path) }
+                }
+                [void](Select-AUVerifiedPath $Probe $Kernel $VolumeCache)
             }
             catch { Write-CMTraceLog -Message "App Usage: couldn't translate $($Kernel): $($_.Exception.Message)" -Component 'AppUsage' -Type 2 }
         }
@@ -7748,8 +7771,11 @@ function Get-AUServiceRecords
     <#
 .SYNOPSIS
     Returns every Win32 service's Name and PathName. A separate function so tests can mock the WMI read.
+.DESCRIPTION
+    The query gives up after AUServiceQueryTimeoutSeconds (30) and throws, so a stuck WMI service
+    can't hang the run; Get-AUServiceBinaries then logs it and returns an empty map.
 #>
-    return @(Get-CimInstance -ClassName Win32_Service -Property Name, PathName -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; PathName = [string]$_.PathName } })
+    return @(Get-CimInstance -ClassName Win32_Service -Property Name, PathName -OperationTimeoutSec $script:AUServiceQueryTimeoutSeconds -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; PathName = [string]$_.PathName } })
 }#endfunction
 
 function Get-AUServiceDll

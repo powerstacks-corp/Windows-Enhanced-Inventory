@@ -169,20 +169,49 @@ Describe 'Resolve-AUKernelPath' {
         Resolve-AUKernelPath $script:Kernel $script:Info @{} | Should -BeNullOrEmpty
     }
 
-    It 'tries only the cached drive for a cached volume' {
+    It 'tries only the cached drive when the file there verifies' {
         New-TestPe (Join-Path $script:RootC $script:Rest) $script:OldBuild 0x5150
-        $cache = @{ 'harddiskvolume3' = $script:RootE }
-        Resolve-AUKernelPath $script:Kernel $script:Info $cache | Should -BeNullOrEmpty
-        Should -Invoke Get-AUFixedDrives -Times 0
         New-TestPe (Join-Path $script:RootE $script:Rest) $script:OldBuild 0x5150
+        $cache = @{ 'harddiskvolume3' = $script:RootE }
         Resolve-AUKernelPath $script:Kernel $script:Info $cache | Should -BeExactly (Join-Path $script:RootE $script:Rest)
+        Should -Invoke Get-AUFixedDrives -Times 0
+        $cache['harddiskvolume3'] | Should -BeExactly $script:RootE
     }
 
-    It 'does not probe a drive another volume is cached to' {
+    It 'falls back to every drive when nothing verifies on the cached drive, and corrects the cache' {
         New-TestPe (Join-Path $script:RootC $script:Rest) $script:OldBuild 0x5150
-        $cache = @{ 'harddiskvolume1' = $script:RootC }
-        Resolve-AUKernelPath '\Device\HarddiskVolume7\Program Files\Contoso\tool.exe' $script:Info $cache | Should -BeNullOrEmpty
-        $cache.ContainsKey('harddiskvolume7') | Should -BeFalse
+        $cache = @{ 'harddiskvolume3' = $script:RootE }
+        Resolve-AUKernelPath $script:Kernel $script:Info $cache | Should -BeExactly (Join-Path $script:RootC $script:Rest)
+        Should -Invoke Get-AUFixedDrives -Times 1 -Exactly
+        $cache['harddiskvolume3'] | Should -BeExactly $script:RootC
+    }
+
+    It 'keeps the cache when the fallback finds nothing or is ambiguous' {
+        $cache = @{ 'harddiskvolume3' = $script:RootE }
+        Resolve-AUKernelPath $script:Kernel $script:Info $cache | Should -BeNullOrEmpty
+        $cache['harddiskvolume3'] | Should -BeExactly $script:RootE
+        New-TestPe (Join-Path $script:RootE $script:Rest) $script:NewBuild 0x9999
+        New-TestPe (Join-Path $script:RootC $script:Rest) $script:OldBuild 0x5150
+        $other = Join-Path (Get-AULongPath $TestDrive) 'VolF'
+        Mock Get-AUFixedDrives { @($script:RootC, $script:RootE, (Join-Path (Get-AULongPath $TestDrive) 'VolF')) }
+        New-TestPe (Join-Path $other $script:Rest) $script:OldBuild 0x5150
+        Resolve-AUKernelPath $script:Kernel $script:Info $cache | Should -BeNullOrEmpty
+        $cache['harddiskvolume3'] | Should -BeExactly $script:RootE
+    }
+
+    It 'still probes a drive another volume is cached to, so a wrong cache entry never takes a drive out' {
+        # Volume 6 was cached to C: from a same-build file at the same relative path on C:.
+        $cache = @{ 'harddiskvolume6' = $script:RootC }
+        New-TestPe (Join-Path $script:RootC $script:Rest) $script:OldBuild 0x5150
+        # C:'s own volume (3) still finds its file on C:.
+        Resolve-AUKernelPath $script:Kernel $script:Info $cache | Should -BeExactly (Join-Path $script:RootC $script:Rest)
+        $cache['harddiskvolume3'] | Should -BeExactly $script:RootC
+        # And volume 6's file, really on E:, is found there once C: has no verified copy.
+        $restE = 'probe\ProbeOnE.exe'
+        $infoE = New-TestExeInfo 'probeone.exe' $script:NewBuild 0x6
+        New-TestPe (Join-Path $script:RootE $restE) $script:NewBuild 0x6
+        Resolve-AUKernelPath ('\Device\HarddiskVolume6\' + $restE) $infoE $cache | Should -BeExactly (Join-Path $script:RootE $restE)
+        $cache['harddiskvolume6'] | Should -BeExactly $script:RootE
     }
 
     It 'works without a cache' {
@@ -280,6 +309,21 @@ Describe 'Find-AUExePath' {
         $found.Verified | Should -BeTrue
         @($found.PSObject.Properties.Name) | Should -Be @('Path', 'Verified')
         (Find-AUExePath $script:Kernels (New-TestExeInfo 'tool.exe' $script:NewBuild 0x64) @{}).Path | Should -BeExactly $script:Sys32
+    }
+
+    It 'returns $null when one kernel path verifies on two drives and another verifies once (D24)' {
+        Mock Write-CMTraceLog { }
+        $rootB = Join-Path (Get-AULongPath $TestDrive) 'VolB'
+        Remove-Item -Recurse -Force -Path $rootB -ErrorAction SilentlyContinue
+        Mock Get-AUFixedDrives { @($script:Root, (Join-Path (Get-AULongPath $TestDrive) 'VolB')) }
+        New-TestPe (Join-Path $script:Root 'x\tool.exe') $script:OldBuild 0x32
+        New-TestPe (Join-Path $rootB 'x\tool.exe') $script:OldBuild 0x32
+        New-TestPe (Join-Path $script:Root 'y\tool.exe') $script:OldBuild 0x32
+        $kernels = @('\Device\HarddiskVolume3\x\tool.exe', '\Device\HarddiskVolume3\y\tool.exe')
+        Find-AUExePath $kernels (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{} | Should -BeNullOrEmpty
+        Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match '3 paths verify' }
+        # In the other order too.
+        Find-AUExePath @($kernels[1], $kernels[0]) (New-TestExeInfo 'tool.exe' $script:OldBuild 0x32) @{} | Should -BeNullOrEmpty
     }
 
     It 'returns $null when both candidates match (D24)' {
@@ -554,6 +598,24 @@ Describe 'Timed reads outside the allowlisted system folders' {
         Close-AUReadBudget $budget
     }
 
+    It 'does not reuse a runspace whose read failed, and logs the failure' {
+        $real = Get-AUFileReadScript
+        Mock Get-AUFileReadScript { 'throw "runspace read broke"' }
+        $budget = New-AUReadBudget
+        try
+        {
+            $read = Read-AUFile $script:Path -ReadBudget $budget
+            $read.Status | Should -BeExactly 'Failed'
+            $budget.Runspace | Should -BeNullOrEmpty
+            Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match 'runspace read broke' -and $Type -eq 2 }
+            # The next read gets a new runspace and works.
+            $budget.ScriptText = $real
+            (Read-AUFile $script:Path -ReadBudget $budget).Status | Should -BeExactly 'OK'
+            $budget.Runspace | Should -Not -BeNullOrEmpty
+        }
+        finally { Close-AUReadBudget $budget }
+    }
+
     It 'reads allowlisted paths directly even when the budget is spent' {
         Mock Test-AUDirectRead { $true }
         $budget = New-AUReadBudget -TotalSeconds 0
@@ -783,6 +845,17 @@ Describe 'Get-AUServiceBinaries' {
         $map = Get-AUServiceBinaries
         @($map.Values) -contains 'Netsvc' | Should -BeFalse
         $map['c:\contoso\vpn.exe'] | Should -BeExactly 'ContosoVpn'
+    }
+}
+
+Describe 'Get-AUServiceRecords' {
+    It 'bounds the service query with a 30-second WMI timeout, and a timed-out query gives an empty map' {
+        Mock Write-CMTraceLog { }
+        Mock Get-CimInstance { throw 'The WS-Management service cannot complete the operation within the time specified in OperationTimeout.' }
+        $map = Get-AUServiceBinaries
+        $map.Count | Should -Be 0
+        Should -Invoke Get-CimInstance -Times 1 -Exactly -ParameterFilter { $ClassName -eq 'Win32_Service' -and $OperationTimeoutSec -eq 30 }
+        Should -Invoke Write-CMTraceLog -ParameterFilter { $Message -match 'OperationTimeout' -and $Type -eq 2 }
     }
 }
 
