@@ -204,7 +204,7 @@ Row 1 of every run with App Usage on carries these columns, next to the App Inve
 |---|---|
 | `AppUsageEnabled_b` | `true`: App Usage was on for this run. |
 | `WatchingSince_t` | The earliest usage App Usage has for the device, in UTC. Blank until the device has some. |
-| `AppUsageScriptVersion_s` | The script version. |
+| `AppUsageScriptVersion_s` | The leading number of the script version, for example `20`. |
 | `MappingsVersion_s` | The version of the PowerStacks mapping rules built into the script. Blank when App Usage skipped before it loaded them. |
 | `CustomerMappingsHash_s` | The SHA-256 of the customer mapping file the run used. Blank when there's no file or it's invalid. |
 | `UnmatchedExeCount_d` | How many executables no rule matched. Executables that ignore rules match aren't counted. |

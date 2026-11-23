@@ -11450,8 +11450,9 @@ function New-AUDeviceColumns
     Returns the device columns for row 1, in the spec's order, named for the API mode (Get-AUColumnName).
 .DESCRIPTION
     AppUsageEnabled_b (true: metering was on), WatchingSince_t (Format-AUDate text, or $null),
-    AppUsageScriptVersion_s, MappingsVersion_s, CustomerMappingsHash_s, UnmatchedExeCount_d,
-    ProfilesFound_d, ProfilesRead_d, and AppUsageCollectionStatus_s. The run columns RunId_g,
+    AppUsageScriptVersion_s (the leading number of ScriptVersion), MappingsVersion_s,
+    CustomerMappingsHash_s, UnmatchedExeCount_d, ProfilesFound_d, ProfilesRead_d, and
+    AppUsageCollectionStatus_s. The run columns RunId_g,
     RowIndex_d, and RowCount_d are New-AURunRows's. Uses only what Constrained Language Mode allows.
 .PARAMETER Result
     The Invoke-AppUsage result, with Status set.
@@ -11471,7 +11472,11 @@ function New-AUDeviceColumns
     $Columns = [ordered]@{}
     $Columns[(Get-AUColumnName 'AppUsageEnabled' 'b' $LogAPIMode)] = $true
     $Columns[(Get-AUColumnName 'WatchingSince' 't' $LogAPIMode)] = $Watching
-    $Columns[(Get-AUColumnName 'AppUsageScriptVersion' 's' $LogAPIMode)] = $ScriptVersion
+    # The leading number of $ScriptVersion ('19 - August 10, 2026' gives 19), as the samples show; a
+    # version with no leading number is sent as it is, trimmed.
+    $Version = ([string]$ScriptVersion).Trim()
+    if ($Version -match '^(\d+)') { $Version = $Matches[1] }
+    $Columns[(Get-AUColumnName 'AppUsageScriptVersion' 's' $LogAPIMode)] = $Version
     $Columns[(Get-AUColumnName 'MappingsVersion' 's' $LogAPIMode)] = [string]$Result.MappingsVersion
     $Columns[(Get-AUColumnName 'CustomerMappingsHash' 's' $LogAPIMode)] = [string]$Result.CustomerMappingsHash
     $Columns[(Get-AUColumnName 'UnmatchedExeCount' 'd' $LogAPIMode)] = $Result.UnmatchedExeCount
