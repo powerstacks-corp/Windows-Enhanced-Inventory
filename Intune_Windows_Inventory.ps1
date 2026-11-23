@@ -8982,14 +8982,15 @@ $script:AUOutboxFilePattern = '^(?<RunId>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-
 $script:AUOutboxTempMaxAgeHours = 24
 
 # The sender (F51): Send-AUOutbox and Send-AURunRows take it as a required scriptblock,
-# param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType), whose last output is an object with
-# Ok ($true only when the row was accepted) and Permanent ($true only for a rejection a resend can't
-# fix, Test-AUPermanentStatus); a [bool] alone is read as Ok. The region never reads the inventory's
-# connection settings, so the inline App Inventory section builds it outside the region ($AUSender): it
-# calls Send-LogIngestionAPI (or Send-DataCollectorAPI for the classic API) with the inventory's
-# connection variables, as the inline App Inventory upload does, so each row keeps the inventory's
-# existing retry (Invoke-LogSubmission), and Ok is whether the response is the success status the
-# summary line checks (204, or 200 for the classic API). Tests pass a mock.
+# param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType, [bool]$SingleAttempt), whose last
+# output is an object with Ok ($true only when the row was accepted) and Permanent ($true only when
+# the ingestion POST rejected the row itself, Test-AUPermanentStatus); a [bool] alone is read as Ok.
+# The region never reads the inventory's connection settings, so the inline App Inventory section
+# builds it outside the region ($AUSender): it calls Send-LogIngestionAPI (or Send-DataCollectorAPI
+# for the classic API) with the inventory's connection variables, as the inline App Inventory upload
+# does, so this run's rows keep the inventory's existing retry (Invoke-LogSubmission); with
+# SingleAttempt (the outbox drain) it makes one attempt with no backoff. Ok is whether the response
+# is the success status the summary line checks (204, or 200 for the classic API). Tests pass a mock.
 
 function Get-AUColumnName
 {
@@ -9529,29 +9530,34 @@ function Invoke-AUSend
 .DESCRIPTION
     The sender's last output is an object with Ok and Permanent (the contract the inventory's sender
     keeps), or a [bool] for Ok alone. Ok is $true only when the row was accepted. Permanent is $true
-    only for a rejection that a resend can't fix: an HTTP 4xx other than 408 and 429. Anything else
-    counts as a failed send that may work later. A sender that throws, such as the inventory's size
-    guard or a failed token request, counts as a failed send that isn't permanent.
+    only when the data collection rule's ingestion response rejected the row itself (400 or 413,
+    Test-AUPermanentStatus), so a resend of the same row can't succeed. Anything else counts as a
+    failed send that may work later. A sender that throws, such as the inventory's size guard or a
+    failed token request, counts as a failed send that isn't permanent.
 .PARAMETER Sender
-    The sender scriptblock: param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType).
+    The sender scriptblock: param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType,
+    [bool]$SingleAttempt).
 .PARAMETER Body
     The body.
 .PARAMETER LogAPIMode
     The inventory's $LogAPIMode.
 .PARAMETER LogType
     The App Inventory log type.
+.PARAMETER SingleAttempt
+    Ask the sender for one attempt with no backoff (the outbox drain).
 #>
     param (
         [scriptblock]$Sender,
         [byte[]]$Body,
         [string]$LogAPIMode,
-        [string]$LogType
+        [string]$LogType,
+        [switch]$SingleAttempt
     )
 
     $Outcome = [pscustomobject]@{ Ok = $false; Permanent = $false }
     try
     {
-        $Output = & $Sender $Body $LogAPIMode $LogType
+        $Output = & $Sender $Body $LogAPIMode $LogType ([bool]$SingleAttempt)
         $Last = @($Output) | Select-Object -Last 1
         if ($Last -is [bool]) { $Outcome.Ok = $Last }
         elseif ($null -ne $Last -and $null -ne $Last.PSObject.Properties['Ok'])
@@ -9571,7 +9577,11 @@ function Test-AUPermanentStatus
 {
     <#
 .SYNOPSIS
-    Tests whether an HTTP status is a permanent rejection: a 4xx other than 408 (timeout) and 429 (throttled).
+    Tests whether a data collection rule's ingestion response rejected the row itself: 400 (bad request) or 413 (too large).
+.DESCRIPTION
+    Only those two say the row can never be accepted. 401, 403, and 404 are configuration (an
+    expired secret, a missing role, a wrong rule), and 408, 429, and 5xx are transient, so those rows
+    are kept. Pass only the status of the ingestion POST, never of the token request.
 .PARAMETER StatusCode
     The HTTP status code, or $null when there was no response.
 #>
@@ -9581,7 +9591,7 @@ function Test-AUPermanentStatus
 
     $Code = $StatusCode -as [int]
     if ($null -eq $Code) { return $false }
-    return ($Code -ge 400 -and $Code -le 499 -and $Code -ne 408 -and $Code -ne 429)
+    return ($Code -eq 400 -or $Code -eq 413)
 }#endfunction
 
 function Remove-AUStaleOutboxTemp
@@ -9637,13 +9647,13 @@ function Send-AUOutbox
     AppUsageCollectionStatus_s reflects the flush: PendingRows is $true when rows still wait
     afterward. The outbox first keeps only the MaxRuns most recent runs. A saved row that isn't
     valid (Read-AUOutboxRow) is deleted unsent.
-    RetryBudget is shared with Send-AURunRows (F51): each send gets the sender's own retry (the
-    inventory's Invoke-LogSubmission), and a send that still fails spends one unit. Once the budget
-    is 0, nothing more is sent this run and the rows stay for the next run. The caller sets it to 1
-    per run, so an outage costs one retry cycle, not one per row. A row the service rejects
-    permanently (Invoke-AUSend's Permanent: a 4xx other than 408 and 429) is deleted unsent and
-    counted in Discarded, without spending the budget, because resending can't fix it. A sent row
-    that can't be deleted is renamed to *.sent (Remove-AUOutboxFile -Sent), so it's never sent again.
+    Each saved row gets one attempt with no backoff (Invoke-AUSend -SingleAttempt), so the drain
+    takes at most one call per saved row. The first failure that may work later stops the drain:
+    that row and the rest stay for the next run, and the run's RetryBudget (F51), which this run's
+    own rows use (Send-AURunRows), isn't spent. Nothing is sent when RetryBudget is already 0. A row
+    the ingestion service rejected itself (Invoke-AUSend's Permanent: a DCR response of 400 or 413)
+    is deleted unsent and counted in Discarded, and the drain goes on. A sent row that can't be
+    deleted is renamed to *.sent (Remove-AUOutboxFile -Sent), so it's never sent again.
     In a trusted outbox, leftover temp files older than 24 hours, and *.sent files, are deleted first
     (Remove-AUStaleOutboxTemp). An outbox that isn't trusted (Get-AUOutboxState) is never read,
     sent, or deleted from; OutboxSkipped is then $true, as it is when the folder can't be listed.
@@ -9655,7 +9665,7 @@ function Send-AUOutbox
 .PARAMETER OutboxDir
     The outbox folder (Get-AUOutboxPath).
 .PARAMETER RetryBudget
-    The run's retry budget, a [ref] to an int.
+    The run's retry budget, a [ref] to an int. The drain reads it and never spends it.
 .PARAMETER LogAPIMode
     The inventory's $LogAPIMode.
 .PARAMETER LogType
@@ -9715,7 +9725,7 @@ function Send-AUOutbox
             if (Remove-AUOutboxFile -Path $File.Path) { $Remaining-- }
             continue
         }
-        $Send = Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType
+        $Send = Invoke-AUSend -Sender $Sender -Body $Body -LogAPIMode $LogAPIMode -LogType $LogType -SingleAttempt
         if ($Send.Ok)
         {
             $Result.Sent++
@@ -9723,15 +9733,16 @@ function Send-AUOutbox
         }
         elseif ($Send.Permanent)
         {
-            # Resending can't fix it, so the row is discarded and the budget is kept for the rest.
+            # The service rejected the row itself, so resending can't fix it.
             $Result.Discarded++
             Write-CMTraceLog -Message "App Usage: row $($File.RowIndex) of run $($File.RunId) from the outbox was rejected permanently, so it's deleted unsent." -Component 'AppUsage' -Type 3
             if (Remove-AUOutboxFile -Path $File.Path) { $Remaining-- }
         }
         else
         {
-            $RetryBudget.Value--
-            Write-CMTraceLog -Message "App Usage: row $($File.RowIndex) of run $($File.RunId) from the outbox wasn't sent; it waits for the next run." -Component 'AppUsage' -Type 2
+            # One attempt only: the rest wait too, and this run's own rows keep the retry budget.
+            Write-CMTraceLog -Message "App Usage: row $($File.RowIndex) of run $($File.RunId) from the outbox wasn't sent, so it and the rows after it wait for the next run." -Component 'AppUsage' -Type 2
+            break
         }
     }
     $Result.Remaining = $Remaining
@@ -11798,11 +11809,17 @@ if ($CollectAppInventory)
             }
 
             # Each row is sent with the inventory's own upload, and its retry, using the connection
-            # settings above. Ok: the success status the summary line checks. Permanent: a 4xx other
-            # than 408 and 429, which a resend can't fix.
+            # settings above. A saved outbox row asks for one attempt with no backoff (SingleAttempt).
+            # Ok: the success status the summary line checks. Permanent: the ingestion POST itself
+            # rejected the row (400 or 413). The status comes only from that POST, never from the
+            # token request, so an expired secret or a missing role never discards a row.
             $AUSender = {
-                param ([byte[]]$Body, [string]$Mode, [string]$Type)
-                $ErrorActionPreference = 'Stop'
+                param ([byte[]]$Body, [string]$Mode, [string]$Type, [bool]$SingleAttempt)
+                if ($SingleAttempt)
+                {
+                    # Invoke-LogSubmission reads this setting; this scope's copy holds for this call only.
+                    $SubmissionMaxRetries = 0
+                }
                 $script:LastSubmissionStatusCode = $null
                 $Code = $null
                 $Response = ''
@@ -11811,6 +11828,7 @@ if ($CollectAppInventory)
                     if ($Mode -eq "LogIngestionAPI")
                     {
                         $Response = Send-LogIngestionAPI -tenantId $TenantId -clientId $ClientId -clientSecret $ClientSecret -body $Body -dceURI $DceURI -dcrImmutableId $DcrImmutableId -logType $Type
+                        # Set only by the DCR POST (Invoke-LogSubmission).
                         $Code = $script:LastSubmissionStatusCode
                     }
                     else
@@ -11820,7 +11838,8 @@ if ($CollectAppInventory)
                 }
                 catch
                 {
-                    if ($_.Exception.Response)
+                    # The classic API has no token request, so its error response is the POST's.
+                    if ($Mode -ne "LogIngestionAPI" -and $_.Exception.Response)
                     {
                         try
                         {

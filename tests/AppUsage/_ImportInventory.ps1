@@ -31,13 +31,46 @@ function Get-TestSummaryBlock([string]$ScriptText)
     return $Match.Groups[1].Value
 }
 
-# Version 19 (commit 094a084), read from git into memory. The worktree is never checked out.
+# A function's definition from the script text (an AST lookup), for a test to dot-source in its own
+# scope: . ([scriptblock]::Create((Get-TestScriptFunction 'Send-LogIngestionAPI'))).
+function Get-TestScriptFunction([string]$Name, [string]$ScriptText = (Get-TestScriptText))
+{
+    $Ast = [Management.Automation.Language.Parser]::ParseInput($ScriptText, [ref]$null, [ref]$null)
+    $Function = $Ast.Find({ param($Node) $Node -is [Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq $Name }, $true)
+    if ($null -eq $Function) { throw "Function $Name not found." }
+    return $Function.Extent.Text
+}
+
+# Version 19's App Inventory region and status report (commit 094a084), from the committed copy in
+# fixtures, so the tests need no git history: CI checks out a single commit.
+$script:AUV19SourcePath = Join-Path $PSScriptRoot 'fixtures\v19-appinventory-source.txt'
+
 function Get-TestV19ScriptText
 {
+    if (-not (Test-Path -LiteralPath $script:AUV19SourcePath)) { throw "The version 19 source fixture $($script:AUV19SourcePath) is missing. Regenerate it with Export-TestV19Source in a clone that has commit 094a084." }
+    return [IO.File]::ReadAllText($script:AUV19SourcePath, [Text.Encoding]::UTF8)
+}
+
+# Writes fixtures\v19-appinventory-source.txt from git (commit 094a084): a header, then version 19's
+# App Inventory region and status report, verbatim. Needs a clone with that commit; tests never call it.
+function Export-TestV19Source([string]$Path = $script:AUV19SourcePath)
+{
     $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-    $Text = & git -C $Root show '094a084:Intune_Windows_Inventory.ps1' 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $Text) { throw 'Version 19 (094a084) is not in this clone.' }
-    return (@($Text) -join "`r`n")
+    $Lines = & git -C $Root show '094a084:Intune_Windows_Inventory.ps1' 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $Lines) { throw 'Version 19 (094a084) is not in this clone.' }
+    $Text = (@($Lines) -join "`n") + "`n"
+    $Region = [regex]::Match($Text, '(?ms)^# region APPINVENTORY\n.*?^# end region APPINVENTORY\n').Value
+    $Summary = [regex]::Match($Text, '(?ms)^# Report back status\n.*?^#endregion script\n').Value
+    if (-not $Region -or -not $Summary) { throw 'Version 19 no longer has both parts.' }
+    $Header = @(
+        '# Version 19 of Intune_Windows_Inventory.ps1 (commit 094a084), the two parts the App Inventory'
+        '# tests compare against: the App Inventory region and the final status report, copied verbatim.'
+        '# Kept in the repo so the tests need no git history (CI checks out one commit). Regenerate with'
+        '# Export-TestV19Source in tests/AppUsage/_ImportInventory.ps1. Never edit by hand.'
+        ''
+        ''
+    ) -join "`n"
+    [IO.File]::WriteAllText($Path, $Header + $Region + "`n" + $Summary, (New-Object Text.UTF8Encoding $false))
 }
 
 # The synthetic device's apps, in the shape of version 19's Get-InstalledApplications output (the
@@ -141,7 +174,9 @@ function Invoke-TestAppInventory
         [object[]]$Apps = (New-TestInventoryApps),
         [object[]]$AppxApps = (New-TestInventoryAppx),
         [scriptblock]$SendResponse,
-        [switch]$Summary
+        [switch]$Summary,
+        [switch]$RealUpload,
+        [switch]$RealLogger
     )
 
     # The script settings and common data the block reads.
@@ -177,7 +212,9 @@ function Invoke-TestAppInventory
     }
 
     # The stubs.
-    function Write-CMTraceLog { param ([Parameter(Position = 0)]$Message, [Parameter(ValueFromRemainingArguments = $true)]$Rest) $AUTestInventoryState.Log.Add([string]$Message) }
+    # -RealLogger and -RealUpload leave out these stubs, so the caller's own definitions (the real
+    # functions, Get-TestScriptFunction) are found instead.
+    if (-not $RealLogger) { function Write-CMTraceLog { param ([Parameter(Position = 0)]$Message, [Parameter(ValueFromRemainingArguments = $true)]$Rest) $AUTestInventoryState.Log.Add([string]$Message) } }
     function Get-WmiObject { [pscustomobject]@{ UserName = 'TESTDOMAIN\testuser' } }
     function Get-CimInstance { }
     function Invoke-CimMethod { }
@@ -191,7 +228,7 @@ function Invoke-TestAppInventory
         $script:LastSubmissionStatusCode = $Code
         return "$Code : Upload payload size is $(($Body.Length / 1024).ToString('#.#'))Kb "
     }
-    function Send-LogIngestionAPI { param ($tenantId, $clientId, $clientSecret, $body, $dceURI, $dcrImmutableId, $logType) Send-TestUpload 'LogIngestionAPI' $logType $body }
+    if (-not $RealUpload) { function Send-LogIngestionAPI { param ($tenantId, $clientId, $clientSecret, $body, $dceURI, $dcrImmutableId, $logType) Send-TestUpload 'LogIngestionAPI' $logType $body } }
     function Send-DataCollectorAPI { param ($customerId, $sharedKey, $body, $logType) Send-TestUpload 'DataCollectorAPI' $logType $body }
 
     $Block = [scriptblock]::Create((Get-TestAppInventoryBlock $ScriptText))

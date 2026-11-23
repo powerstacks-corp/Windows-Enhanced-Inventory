@@ -7,7 +7,7 @@ App Usage (software metering) records which installed apps people actually use, 
 App Usage runs only where it's supported. On any other device, the inventory runs as before, and App Usage reports why it skipped in `AppUsageCollectionStatus_s`.
 
 - **Windows:** Windows 11 25H2 (build 26200) or later. Windows 10 and earlier Windows 11 releases report `UnsupportedOS`.
-- **PowerShell:** 64-bit Windows PowerShell 5.1, running as SYSTEM, the way Intune runs the script. In Constrained Language mode, for example under an application control policy, App Usage reports `LanguageMode:ConstrainedLanguage; skipped`.
+- **PowerShell:** 64-bit Windows PowerShell 5.1, running as SYSTEM, the way Intune runs the script. In Constrained Language mode, for example under an application control policy, App Usage is skipped and the inventory uploads as in version 19, without the App Usage columns. The reason, `LanguageMode:ConstrainedLanguage`, appears in the script log.
 
 Before you turn it on:
 
@@ -148,14 +148,16 @@ Turning App Usage on requires the BI for Intune release that reads split runs. W
 
 ### Rows That Fail to Send
 
-Each row gets the script's usual upload retries. A row that still fails is saved on the device, in `C:\Windows\AppUsage_<Serial>_outbox\`, next to the usage history and with the same `<Serial>`, as `<RunId>-<RowIndex>.json`. The next run sends it first, unchanged.
+This run's rows get the script's usual upload retries. A row that still fails is saved on the device, in `C:\Windows\AppUsage_<Serial>_outbox\`, next to the usage history and with the same `<Serial>`, as `<RunId>-<RowIndex>.json`. The next run sends it first, unchanged.
 
 - Only SYSTEM and administrators can open the folder and its files, because the rows hold usage data. If something else is at that path, such as a link, a folder owned by another account, or a folder other users can open, the script never reads, sends, or deletes anything there, and saves nothing to it. To fix that, delete the folder as an administrator; the next run that needs it creates it again.
 - Each run sends the saved rows first, oldest run first, and then its own rows, so the rows arrive in run order.
-- A run spends one round of retries in total. Once a row still fails after its retries, every row left to send, saved or new, waits in the folder for the next run. A network or service outage costs one round of retries, not one for each row.
+- Saved rows get one attempt each, with no retries or waits, so sending them never holds up the run for long. The first saved row that fails stops the sending of saved rows: it and the rest wait for the next run.
+- This run's own rows then get the script's usual retries, one round in total. Once a row still fails after its retries, every row left waits in the folder for the next run. A network or service outage costs one round of retries, not one for each row.
 - The folder keeps the rows of the 5 most recent runs. Once every row of a newer run is sent, the saved rows of older runs are deleted, because the newer run replaces them.
 - While rows wait, row 1's `AppUsageCollectionStatus_s` includes `PendingRows`. The status is set after the saved rows are sent, so a run that empties the folder doesn't report it.
-- A row the service rejects outright, with an HTTP 4xx error other than 408 (request timeout) or 429 (too many requests), can't succeed later. A saved row rejected that way is deleted without using the run's retries, and the run goes on to the next row. A new row rejected that way is saved like any other, so the next run tries it once more.
+- The ingestion service can reject a row itself, with HTTP 400 (bad request) or 413 (too large), and a resend of the same row can't succeed. A saved row rejected that way is deleted, and the run goes on to the next saved row. A new row rejected that way is saved like any other, so the next run tries it once more.
+- No other failure deletes a row. That includes 401 and 403, for example from an expired client secret or a missing role on the data collection rule, a throttled or timed-out request, a server error, and a failed token request. The row waits for the next run.
 - A saved row that was sent but can't be deleted is renamed to `<RunId>-<RowIndex>.json.sent`, so it's never sent again, and a later run deletes it.
 - Two inventory runs never use the folder at the same time. A run that finds another run using it for 60 seconds sends its own rows without the folder and reports `OutboxSkipped`; any of its rows that fail are lost.
 - When App Usage is off, the folder stays on the device and its rows aren't sent.
@@ -183,7 +185,7 @@ Row 1 of every run with App Usage on carries these columns, next to the App Inve
 |---|---|
 | `OK` | Nothing to report. |
 | `UnsupportedOS` | Windows is older than Windows 11 25H2 (build 26200). App Usage skipped. |
-| `LanguageMode:<mode>; skipped` | PowerShell isn't in Full Language mode, for example `LanguageMode:ConstrainedLanguage; skipped`. App Usage skipped. |
+| `LanguageMode:<mode>; skipped` | PowerShell isn't in Full Language mode. App Usage skipped. In Constrained Language mode the inventory uploads as in version 19, without the App Usage columns, so this token appears in the script log, not in the workspace. |
 | `AppUsageFailed:OsBuild` | The Windows build number couldn't be read. App Usage skipped. |
 | `AppUsageFailed:Serial` | The serial number couldn't be read, so the usage history can't be named. App Usage skipped. A device with no serial number uses its computer name instead and isn't affected. |
 | `MappingsUnavailable:Missing` | The PowerStacks mapping rules aren't in the script. App Usage skipped. |

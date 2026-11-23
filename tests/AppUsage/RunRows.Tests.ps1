@@ -507,7 +507,7 @@ Describe 'Send-AURunRows and Send-AUOutbox (D44, F50 to F53)' {
         $Order | Should -Be @("$Old/1", "$Old/2", "$Newer/1", "$Newer/2", "$($script:RunA)/1")
     }
 
-    It 'spends one retry cycle in total when every send fails (F51)' {
+    It 'spends one attempt on the outbox and one retry cycle in total when every send fails (F51)' {
         $Failing = New-TestSender -AlwaysFail
         $Old = '44444444-4444-4444-8444-444444444444'
         $Rows = New-AURunRows -MainColumns (New-TestMain) -InstalledAppsJson ('["' + (Get-TestHex (New-Object Random 11) 150000) + '"]') -ExeUsageJson '' -LogAPIMode 'LogIngestionAPI' -MaxRowBytes 200000 -RunId $Old
@@ -521,8 +521,12 @@ Describe 'Send-AURunRows and Send-AUOutbox (D44, F50 to F53)' {
         $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Sender.Block -MaxRowBytes 200000
         $Current = New-AURunRows -MainColumns (New-TestMain) -InstalledAppsJson ('["' + (Get-TestHex (New-Object Random 12) 400000) + '"]') -ExeUsageJson '' -LogAPIMode 'LogIngestionAPI' -MaxRowBytes 200000 -RunId $script:RunA
         $Current.Count | Should -Be 4
+        # The drain stops after one single attempt and keeps the budget for this run's rows, whose
+        # first send spends it; the rest go straight to the outbox.
+        $Flush.Sent | Should -Be 0
         $Result = Send-AURunRows -Rows $Current -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Sender.Block -MaxRowBytes 200000
-        $Sender.State.Calls | Should -Be 1
+        $Sender.State.Calls | Should -Be 2
+        $Budget | Should -Be 0
         $Flush.PendingRows | Should -BeTrue
         $Result.Sent | Should -Be 0
         $Result.Saved | Should -Be 4
@@ -887,9 +891,19 @@ Describe 'The sender contract: Ok and Permanent (Task 17 follow-ups)' {
         $Send.Permanent | Should -Be $Permanent
     }
 
-    It 'treats only a 4xx other than 408 and 429 as permanent' {
-        foreach ($Code in 400, 401, 403, 404, 413, 422) { Test-AUPermanentStatus $Code | Should -BeTrue -Because "$Code" }
-        foreach ($Code in 200, 204, 408, 429, 500, 502, 503, $null, '', 'x') { Test-AUPermanentStatus $Code | Should -BeFalse -Because "'$Code'" }
+    It 'treats only a DCR 400 or 413 as permanent' {
+        foreach ($Code in 400, 413, '400') { Test-AUPermanentStatus $Code | Should -BeTrue -Because "$Code" }
+        foreach ($Code in 200, 204, 401, 403, 404, 408, 422, 429, 500, 502, 503, $null, '', 'x') { Test-AUPermanentStatus $Code | Should -BeFalse -Because "'$Code'" }
+    }
+
+    It 'asks the sender for a single attempt for saved rows only' {
+        $Files = Save-TestTwoRuns
+        $script:Attempts = New-Object 'System.Collections.Generic.List[bool]'
+        $Recorder = { param([byte[]]$Body, [string]$LogAPIMode, [string]$LogType, [bool]$SingleAttempt) $script:Attempts.Add($SingleAttempt); $true }
+        $Budget = 1
+        [void](Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Recorder)
+        [void](Send-AURunRows -Rows (New-AURunRows -MainColumns (New-TestMain) -LogAPIMode 'LogIngestionAPI' -RunId $script:RunA) -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Recorder)
+        $script:Attempts.ToArray() | Should -Be @($true, $true, $false)
     }
 
     It 'discards an outbox row the service rejects permanently, without spending the retry budget' {
@@ -907,13 +921,13 @@ Describe 'The sender contract: Ok and Permanent (Task 17 follow-ups)' {
         Test-Path -LiteralPath $Files.Second | Should -BeFalse
     }
 
-    It 'still spends the budget, and keeps the row, on a transient failure' {
+    It 'stops the drain at the first transient failure, keeping that row and the rest, without spending the budget' {
         $Files = Save-TestTwoRuns
         $Contract = New-TestContractSender @('Fail')
         $Budget = 1
         $Flush = Send-AUOutbox -OutboxDir $script:Outbox -RetryBudget ([ref]$Budget) -LogAPIMode 'LogIngestionAPI' -Sender $Contract.Block
         $Contract.State.Calls | Should -Be 1
-        $Budget | Should -Be 0
+        $Budget | Should -Be 1
         $Flush.Discarded | Should -Be 0
         $Flush.Remaining | Should -Be 2
         $Flush.PendingRows | Should -BeTrue

@@ -137,12 +137,12 @@ BeforeAll {
         Mock Find-AUExePath { $null }
     }
 
-    function Invoke-TestMetered([hashtable]$Settings = @{}, [scriptblock]$SendResponse, [switch]$Summary, [object[]]$Apps = (New-TestV19Apps))
+    function Invoke-TestMetered([hashtable]$Settings = @{}, [scriptblock]$SendResponse, [switch]$Summary, [object[]]$Apps = (New-TestV19Apps), [switch]$RealUpload, [switch]$RealLogger)
     {
         $All = @{}
         foreach ($Key in $script:Metered.Keys) { $All[$Key] = $script:Metered[$Key] }
         foreach ($Key in $Settings.Keys) { $All[$Key] = $Settings[$Key] }
-        return Invoke-TestAppInventory -ScriptText $script:ScriptText -Settings $All -Apps $Apps -SendResponse $SendResponse -Summary:$Summary
+        return Invoke-TestAppInventory -ScriptText $script:ScriptText -Settings $All -Apps $Apps -SendResponse $SendResponse -Summary:$Summary -RealUpload:$RealUpload -RealLogger:$RealLogger
     }
 
     # A sent body as the service receives it.
@@ -368,14 +368,17 @@ Describe 'App Inventory with metering on' {
     }
 
     It 'sends the outbox first and reports PendingRows on row 1 when a waiting row still fails' {
-        # An earlier run's row waits in the outbox; it fails again, so this run's row is saved unsent.
+        # An earlier run's row waits in the outbox and fails again (one attempt); this run's row
+        # then fails too and is saved.
         $Earlier = '33333333-3333-4333-8333-333333333333'
         $Budget = [ref]1
         $Rows = New-AURunRows -MainColumns ([ordered]@{ ComputerName_s = 'TESTPC-0001'; ManagedDeviceID_g = 'x' }) -LogAPIMode 'LogIngestionAPI' -RunId $Earlier
         [void](Send-AURunRows -Rows $Rows -OutboxDir $script:OutboxDir -RetryBudget $Budget -LogAPIMode 'LogIngestionAPI' -Sender { $false })
         $Run = Invoke-TestMetered -SendResponse { param ($Mode, $Body) $script:LastSubmissionStatusCode = 503; 'DCR upload failed after retries : ' } -Summary
-        @($Run.Sends).Count | Should -Be 1
+        @($Run.Sends).Count | Should -Be 2
         (ConvertFrom-TestSend $Run.Sends[0]).RunId_g | Should -BeExactly $Earlier
+        (ConvertFrom-TestSend $Run.Sends[1]).RunId_g | Should -Match '^[0-9a-f]{8}-'
+        (ConvertFrom-TestSend $Run.Sends[1]).RunId_g | Should -Not -BeExactly $Earlier
         $Run.MainApp.AppUsageCollectionStatus_s | Should -BeExactly 'PendingRows'
         @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter '*.json').Count | Should -Be 2
         $Run.Response | Should -BeExactly 'Sent 0 of 1 row '
@@ -400,13 +403,14 @@ Describe 'App Inventory with metering on' {
         $Run.Response | Should -Match '^204 : '
     }
 
-    It 'spends the retry budget on a throttled (429) waiting row' {
+    It 'stops the drain on a throttled (429) waiting row, keeps it, and still tries this run''s row' {
         $Earlier = '55555555-5555-4555-8555-555555555555'
         $Budget = [ref]1
         $Rows = New-AURunRows -MainColumns ([ordered]@{ ComputerName_s = 'TESTPC-0001'; ManagedDeviceID_g = 'x' }) -LogAPIMode 'LogIngestionAPI' -RunId $Earlier
         [void](Send-AURunRows -Rows $Rows -OutboxDir $script:OutboxDir -RetryBudget $Budget -LogAPIMode 'LogIngestionAPI' -Sender { $false })
         $Run = Invoke-TestMetered -SendResponse { param ($Mode, $Body) $script:LastSubmissionStatusCode = 429; 'DCR upload failed after retries : ' }
-        @($Run.Sends).Count | Should -Be 1
+        @($Run.Sends).Count | Should -Be 2
+        @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter "$Earlier-*.json").Count | Should -Be 1
         $Run.MainApp.AppUsageCollectionStatus_s | Should -BeExactly 'PendingRows'
     }
 
@@ -439,6 +443,141 @@ Describe 'App Inventory with metering on' {
         $Run = Invoke-TestMetered -SendResponse { param ($Mode, $Body) $script:LastSubmissionStatusCode = 500; 'DCR upload failed after retries : ' } -Summary
         @($Run.Output).Count | Should -Be 1
         [string]$Run.Output[0] | Should -Match '^InventoryDate: \S+ \S+  AppInventory: Fail $'
+    }
+}
+
+Describe 'The version 19 source fixture' {
+    It 'is in the repo, so the comparisons need no git history, and holds both parts of 094a084' {
+        Test-Path -LiteralPath $script:AUV19SourcePath | Should -BeTrue -Because 'tests\AppUsage\fixtures\v19-appinventory-source.txt must be committed (CI clones one commit)'
+        $Text = Get-TestV19ScriptText
+        $Text | Should -Match '094a084'
+        Get-TestAppInventoryBlock $Text | Should -Match 'Get-InstalledApplications -UserSid \$UserSid'
+        Get-TestSummaryBlock $Text | Should -Match 'AppInventory: OK'
+    }
+}
+
+Describe 'The App Inventory row sender (fix round 1)' {
+    BeforeAll {
+        # An exception like Invoke-WebRequest's for an HTTP error: Response.StatusCode is the status.
+        function New-TestHttpError([int]$Code)
+        {
+            $Exception = New-Object System.Exception "The remote server returned an error: ($Code)."
+            Add-Member -InputObject $Exception -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = $Code })
+            return $Exception
+        }
+
+        # Saves one row for each RunId in the outbox, oldest first.
+        function Save-TestOutboxRows([string[]]$RunIds)
+        {
+            $Age = $RunIds.Count
+            foreach ($RunId in $RunIds)
+            {
+                $Budget = [ref]1
+                $Rows = New-AURunRows -MainColumns ([ordered]@{ ComputerName_s = 'TESTPC-0001'; ManagedDeviceID_g = 'x' }) -LogAPIMode 'LogIngestionAPI' -RunId $RunId
+                [void](Send-AURunRows -Rows $Rows -OutboxDir $script:OutboxDir -RetryBudget $Budget -LogAPIMode 'LogIngestionAPI' -Sender { $false })
+                [IO.File]::SetLastWriteTimeUtc((Join-Path $script:OutboxDir "$RunId-1.json"), [datetime]::UtcNow.AddMinutes(-10 * $Age))
+                $Age--
+            }
+        }
+
+        function Get-TestSavedRunIds
+        {
+            return @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter '*.json' | ForEach-Object { $_.Name.Substring(0, 36) } | Sort-Object)
+        }
+
+        $script:RunA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        $script:RunB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+        $script:RunC = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+        $script:Retries = @{ SubmissionMaxRetries = 2; SubmissionInitialWaitSeconds = 60; SubmissionMaxWaitSeconds = 360 }
+    }
+
+    BeforeEach {
+        Use-TestMeteredDevice
+        # The real upload chain (Send-LogIngestionAPI and Invoke-LogSubmission) with the network and
+        # the clock stubbed: Respond gives the DCR's status for a body; Start-Sleep only counts.
+        . ([scriptblock]::Create((Get-TestScriptFunction 'Send-LogIngestionAPI')))
+        . ([scriptblock]::Create((Get-TestScriptFunction 'Invoke-LogSubmission')))
+        $script:Web = [pscustomobject]@{ Calls = (New-Object 'System.Collections.Generic.List[string]'); Sleeps = 0; Respond = { param ($Text) 204 }; Token = { 'token' } }
+        function New-BearerToken { & $script:Web.Token }
+        function Invoke-WebRequest
+        {
+            param ($Uri, $Method, $Headers, $Body, $ContentType, [switch]$UseBasicParsing)
+            $Text = [Text.Encoding]::UTF8.GetString($Body)
+            $script:Web.Calls.Add($Text)
+            $Code = [int](& $script:Web.Respond $Text)
+            if ($Code -ge 300) { throw (New-TestHttpError $Code) }
+            [pscustomobject]@{ StatusCode = $Code }
+        }
+        function Start-Sleep { param ($Seconds) $script:Web.Sleeps++ }
+    }
+
+    It 'drains saved rows with one attempt each and no backoff, discards only the row the DCR rejects (400), and stops at the first transient failure' {
+        Save-TestOutboxRows @($script:RunA, $script:RunB, $script:RunC)
+        $script:Web.Respond = { param ($Text) if ($Text.Contains($script:RunA)) { 400 } elseif ($Text.Contains($script:RunB)) { 503 } else { 204 } }
+        $Run = Invoke-TestMetered -Settings $script:Retries -RealUpload
+        $script:Web.Sleeps | Should -Be 0
+        $script:Web.Calls.Count | Should -Be 3
+        $script:Web.Calls[0] | Should -Match $script:RunA
+        $script:Web.Calls[1] | Should -Match $script:RunB
+        $script:Web.Calls[2] | Should -Not -Match "$($script:RunA)|$($script:RunB)|$($script:RunC)"
+        $script:Web.Calls[2] | Should -Match '"AppUsageEnabled_b":true'
+        # B and C waited (PendingRows) until this run's row was sent in full, which supersedes them.
+        @($Run.Log | Where-Object { $_ -like '*rejected permanently*' }).Count | Should -Be 1
+        @($Run.Log | Where-Object { $_ -like "*run $($script:RunA)*rejected permanently*" }).Count | Should -Be 1
+        @($Run.Log | Where-Object { $_ -like '*sent 0 row(s) from the outbox; 2 still wait.*' }).Count | Should -Be 1
+        $Run.MainApp.AppUsageCollectionStatus_s | Should -BeExactly 'PendingRows'
+        $Run.Response | Should -Match '^204 : Upload payload size is [\d.]+Kb \(1 row\) $'
+    }
+
+    It 'keeps every saved row when the DCR answers <Code>, after one attempt' -ForEach @(@{ Code = 401 }, @{ Code = 403 }, @{ Code = 404 }, @{ Code = 429 }) {
+        Save-TestOutboxRows @($script:RunA, $script:RunB)
+        $script:Code = $Code
+        $script:Web.Respond = { param ($Text) if ($Text.Contains($script:RunA) -or $Text.Contains($script:RunB)) { $script:Code } else { 204 } }
+        $Run = Invoke-TestMetered -Settings $script:Retries -RealUpload
+        @($script:Web.Calls | Where-Object { $_.Contains($script:RunA) -or $_.Contains($script:RunB) }).Count | Should -Be 1
+        $script:Web.Sleeps | Should -Be 0
+        @($Run.Log | Where-Object { $_ -like '*rejected permanently*' }) | Should -BeNullOrEmpty
+        @($Run.Log | Where-Object { $_ -like '*sent 0 row(s) from the outbox; 2 still wait.*' }).Count | Should -Be 1
+        $Run.MainApp.AppUsageCollectionStatus_s | Should -BeExactly 'PendingRows'
+        $Run.Response | Should -Match '^204 : '
+    }
+
+    It 'never discards a saved row when the token request fails with 401, and sends nothing' {
+        Save-TestOutboxRows @($script:RunA)
+        $script:Web.Token = { throw (New-TestHttpError 401) }
+        $Run = Invoke-TestMetered -Settings $script:Retries -RealUpload
+        $script:Web.Calls.Count | Should -Be 0
+        @(Get-TestSavedRunIds) -contains $script:RunA | Should -BeTrue
+        @(Get-TestSavedRunIds).Count | Should -Be 2
+        $Run.Response | Should -BeExactly 'Sent 0 of 1 row '
+    }
+
+    It 'gives this run''s own rows the inventory''s normal retry' {
+        $script:Web.Respond = { param ($Text) 503 }
+        $Run = Invoke-TestMetered -Settings $script:Retries -RealUpload
+        $script:Web.Calls.Count | Should -Be 3
+        $script:Web.Sleeps | Should -Be 2
+        @(Get-TestSavedRunIds).Count | Should -Be 1
+        $Run.Response | Should -BeExactly 'Sent 0 of 1 row '
+    }
+
+    It 'reports an accepted row as sent when the log file is locked' {
+        . ([scriptblock]::Create((Get-TestScriptFunction 'Write-CMTraceLog')))
+        $SavedLog = $script:CMLog
+        $script:CMLog = Join-Path $TestDrive "locked-$([guid]::NewGuid().ToString('N')).log"
+        $Lock = [IO.File]::Open($script:CMLog, [IO.FileMode]::Create, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try
+        {
+            $Run = Invoke-TestMetered -Settings $script:Retries -RealUpload -RealLogger
+        }
+        finally
+        {
+            $Lock.Dispose()
+            $script:CMLog = $SavedLog
+        }
+        $script:Web.Calls.Count | Should -Be 1
+        $Run.Response | Should -Match '^204 : Upload payload size is [\d.]+Kb \(1 row\) $'
+        @(Get-ChildItem -LiteralPath $script:OutboxDir -Filter '*.json' -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty
     }
 }
 
