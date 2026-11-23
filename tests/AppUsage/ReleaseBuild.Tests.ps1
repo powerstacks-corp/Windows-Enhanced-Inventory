@@ -433,6 +433,13 @@ Describe 'Seed rules in powerstacks-mappings.json' {
             (New-TestApp 'Adobe Creative Cloud' 'Adobe Inc.')
             (New-TestApp 'Adobe Acrobat (64-bit)' 'Adobe Inc.')
         )
+
+        # The typical device's apps, plus a case's own extra entry when it names one.
+        function Get-TestCaseApps([string]$Extra)
+        {
+            if (-not $Extra) { return , $Apps }
+            return , @($Apps + @((New-TestApp $Extra 'Microsoft Corporation')))
+        }
     }
 
     BeforeDiscovery {
@@ -445,6 +452,8 @@ Describe 'Seed rules in powerstacks-mappings.json' {
             @{ Id = 'ps-m365apps-5'; Exe = 'ONENOTE.EXE'; Path = 'C:\Program Files\Microsoft Office\root\Office16\ONENOTE.EXE'; Company = 'Microsoft Corporation'; Product = 'Microsoft OneNote'; Description = 'Microsoft OneNote'; App = 'Microsoft 365 Apps for enterprise - en-us' }
             @{ Id = 'ps-m365apps-6'; Exe = 'MSACCESS.EXE'; Path = 'C:\Program Files\Microsoft Office\root\Office16\MSACCESS.EXE'; Company = 'Microsoft Corporation'; Product = 'Microsoft Office'; Description = 'Microsoft Access'; App = 'Microsoft 365 Apps for enterprise - en-us' }
             @{ Id = 'ps-vscode-1'; Exe = 'Code.exe'; Path = 'C:\Users\a\AppData\Local\Programs\Microsoft VS Code\Code.exe'; Company = 'Microsoft Corporation'; Product = 'Visual Studio Code'; Description = 'Visual Studio Code'; App = 'Microsoft Visual Studio Code (User)' }
+            # Insiders is checked with its own entry installed too (Extra).
+            @{ Id = 'ps-vscode-insiders-1'; Exe = 'Code - Insiders.exe'; Path = 'C:\Users\a\AppData\Local\Programs\Microsoft VS Code Insiders\Code - Insiders.exe'; Company = 'Microsoft Corporation'; Product = 'Visual Studio Code - Insiders'; Description = 'Visual Studio Code - Insiders'; App = 'Microsoft Visual Studio Code - Insiders (User)'; Extra = 'Microsoft Visual Studio Code - Insiders (User)' }
             @{ Id = 'ps-adobecc-1'; Exe = 'Creative Cloud.exe'; Path = 'C:\Program Files\Adobe\Adobe Creative Cloud\ACC\Creative Cloud.exe'; Company = 'Adobe Inc.'; Product = 'Creative Cloud'; Description = 'Creative Cloud'; App = 'Adobe Creative Cloud' }
             @{ Id = 'ps-adobecc-2'; Exe = 'Creative Cloud Helper.exe'; Path = 'C:\Program Files\Common Files\Adobe\Adobe Desktop Common\ADS\Creative Cloud Helper.exe'; Company = 'Adobe Inc.'; Product = 'Creative Cloud Helper'; Description = 'Creative Cloud Helper'; App = 'Adobe Creative Cloud' }
             @{ Id = 'ps-adobecc-3'; Exe = 'Creative Cloud UI Helper.exe'; Path = 'C:\Program Files\Adobe\Adobe Creative Cloud\ACC\Creative Cloud UI Helper.exe'; Company = 'Adobe Inc.'; Product = 'Creative Cloud UI Helper'; Description = 'Creative Cloud UI Helper'; App = 'Adobe Creative Cloud' }
@@ -482,7 +491,7 @@ Describe 'Seed rules in powerstacks-mappings.json' {
     }
 
     It '<Id> maps <Exe> to <App>' -ForEach $IdentityCases {
-        $r = Resolve-AUIdentity (New-TestFacts $Exe $Path $Company $Product $Description) $Shipped $Apps
+        $r = Resolve-AUIdentity (New-TestFacts $Exe $Path $Company $Product $Description) $Shipped (Get-TestCaseApps $Extra)
         $r.MatchSection | Should -Be 'PowerStacks'
         $r.MatchRuleId | Should -Be $Id
         $r.ResolvedAppName | Should -Be $App
@@ -493,13 +502,13 @@ Describe 'Seed rules in powerstacks-mappings.json' {
         $Facts = New-TestFacts $Exe $Path $null $null $null
         $Facts.FactsVerified = $false
         $Facts.PathEvidence = [pscustomobject]@{ CompanyName = $Company; ProductName = $Product }
-        $r = Resolve-AUIdentity $Facts $Shipped $Apps
+        $r = Resolve-AUIdentity $Facts $Shipped (Get-TestCaseApps $Extra)
         $r.MatchRuleId | Should -Be $Id
         $r.EvidenceUsed | Should -Be 'CurrentFileAtPath'
     }
 
     It '<Id> leaves <Exe> from another publisher unmatched' -ForEach $IdentityCases {
-        $r = Resolve-AUIdentity (New-TestFacts $Exe $Path 'Contoso Ltd.' $Product $Description) $Shipped $Apps
+        $r = Resolve-AUIdentity (New-TestFacts $Exe $Path 'Contoso Ltd.' $Product $Description) $Shipped (Get-TestCaseApps $Extra)
         $r.MatchSection | Should -Be 'None'
         $r.MatchRuleId | Should -BeNullOrEmpty
     }
